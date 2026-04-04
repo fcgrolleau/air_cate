@@ -1,0 +1,564 @@
+\documentclass{article}
+\usepackage[numbers]{natbib}
+\bibliographystyle{unsrtnat}
+
+\usepackage{soul} % strikethrough -- remove later
+\usepackage{hyperref}       % hyperlinks
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{amsmath}
+\usepackage{amsthm}
+\usepackage{mathrsfs}
+\usepackage{mathtools}
+\usepackage{bbm}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode} 
+\usepackage{xcolor} % REMOVE THIS LATER
+\usepackage{graphicx} % for scalebox remove later if possible
+
+\algrenewcommand\algorithmicrequire{\textbf{Input:}}
+\algrenewcommand\algorithmicensure{\textbf{Output:}}
+
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{definition}{Definition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{assumption}{Assumption}
+\newtheorem{remark}{Remark}
+\newtheorem*{remark*}{Remark}
+
+\DeclareMathOperator*{\eqdef }{\,\stackrel{\text{def}}{=}\,}
+\DeclareMathOperator{\IDF}{\mathbbm{1}}% indicator function
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\EX}{\mathbb{E}\,}
+\DeclareMathOperator{\PR}{\mathbb{P}\,}
+
+\newcommand{\ms}{\mathscr}
+
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\indep}{\perp \!\!\! \perp}% independance
+\newcommand{\tend}{t_{\mathrm{end}}}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\nd}{\mathrm{d}}
+\newcommand{\Rp}{\mathbb{R}_+}
+\newcommand{\Rpstar}{\mathbb{R}_+^\ast}
+
+\title{Learning Time-Varying Conditional Average Treatment Effects from Right-Censored Data}
+
+
+\author{%
+  François Grolleau\\
+  Department of Biomedical Data Science\\
+  Stanford University\\
+  \texttt{grolleau@stanford.edu}
+  \and
+  Alex Fernandes\\
+  Université Paris Cité and Université Sorbonne Paris Nord,\\
+  Inserm, INRAE,\\
+  Centre for Research in Epidemiology and Statistics (CRESS),\\
+  75004, Paris, France\\
+  \texttt{alex.fernandes@u-paris.fr}
+}
+
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Orthogonal methods for estimating heterogeneous treatment effects from right-censored survival data have generally targeted a single, analyst-chosen time horizon, producing a pointwise summary rather than the full effect trajectory.
+When the treatment effect changes sign over time, such a summary can reverse the treatment recommendation.
+We propose an estimator for the time-varying conditional average treatment effect, defined as the patient-level curve that traces the survival-probability difference between treated and untreated trajectories over the full follow-up.
+Extending the R-learner framework, we construct an augmented inverse-probability-of-censoring-weighted pseudo-outcome, integrate the resulting squared loss over time, and prove that its unique population minimizer is the target estimand.
+We establish Neyman orthogonality with respect to all nuisance functions, so that nuisance-estimation errors affect the treatment-effect loss only at second order.
+We parametrize the effect curve as a covariate-gated mixture of survival-function differences that satisfies the structural constraints of any valid treatment-effect curve, is universally approximating, and is fully differentiable, so that the entire model, including upstream feature encoders for unstructured inputs such as medical images or clinical text, can be trained end-to-end.
+Simulations calibrated to a stroke trial and an observational coronary-revascularization cohort demonstrate recovery of heterogeneous, time-varying treatment-effect patterns that fixed-horizon methods cannot detect.
+\end{abstract}
+
+\newpage
+
+\section{Introduction}
+
+Precision medicine asks a patient-level counterfactual question: how
+would this individual's survival differ under treatment versus control
+as time unfolds?
+The natural answer is the time-varying conditional average treatment
+effect (tv-CATE), the patient-specific curve that traces the
+survival-probability difference between treated and untreated
+trajectories over the entire follow-up period.
+
+Consider two patients with complex coronary artery disease deciding
+between cardiac surgery (CABG) and percutaneous coronary intervention
+(PCI).
+Population-level trials often show no clear average advantage, yet
+subgroup analyses suggest marked heterogeneity
+\citep{takahashi2020redevelopment}.
+For one patient, surgery may raise short-term risk while providing
+durable long-term benefit; for another, the less invasive option
+dominates at every time point.
+A hazard ratio or a survival difference at five years cannot distinguish
+these two patterns: the first patient's effect curve changes sign over
+time, moving from negative in the short term to positive in the long
+term, while the
+second's remains positive throughout, yet both may yield the same scalar
+summary at a particular horizon.
+When the effect changes sign over time, a summary at the wrong horizon
+gets the treatment recommendation backwards.
+Moreover, even when the effect is monotone, different patients weight
+different time horizons (a frail patient may care most about two-year
+survival), so no single analyst-specified horizon can respect both
+sources of heterogeneity simultaneously.
+
+\subsection*{Limitations of existing approaches}
+
+A growing literature addresses heterogeneous treatment effects for
+survival outcomes, encompassing meta-learner adaptations, tree-based
+estimators, and neural models that accommodate non-proportional hazards
+and censoring
+\citep{cui2023estimating,sverdrup2025efficient,xu2024estimating,
+curth2021survite,xu2023treatment,bo2024estimating,
+foster2023orthogonal,frauen2025orthogonal,datta2020new}.
+Two gaps remain.
+
+\paragraph{Pointwise horizon targets.}
+Orthogonal methods for right-censored data, including the causal
+survival forest of \citet{cui2023estimating}, its log-rank extension
+by \citet{sverdrup2025efficient}, the censoring unbiased transformations
+of \citet{xu2024estimating}, and the model-agnostic orthogonal
+survival learners of \citet{frauen2025orthogonal}, estimate the
+treatment effect at individual time points rather than jointly
+recovering the full effect trajectory.
+Each such estimate is a scalar that cannot reveal whether a benefit at
+one horizon becomes a harm at another.
+More classical approaches, including proportional-hazards models and
+fixed-horizon restricted mean survival time differences
+\citep{cox1984,royston2013restricted}, share this limitation.
+Practitioners who wish to explore multiple horizons must refit or
+re-evaluate the estimator repeatedly, with no guarantee that the
+resulting family of pointwise estimates forms a valid treatment-effect
+curve.
+
+\paragraph{Structural validity.}
+Among the methods above, the causal survival forest and its log-rank
+extension rely on random forests, whose splitting rules are not
+differentiable with respect to the input representation.
+When treatment-effect information resides in unstructured data such as medical
+images or clinical text, one would like to train a feature encoder
+jointly with the treatment-effect model; non-differentiable learners
+preclude this, forcing the analyst to supply fixed, pre-extracted
+embeddings and forfeiting the ability to fine-tune representations for
+the causal objective.
+Model-agnostic formulations
+\citep{xu2024estimating,frauen2025orthogonal} resolve
+this limitation for fixed-horizon targets by allowing neural-network
+second-stage learners.
+However, none of these approaches, whether tree-based or
+neural, produces a treatment-effect \emph{curve} that is guaranteed to
+satisfy the constraints that any difference of two survival functions
+must obey: the curve must equal zero at baseline, be continuous, remain
+bounded between minus one and one, and vanish as the follow-up grows
+large.
+Without such guarantees, fitted trajectories can be biologically
+implausible, for instance predicting a survival-probability difference
+that exceeds one or that is nonzero at time zero.
+Moreover, while model-agnostic neural formulations
+\citep{xu2024estimating,frauen2025orthogonal} allow gradient-based
+training of the encoder, they optimize only a single-horizon loss and,
+being unconstrained in their output, do not enforce the structural
+properties of a valid treatment-effect curve.
+
+\subsection*{Our approach}
+We take the R-learner framework of \citet{nie2021quasi} as a starting
+point and extend it to the time-varying, right-censored setting.
+The key difficulty is that survival status at any given time is
+unobserved for censored patients.
+We replace it with an augmented inverse-probability-of-censoring-weighted
+(AIPCW) pseudo-outcome \citep{rubin2006doubly,cui2023estimating},
+integrate the resulting squared loss over the follow-up, and prove two
+properties of the resulting time-varying R-loss:
+first, its unique population minimizer is the tv-CATE
+(Theorem~\ref{th:loss}); and second, it is Neyman-orthogonal with
+respect to the propensity score and the arm-specific survival
+functions (Proposition~\ref{prop:neyman_ort}), so that
+nuisance-estimation errors affect the treatment-effect regret only at
+second order \citep{foster2023orthogonal}.
+
+\subsection*{The AIR estimator}
+
+We propose the \textbf{AIR} (\textit{Augmented time-Integrated R-loss})
+estimator, which minimizes an empirical version of the time-varying
+R-loss over a structured parametric family: a covariate-gated mixture of
+differences of Gamma survival functions.
+This parametrization enforces, by construction, the structural
+constraints that any valid treatment-effect curve must satisfy:
+the curve equals zero at baseline, is continuous, remains bounded, and
+vanishes as the follow-up grows large. It is also dense in the relevant
+function class
+(Theorem~\ref{thm:univ_approx}) and fully differentiable, so that the
+entire model, including any upstream feature encoder for images or text,
+can be trained end-to-end with standard gradient-based optimizers.
+Nuisance components are estimated by cross-fitting to exploit the
+orthogonality of the loss
+\citep{schick1986asymptotically,chernozhukov2018double}.
+
+\subsection*{Contributions}
+This paper makes four contributions.
+\begin{enumerate}
+  \item We formalize the tv-CATE and the conditional restricted mean
+    survival time difference as patient-level estimands for
+    right-censored data and establish their identification under standard
+    causal and censoring assumptions (Section~\ref{sec:notations}).
+
+  \item We construct the time-varying R-loss from an AIPCW
+    pseudo-outcome, prove that the tv-CATE is its unique minimizer, and
+    establish Neyman orthogonality with respect to all nuisance functions
+    (Section~\ref{sec:rlosses}).
+
+  \item We introduce the AIR estimator with a covariate-gated Gamma
+    mixture parametrization that is structurally valid, universally
+    approximating, and differentiable, enabling end-to-end training
+    with deep-learning optimizers and pretrained encoders for multimodal
+    clinical data (Section~\ref{sec:estimation}).
+
+  \item We evaluate the estimator in a semi-synthetic simulation
+    calibrated on the IST-3 stroke trial and in an observational
+    coronary-revascularization cohort comparing CABG and PCI, recovering
+    heterogeneous, time-resolved treatment-effect patterns
+    (Section~\ref{sec:experiments}).
+\end{enumerate}
+
+\section{Background and notations}\label{sec:notations}
+
+In this section we recall standard objects in survival analysis and causal inference for observational studies that will be used later. An introduction to the former and the latter can be found in \citet{klein2003survival} and \citet{imbens2015causal} respectively. 
+
+\bigskip 
+
+We consider a study on a time-frame $\mathcal{T} \eqdef [0,\tend]$ with $\tend \in \R^*_+$ the known maximum follow-up time in the study. At baseline $t=0$, each patient receives one of two treatment options; we represent baseline, pre-treatment covariates (assumed time-invariant) by a random variable $X$ with range $\mathcal{X} \subseteq \R^m$, and treatment assignment by a binary random variable $W$. We model the time to death $D$ and the censoring time $C$ as non-negative real random variables. We denote the time at which the first event (death or censoring) occurs by $Z \eqdef \min(C,D)$ and the non-censoring indicator by $\Delta \eqdef \IDF\{D \leq C\}$.
+Throughout, the \emph{observed data} refers to the random vector $(X,W,Z,\Delta)$.
+
+\bigskip
+
+To streamline notations, we define the propensity score by $e(X) \eqdef \EX[W \mid X]$ and define the different survival functions as the stochastic processes
+\begin{align*}
+    S^\dag(t\mid X) \eqdef& \PR(D>t \mid X), \\
+    S^\dag_w(t\mid X) \eqdef& \PR(D>t \mid X,\,W=w), \\
+    S^*_w(t \mid X)\eqdef& \PR(C>t \mid X,W=w).
+\end{align*}
+
+\bigskip
+
+We will rely on the causal inference potential outcome setup, that is, we assume the existence of $D^{w=1}$ and $D^{w=0}$ that model the time at which a patient dies if (possibly contrary to fact) they receive treatment or control respectively. 
+
+\subsection*{Causal estimands}
+This paper focuses on two estimand of interest. The primary estimand is the \emph{time-varying conditional CATE} defined as follows.
+
+\begin{definition}[{\bf Time-varying and time-fixed CATEs}]\label{def:t-CATE}
+Let $t \in \mathcal{T}$, the $t$-time-fixed CATE (or generically time-fixed CATE) denoted $\tau_t(X)$ is defined as the random variable given by
+\begin{align*}
+\tau_t(X) \eqdef \, \PR \bigl(D^{w=1}>t \mid X\bigr)-\PR \bigl(D^{w=0}>t \mid X\bigr).
+\end{align*}
+Hence, we define the \emph{time-varying CATE}, denoted $\tau$ or $\{\tau(t|X)\}_t$, as the random process $\{\tau_t(X)\}_{t \in \mathcal{T}}$.
+\end{definition}
+In particular, for any $t \in \mathcal{T}$ it follows from the definition of time-fixed CATE that $\tau_t(X)> 0$ signals that experimental treatment $W=1$ increases the probability of being alive at time $t$.
+
+\bigskip
+
+Our secondary estimand is the \emph{time-varying conditional restricted mean survival time difference (CRMST difference)}.
+
+\bigskip
+
+The RMST difference is well-established in population-level analyses~\cite{royston2013restricted}. Here, we examine it in its time varying, covariate-conditional form defined as follows.
+%
+\begin{definition}[{\bf Time-varying CRMST difference}]\label{def:time_conditional_RMSTD}
+The time-fixed CRMST difference $\Gamma_t(X)$ is defined as the random variable 
+\begin{align*}
+\Gamma_t (X) &\eqdef \int_0^{t} \PR \bigl(D^{w=1}>u \mid X \bigr) \nd u - \int_0^{t} \PR \bigl(D^{w=0}>u \mid X) \nd u.
+\end{align*}
+Hence, the time-varying CRMST difference denoted $\Gamma$ or $\{ \Gamma(t \mid X) \}_t$ is defined as the random process $\{ \Gamma_t(X) \}_{t \in \mathcal{T}}$.  
+\end{definition}
+In particular, for any $t \in \mathcal{T}$ one has
+\[ \Gamma(t \mid X) = \Gamma_t(X) = \int_0^{t} \tau(u \mid X)\nd u\]
+hence $\Gamma(t\mid x)$ measures the \emph{expected difference in survival time} accumulated between study start and the horizon $t$ between two patients with baseline covariates $X$ that receive treatment or control respectively. If $\Gamma(t \mid X)$ is positive the treatment is predicted to prolong life by $\Gamma(t\mid X)$ time-units on average by time $t$, while a negative value signals a reduction.
+
+\bigskip
+
+
+\subsection*{Causal Identifiability Assumptions}
+The following assumption allows use to identify our estimands \cite{robins2000correcting}.
+\begin{assumption}[{\bf Consistency over time}]\label{as:cons_t} A treatment option is consistent regardless of how it is administered; that is, there are no \emph{versions} of a treatment option. Formally, $$D=WD^{w=1}+(1-W)D^{w=0}.$$
+\end{assumption}
+
+\begin{assumption}[{\bf Ignorability over time}]\label{as:ign_t} The variables that causally affect both the treatment $W$ and the time at which a patient dies  $D$ are measured. Formally, $$\{D^{w=0}, D^{w=1}\} \indep W \mid X.$$
+\end{assumption}
+\begin{assumption}[{\bf Positivity in treatment assignment}]\label{as:ovl} The conditional probability of receiving either of the treatments given a covariate pattern is bounded away from zero. Namely, there exists $\eta \in \R_+^*$ a constant such that $$0 < \eta <  e(X) < 1 - \eta < 1.$$
+\end{assumption}
+\begin{assumption}[{\bf Noninformative censoring}]\label{as:cens} Censoring and survival time are independent conditionally on treatment assignment and covariates. Formally, $$C \indep D \mid X, W.$$
+\end{assumption}
+\begin{assumption}[{\bf Positivity in non-censoring and being at risk}]\label{as:ovl_cens}
+Throughout the follow-up, there are strictly always patients at risk of censoring and death in each treatment arm.
+Formally, let $w \in \{0,1\}$ be a treatment and $t \in \mathcal{T}$; there exists $\eta \in \R_+^*$ such that
+\[
+  0<\eta < S^*_w(t\mid X)
+  \qquad\text{and}\qquad
+  0<\eta < S^\dag_w(t\mid X).
+\]
+\end{assumption}
+
+
+
+\section{R-Losses}\label{sec:rlosses}
+%
+We introduce time-varying (respectively, time-fixed) R-losses, extending the R-loss of Nie and Wager \cite{nie2021quasi} to the estimands in this paper: the time-varying (respectively, time-fixed) CATE.
+%
+\subsection*{Time fixed and time-varying R-loss}
+
+We begin with a decomposition showing that the time-varying CATE is identifiable from uncensored data \cite{rosenbaum1983central}.
+\begin{proposition}\label{prop:g}
+Under Assumptions \ref{as:cons_t}–\ref{as:ovl}, the time‐varying conditional average treatment effect from Definition \ref{def:t-CATE} decomposes as $$\tau(t \mid X)=S^\dag_1(t \mid X)-S^\dag_0(t \mid X).$$
+\end{proposition}
+We next introduce the augmented inverse-probability-of-censoring-weighted (AIPCW) pseudo-outcome, following \citet{rubin2006doubly} and \citet{cui2023estimating}.
+\begin{definition}[{\bf AIPCW pseudo-outcome}]
+Under Assumption \ref{as:ovl_cens}, define the \emph{AIPCW pseudo-outcome} by
+   \begin{align*}
+Y_{\mathrm{PO}}(t) &\eqdef \frac{\IDF\{Z > t\}}{S^*_W(t \mid X)}
++ \frac{\IDF\{Z \le t, \Delta=0\} S^\dagger_W(t \mid X)}{S^\dagger_W(Z \mid X) S^*_W(Z \mid X)} \\
+&-  \int_0^{\min(Z, t)} \frac{S^\dagger_W(t \mid X)\lambda^*_W(u \mid X) }{S^\dagger_W(u \mid X) S^*_W(u \mid X)} \nd u,
+\end{align*}
+where $\lambda^*_W$ denotes the censoring hazard function:  $$\lambda^*_W(t \mid X) \eqdef - \frac{\nd}{\nd t} \log S^*_W(t \mid X).$$ 
+\end{definition}
+The AIPCW pseudo-outcome is unbiased in the following sense.
+\begin{proposition}[{\bf  Unbiasedness of the pseudo-outcome}]\label{prop:unbiasedness}
+Under Assumptions \ref{as:cens} and \ref{as:ovl_cens}, the pseudo-outcome $Y_{\mathrm{PO}}(t)$ satisfies
+\[
+\EX\bigl[Y_{\mathrm{PO}}(t) \mid X,\, W\bigr] = S^\dagger_W(t \mid X).
+\]
+\end{proposition}
+A proof is provided in Appendix \ref{proof:unbiasedness}. Using this pseudo-outcome, we define R-losses adapted to the time-fixed and time-varying CATE in the presence of censoring.
+
+\begin{definition}[{\bf Time-fixed and Time-varying R-Losses}]
+Define the $t$-time fixed R-loss $\mathcal{L}^R_t$ and time-varying R-loss $\mathcal{L}^R$ as the functionals given by
+\begin{align*}
+\mathcal{L}_t^R(\eta_t) &\eqdef \EX \left[ \Big(Y_{\mathrm{PO}}(t)- S^\dag(t|X) -\{W-e(X)\}\eta_t(X)\Big)^2 \right],\\
+\mathcal{L}^{R}(\eta) &\eqdef \int_{\mathcal{T}} \EX \left[ \Big(Y_{\mathrm{PO}}(t)-S^\dag(t|X)-\{W-e(X)\}\eta(t|X)\Big)^2 \right] \nd t,
+\end{align*}
+for $\eta : \mathcal{T} \times \mathcal{X} \to \R$ and $\eta_t : \mathcal{X} \to \R$ any two square integrable functions.
+\end{definition}
+%
+The argument of $\mathcal{L}_t^R$ is time-independent. The subscript $t$ is purely notational and serves two purposes: it distinguishes functions with codomain $\mathcal{X}$ from functions with codomain $\mathcal{T}\times\mathcal{X}$, and it indicates that an object is time-fixed (while dropping the subscript denotes its time-varying analogue). Moreover, for any square-integrable function $\eta$, the time-varying R-loss is the integral of the time-fixed R-loss, namely
+\begin{align*}
+\mathcal{L}^R(\eta)=\int_{\mathcal{T}} \mathcal{L}_t^R(\eta_t)\,\nd t
+\end{align*}
+where, for any $t \in \mathcal{T}$, $\eta_t$ is defined by $x \mapsto \eta(t\mid x)$ and is square-integrable by Tonelli's theorem.
+
+\bigskip
+
+These losses recover the time-fixed and time-varying CATEs. Using the AIPCW pseudo-outcome, for any $t \in \mathcal{T}$ define the residual
+\begin{align*}
+\varepsilon_t \eqdef  Y_{\mathrm{PO}}(t)- S_0^\dag(t\mid X) - W\tau_t(X)
+\end{align*}
+which yields the following AIPCW version of the Robinson decomposition \cite{robinson1988root}.
+\begin{lemma}[{\bf AIPCW-type Robinson decomposition}]\label{lemma:robinson_dec}
+Under Assumptions \ref{as:cons_t}-\ref{as:ovl_cens}, for any $t \in \mathcal{T}$ one has the decomposition 
+$$Y_{\mathrm{PO}}(t) - S^\dag(t|X) = \{W-e(X)\}\tau_t(X) + \varepsilon_t.$$
+\end{lemma}
+
+\begin{theorem}[{\bf Identifiability}]\label{th:loss}
+Under Assumption \ref{as:cons_t}-\ref{as:ovl_cens}, for any $t \in \mathcal{T}$ the $t$-time-fixed CATE \( \tau_t \) (resp. the time varying CATE \( \tau \)) is the unique minimizer of $\mathcal{L}_t ^{R}$ (resp. $\mathcal{L}^{R}$).
+\end{theorem}
+The proofs of Lemma \ref{lemma:robinson_dec} and Theorem \ref{th:loss} are provided in Appendix \ref{proof:new_loss}.
+
+An additional key property is that nuisance-estimation errors affect these losses only at second order. More precisely:
+\begin{proposition}\label{prop:neyman_ort}
+The $t$-time fixed R-loss $\mathcal{L}_t^R$ and the time-varying $R$-loss are Neyman-orthogonal (in the sense of \cite{foster2023orthogonal}).
+\end{proposition}
+This property allows us to apply results from the orthogonal statistical learning literature (see Section \ref{sec:quasioracle}).
+
+\section{Estimation and Inference}\label{sec:estimation}
+
+We observe the data $(X_i,W_i,Z_i,\Delta_i)$ for all $i$ between $1$ and $n$ and suppose these random vectors are i.i.d. from some distribution. This section describes how we estimate the time-varying CATE and CRMST difference by minimizing the orthogonal $R$-loss built from the AIPCW pseudo-outcome.
+
+\subsection{Augmented and Integrated R-loss (AIR) estimator}
+\label{subsec:opt_objective}
+We posit a parametric family $\{\tau(\cdot\mid\cdot;\theta):\theta\in\Theta\}$ for the time-varying CATE (see Section~\ref{subsec:param_spec}).
+We estimate $\theta$ by empirical risk minimization,
+\[
+\hat\theta \in \argmin_{\theta\in\Theta}\Big\{\widehat{\mathcal L}^{R}\big(\tau(\cdot\mid\cdot;\theta)\big)+\Lambda(\theta)\Big\},
+\]
+where $\Lambda(\theta)$ is a regularizer (e.g., weight decay, early stopping) controlling the effective complexity of the model class.
+
+\paragraph{Discretization.}
+Let $\{t_m\}_{m=0}^{M}$ be a uniform grid on $[0,\tend]$ with step size $\delta>0$ (so $t_m=m\delta$ and $M=\lfloor \tend/\delta\rfloor$).
+We approximate all time integrals in $\mathcal L^R$ and in the AIPCW augmentation term by Riemann sums over this grid.
+Since the censoring hazard estimator below uses a centered finite difference, it is evaluated only at interior points $m\in\{1,\ldots,M-1\}$.
+A convenient rule of thumb for choosing $\delta$ is
+\(
+\delta \;=\; \tfrac{1}{2}\min_{1\le i<j\le n}|Z_i-Z_j|.
+\)
+
+\paragraph{Cross-fitting and numerical stability.}
+Let $\hat e(x)$, $\widehat S_w^{\dag}(t\mid x)$, and $\widehat S_w^{*}(t\mid x)$ denote nuisance estimates of the propensity score and the arm-specific event and censoring survival functions.
+We recommend cross-fitting these nuisance components to mitigate own-observation bias and exploit the orthogonality of the $R$-loss \citep{schick1986asymptotically,chernozhukov2018double,athey2021policy}.
+We use a superscript $-q(i)$ to denote predictions obtained from nuisance models trained without the fold containing observation $i$.
+For numerical stability in inverse-weighted terms \citep{crump2009dealing,zhou2020propensity}, we clip nuisance estimates away from the boundaries: for some $\varepsilon\in(0,1/2)$,
+\(
+\tilde e(X_i)=\min\{1-\varepsilon,\max(\hat e^{-q(i)}(X_i),\varepsilon)\},
+\,
+\widetilde S_w^{*}(t_m\mid X_i)=\max\{\widehat S_w^{*\,{-q(i)}}(t_m\mid X_i),\varepsilon\},
+\,
+\widetilde S_w^{\dag}(t_m\mid X_i)=\max\{\widehat S_w^{\dag\,{-q(i)}}(t_m\mid X_i),\varepsilon\}.
+\)
+All expressions below are computed using $(\tilde e,\widetilde S^{*},\widetilde S^{\dag})$.
+
+\paragraph{Discretized AIPCW pseudo-outcome.}
+For subject $i$, define
+\[
+\begin{aligned}
+\widetilde{Y}_i(t)
+\;\eqdef\;&\frac{\IDF\{Z_i>t\}}{\widetilde{S}^{*}_{W_i}(t\mid X_i)}
++ \frac{\IDF\{Z_i\le t,\,\Delta_i=0\}\,\widetilde{S}^{\dag}_{W_i}(t\mid X_i)}{\widetilde{S}^{\dag}_{W_i}(Z_i\mid X_i)\,\widetilde{S}^{*}_{W_i}(Z_i\mid X_i)}\\
+&-\frac{M}{M-2}\sum_{m=1}^{M-1}\delta\,\IDF\{t_m\le \min\{Z_i,t\}\}\,
+\frac{\widetilde{S}^{\dag}_{W_i}(t\mid X_i)\,\widehat{\lambda}^{*}_{W_i}(t_m\mid X_i)}{\widetilde{S}^{\dag}_{W_i}(t_m\mid X_i)\,\widetilde{S}^{*}_{W_i}(t_m\mid X_i)}.
+\end{aligned}
+\]
+We estimate the censoring hazard on the grid by the centered finite difference
+\[
+\widehat{\lambda}^{*}_{W_i}(t_m\mid X_i)
+\;\eqdef\;
+\frac{\log \widetilde{S}^{*}_{W_i}(t_{m-1}\mid X_i)-\log \widetilde{S}^{*}_{W_i}(t_{m+1}\mid X_i)}{t_{m+1}-t_{m-1}}.
+\]
+
+\paragraph{Empirical \(R\)-loss.}
+Given $\widetilde{Y}_i(t)$, define the marginal survival nuisance
+\[
+\widetilde{S}^{\dag}(t\mid X)
+\eqdef
+\widetilde{S}_1^{\dag}(t\mid X)\,\tilde e(X)
++\widetilde{S}_0^{\dag}(t\mid X)\,\big(1-\tilde e(X)\big),
+\]
+and minimize the discretized empirical $R$-loss from Theorem~\ref{th:loss},
+\[
+\widehat{\mathcal{L}}^{R}\!\big(\tau(\cdot\mid\cdot;\theta)\big)
+=
+\frac{1}{n}\sum_{i=1}^{n}\sum_{m=0}^{M}\delta\,
+\Big\{\widetilde{Y}_i(t_m)
+-\widetilde{S}^{\dag}(t_m\mid X_i)
+-\big(W_i-\tilde e(X_i)\big)\,\tau(t_m\mid X_i;\theta)
+\Big\}^{2}.
+\]
+
+We summarize the AIR estimation procedure for the time-varying CATE and CRMST difference in Algorithm~\ref{algo:estimation}.
+
+\begin{algorithm}[h!]
+\caption{Cross-fitted AIR estimator for the time-varying CATE and CRMST difference}\label{algo:estimation}
+\begin{algorithmic}[1]
+\Require Data $\{(X_i,W_i,Z_i,\Delta_i)\}_{i=1}^n$, horizon $\tend$, grid step $\delta>0$, regularizer $\Lambda(\cdot)$, model class $\{\tau(\cdot\mid\cdot;\theta):\theta\in\Theta\}$.
+\Ensure Fitted functions $\hat{\tau}:[0,\tend]\!\times\!\mathcal{X}\to\mathbb{R}$ and $\hat{\Gamma}:[0,\tend]\!\times\!\mathcal{X}\to\mathbb{R}$.
+\State Build the uniform grid $\mathcal{T}=\{t_m=m\delta:\ m=0,\ldots,M\}$ with $M=\lfloor\tend/\delta\rfloor$.
+\State Split indices into $Q$ folds; for each fold $q$, fit nuisance models on the complement and predict on fold $q$:
+\Statex \hspace{\algorithmicindent} propensity $\hat e^{-q}(x)$, event survivals $\widehat S_{w}^{\dag\,{-q}}(t\mid x)$, and censoring survivals $\widehat S_{w}^{*\,{-q}}(t\mid x)$.
+\State Clip nuisances for stability (for some $\varepsilon\in(0,1/2)$): $\tilde e=\mathrm{clip}(\hat e,\varepsilon,1-\varepsilon)$, $\widetilde S^{\dag}=\max(\widehat S^{\dag},\varepsilon)$, and $\widetilde S^{*}=\max(\widehat S^{*},\varepsilon)$.
+\State For each subject $i$ and interior grid point $m\in\{1,\ldots,M-1\}$, estimate the censoring hazard by a centered finite difference:
+\Statex \hspace{\algorithmicindent} $\displaystyle \widehat\lambda^{*}_{W_i}(t_m\mid X_i)=\frac{\log \widetilde S^{*}_{W_i}(t_{m-1}\mid X_i)-\log \widetilde S^{*}_{W_i}(t_{m+1}\mid X_i)}{t_{m+1}-t_{m-1}}.$
+\State For each $i$ and $t_m\in\mathcal T$, compute the discretized AIPCW pseudo-outcome $\widetilde{Y}_i(t_m)$ as in \S\ref{subsec:opt_objective}.
+\State Form the marginal survival nuisance $\widetilde{S}^{\dag}(t\mid X)=\widetilde S_1^{\dag}(t\mid X)\,\tilde e(X)+\widetilde S_0^{\dag}(t\mid X)\,(1-\tilde e(X))$.
+\State Minimize over $\theta\in\Theta$ the regularized discretized empirical $R$-loss
+\Statex \hspace{\algorithmicindent} $\displaystyle \widehat{\mathcal{L}}^{R}\!\big(\tau(\cdot\mid\cdot;\theta)\big)=\frac{1}{n}\sum_{i=1}^{n}\sum_{m=0}^{M}\delta\,\Big\{\widetilde{Y}_i(t_m)-\widetilde{S}^{\dag}(t_m\mid X_i)-\big(W_i-\tilde e(X_i)\big)\,\tau(t_m\mid X_i;\theta)\Big\}^{2}$
+\Statex \hspace{\algorithmicindent} plus $\Lambda(\theta)$, yielding $\hat\theta$.
+\State Output $\hat\tau(t\mid x)=\tau(t\mid x;\hat\theta)$ and the discretized CRMST difference
+\Statex \hspace{\algorithmicindent} $\displaystyle \hat\Gamma(t\mid x)=\sum_{m:\,t_m\le t}\delta\,\hat\tau(t_m\mid x)$.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Unconstrained Parametric Specification for Time-Varying CATEs}
+A natural starting point is to model the time-varying CATE $\tau(t\mid x)$ directly with a generic tensor-product basis expansion, for instance
+\[
+\tau(t\mid x)
+\;=\;
+\psi_{\mathcal T}(t)^{\top}\,\Theta_{\text{M}}\,\psi_{\mathcal X}(x),
+\]
+where $\psi_{\mathcal T}$ and $\psi_{\mathcal X}$ are basis functions in time and covariates (e.g., polynomials or splines) and $\Theta_{\text{M}}$ is a coefficient matrix.
+By letting the basis dimension grow, such parameterizations are dense in broad function classes (e.g., in $L_2$) and hence can approximate many targets \citep{chen2007large}.
+
+However, this ``unconstrained'' approach ignores that $\tau$ is not an arbitrary function: by Proposition \ref{prop:g},
+\(
+\tau(t\mid x)=S_1^{\dag}(t\mid x)-S_0^{\dag}(t\mid x)
+\)
+for two valid survival functions.
+Consequently, $\tau$ must satisfy basic structural restrictions for every $x$:
+(i) $\tau(0\mid x)=0$;
+(ii) $\tau(t\mid x)\in[-1,1]$ for all $t$;
+and (iii) $\tau(t\mid x)\to 0$ as $t\to\infty$ whenever both arm-specific survival functions vanish.
+A direct basis model does not enforce any of these constraints, so finite-sample fits may yield time-varying CATEs that are incompatible with any pair of survival distributions. This mismatch can persist even with large samples if regularization or limited basis size prevents the estimator from entering the constrained region.
+
+These considerations motivate adopting a parameterization that enforces survival compatibility by construction. In the next subsection, we introduce a flexible covariate-dependent specification for $\tau(t\mid x)$ that respects the structural restrictions above while remaining rich enough to approximate the target function class of interest.
+
+\subsection{Parametric Specification for Time-Varying CATEs}
+\label{subsec:param_spec}
+We parameterize the time-varying CATE $\tau(t\mid x)$ directly as a covariate-gated mixture of $K$ time profiles,
+\[
+\tau(t\mid x;\theta)
+=\sum_{k=1}^{K}\rho_k(x;\beta)\,\mathrm{TE}_k(t),
+\qquad
+\rho_k(x;\beta)
+=\frac{\exp\{\beta_k^{\top}\phi(x)\}}{\sum_{j=1}^{K}\exp\{\beta_j^{\top}\phi(x)\}},
+\]
+where $\rho_k(x;\beta)\in[0,1]$ and $\sum_k\rho_k(x;\beta)=1$.
+Each profile $\mathrm{TE}_k$ is a difference of two Gamma survival functions,
+\[
+\mathrm{TE}_k(t)
+\;\eqdef\;
+G(t;\bar\alpha,\lambda_{k,1})-G(t;\bar\alpha,\lambda_{k,0}),
+\]
+with a shared shape parameter $\bar\alpha$ across profiles and arm-specific scales $\lambda_{k,0},\lambda_{k,1}>0$.
+\emph{Rationale for a shared shape.} The next subsection establishes that this mixture family is dense in the target function class \emph{even under the restriction to a common shape parameter} $\bar\alpha$. Consequently, imposing a shared $\bar\alpha$ preserves approximation capacity while reducing the effective dimensionality of the parameter space and improving the statistical and numerical stability of estimation.
+
+We use the Gamma survival function:
+\[
+G(t;\alpha,\lambda)
+\;\eqdef\;
+\PR(T>t),\quad T\sim\mathrm{Gamma}(\text{shape}=\alpha,\text{scale}=\lambda)
+\;=\;
+\frac{\Gamma_{\mathrm{u}}\!\big(\alpha,\,t/\lambda\big)}{\Gamma_\mathrm{c}(\alpha)}.
+\]
+Here $\Gamma_{\mathrm{u}}(\alpha,\cdot)$ denotes the upper incomplete Gamma function, while $\Gamma_\mathrm{c}(\alpha)$ denotes the (complete) Gamma function.
+In particular, for every $x$ we have $\tau(0\mid x)=0$, $\tau(t\mid x)\in[-1,1]$ for all $t$, and $\tau(t\mid x)\to 0$ as $t\to\infty$.
+
+The parameter vector is
+$\theta=\big(\bar\alpha,\{\beta_k\}_{k=1}^{K},\{\lambda_{k,0},\lambda_{k,1}\}_{k=1}^{K}\big)$,
+with a user-specified (or learned) feature map $\phi:\mathcal{X}\to\mathbb{R}^{p}$.
+
+\paragraph{Practical notes.}
+\begin{itemize}
+\item \textbf{Hyperparameter.} $K$ controls flexibility (typically small, e.g., $K\in\{2,\ldots,8\}$): larger $K$ yields richer time patterns and effect heterogeneity through the gating weights $\rho_k(X;\beta)$.
+\item \textbf{Shared structure.} The gating $\rho_k(X;\beta)$ and the shape $\bar\alpha$ are shared across all profiles, while $(\lambda_{k,0},\lambda_{k,1})$ are profile-specific and determine the time pattern and magnitude of $\mathrm{TE}_k(t)$.
+\item \textbf{Interpretability.} For a fixed $x$, the weights $\rho_k(x;\beta)$ act as soft memberships over $K$ latent effect profiles; inspecting the dominant weights and their associated $(\lambda_{k,0},\lambda_{k,1})$ provides a profile-level explanation for $\tau(\cdot\mid x)$.
+\item \textbf{Features.} $\phi(\cdot)$ may be linear (optionally with splines/interactions) or a compact representation from a neural network or other embeddings.
+\end{itemize}
+This parameterization yields a tunable model class with a single structural choice $K$, and enables efficient computation of \(\widehat{\mathcal{L}}^{R}\).
+
+\subsection{Implementation Notes}
+To facilitate the practical implementation of the proposed method in deep learning frameworks (such as PyTorch or JAX), we outline several concrete design choices and architectural recommendations below.
+
+\subsection{Implementation Notes}
+To facilitate the practical implementation of the proposed method, we explicitly propose developing the codebase using \textbf{JAX} in combination with the \textbf{Keras} framework (e.g., Keras 3 with the JAX backend). This ecosystem provides the high-performance auto-differentiation required for our loss functions alongside the structural modularity needed for custom network components. We outline several concrete design choices below.
+
+\begin{itemize}
+    \item \textbf{Nuisance Function Estimators:} 
+    Computing the AIPCW pseudo-outcomes requires evaluating the censoring and event survival functions at the exact continuous observed times $Z_i$. To naturally accommodate this, we recommend utilizing a Weibull Accelerated Failure Time (AFT) model for the survival nuisance components, parameterized by a Multi-Layer Perceptron (MLP). For the propensity score nuisance component, a standard MLP is also recommended. Using Keras, these network architectures should be implemented as modular \texttt{keras.Model} or \texttt{keras.layers.Layer} objects, allowing the user to readily substitute alternative models depending on the dataset.
+    
+    \item \textbf{Enforcing Gamma Distribution Constraints:} 
+    Because our parametrization relies on Gamma survival functions, the shape parameter $\bar{\alpha}$ and the scale parameters $\lambda_{k,w}$ must be strictly positive. Standard deep learning optimizers operate in unconstrained Euclidean space. Therefore, implementations must apply a \texttt{Softplus} activation function (e.g., via \texttt{jax.nn.softplus} or \texttt{keras.activations.softplus}) to the raw neural network outputs associated with these parameters before passing them into the incomplete Gamma function.
+    
+    \item \textbf{Feature Encoder $\phi(x)$:} 
+    The covariate-gated mixture weights depend on a feature representation $\phi(x)$. For standard tabular applications, we recommend employing an MLP as the default encoder. As with the nuisance components, $\phi(x)$ should be implemented as an easily swappable Keras module, enabling users to seamlessly insert domain-specific backbones (e.g., CNNs or Transformers) when working with unstructured data.
+    
+    \item \textbf{Integration Grid and Discretization:} 
+    While a theoretical grid step size $\delta$ may be discussed in the derivations, enforcing a fixed $\delta$ is often computationally impractical. In practice, we propose defining the time grid over a fixed number of evaluation points (e.g., $M=100$), exposing $M$ as a hyperparameter that the user can tune based on their memory and resolution constraints. 
+    
+    Additionally, when discretizing the integral for the pseudo-outcome via a Riemann sum, the equation includes a $\frac{M}{M-2}$ pre-factor. The explicit intent of this scalar is to correct for the volume loss incurred by utilizing only the $M-2$ interior points in the centered-difference approximation.
+\end{itemize}
+
+\end{document}
