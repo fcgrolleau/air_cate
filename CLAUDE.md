@@ -4,37 +4,83 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Research paper: **"Learning Time-Varying Conditional Average Treatment Effects from Right-Censored Data"** by François Grolleau (Stanford) and Alex Fernandes (Université Paris Cité). The method is called **Surv-CATE**.
+Research paper and implementation: **"Learning Time-Varying Conditional Average Treatment Effects from Right-Censored Data"** by François Grolleau (Stanford) and Alex Fernandes (Université Paris Cité). The method is called **Surv-CATE** / **AIR** (Augmented and Integrated R-loss).
 
-This is a LaTeX-only repository — no application code, tests, or build system.
+## Build & Test Commands
+
+```bash
+# Install all dependencies (including dev)
+uv sync --all-extras
+
+# Run all tests
+uv run pytest tests/ -v
+
+# Run only fast unit tests (skip integration)
+uv run pytest tests/ -v -m "not slow"
+
+# Run only slow integration tests
+uv run pytest tests/ -v -m slow
+
+# Run a single test file
+uv run pytest tests/test_pseudo_outcome.py -v
+
+# Run the quickstart example
+uv run python examples/quickstart.py
+
+# Lint
+uv run ruff check src/ tests/
+```
 
 ## Repository Structure
 
 ```
-latex/
-├── main.tex                    # Main paper source
-├── main.bib                    # Bibliography (~60+ references)
-├── related_work_frazier.tex    # Related work section (included from main.tex)
-├── figure1.pdf                 # Standalone figures
-├── prelim_res.pdf
-├── surv_sim.pdf
-└── figures/                    # Generated figure outputs
-    ├── km_curve_by_treatment.pdf
-    ├── mse_violin_plots.pdf
-    └── var_mse_vs_n.pdf
+src/air_cate/                    # Python package (JAX + Keras 3)
+├── __init__.py                  # Sets KERAS_BACKEND=jax, lazy-exports AIREstimator
+├── _types.py                    # SurvivalData, NuisanceEstimates NamedTuples
+├── utils.py                     # build_time_grid, clip_propensity, clip_survival
+├── nuisance/
+│   ├── propensity.py            # PropensityMLP (binary classifier)
+│   ├── weibull_aft.py           # WeibullAFT (parametric survival, custom NLL)
+│   └── cross_fit.py             # Q-fold cross-fitting orchestrator
+├── pseudo_outcome.py            # AIPCW pseudo-outcome (pure JAX, O(n*M) prefix sums)
+├── cate_model/
+│   ├── gamma_survival.py        # G(t; alpha, lambda) via jax.scipy.special.gammaincc
+│   ├── encoder.py               # FeatureEncoder MLP (swappable)
+│   └── mixture.py               # CATEMixture Keras model
+├── r_loss.py                    # Empirical R-loss function
+└── estimator.py                 # AIREstimator: top-level fit/predict API
+
+tests/                           # pytest suite (29 tests)
+├── conftest.py                  # Synthetic DGPs: WeibullDGP, NullDGP
+├── test_estimator.py            # Integration tests (@pytest.mark.slow)
+└── test_*.py                    # Unit tests for each module
+
+latex/                           # Paper source
+├── main.tex                     # Main paper
+├── main.bib                     # Bibliography
+└── related_work_frazier.tex     # Related work section
+
+examples/
+└── quickstart.py                # End-to-end demo on synthetic data
 ```
 
-## Building the Paper
+## Architecture: 3-Stage Pipeline
 
-Compile with the standard multi-pass LaTeX + BibTeX workflow from the `latex/` directory:
+The AIREstimator follows Algorithm 1 from the paper:
 
-```bash
-cd latex
-pdflatex main.tex
-bibtex main
-pdflatex main.tex
-pdflatex main.tex
-```
+1. **Nuisance estimation** (`nuisance/`): Cross-fit propensity (MLP) + 4 Weibull AFT models (event/censoring × arm 0/1). Each fold trains 5 models on the complement, predicts on the held-out fold.
+
+2. **Pseudo-outcomes** (`pseudo_outcome.py`): Compute AIPCW pseudo-outcomes on a uniform time grid. Has 3 terms: IPCW, censored augmentation, and integral augmentation (via efficient prefix sums). Pure JAX, no Keras.
+
+3. **CATE model** (`cate_model/`, `r_loss.py`): Minimize the R-loss over a CATEMixture model — a covariate-gated mixture of K Gamma survival differences. Custom JAX training loop with `stateless_call` for JIT compatibility.
+
+## Key Technical Details
+
+- **Keras 3 + JAX backend**: Set via `os.environ["KERAS_BACKEND"] = "jax"` in `__init__.py`. Must be set before any Keras import.
+- **WeibullAFT** uses a `_WeibullTrainModel` wrapper with `compute_loss(self, x, y, y_pred, sample_weight, training)` signature (Keras 3.3+ requirement).
+- **CATEMixture training** uses `model.stateless_call(trainable_vars, non_trainable_vars, inputs)` inside a `jax.jit`-compiled training step. Keras variables must be extracted via `.value` before passing to JIT.
+- **Positivity constraints**: Gamma shape/scale parameters enforced via `softplus(raw) + 1e-4`.
+- **Structural constraints by construction**: `tau(0|x)=0`, `tau(t|x) in [-1,1]`, `tau -> 0` as `t -> inf`.
 
 ## LaTeX Conventions
 
@@ -42,12 +88,3 @@ pdflatex main.tex
 - Custom math operators: `\EX` (expectation), `\PR` (probability), `\IDF` (indicator), `\eqdef` (definition equality), `\indep` (independence)
 - Custom commands: `\tend` (end time), `\ms` (mathscr), `\abs`, `\norm`, `\R`, `\Rp`, `\Rpstar`
 - Theorem environments: theorem, proposition, lemma, definition, corollary, assumption, remark
-- Algorithm style: `algorithm` + `algpseudocode` with `\textbf{Input:}` / `\textbf{Output:}`
-
-## Research Context
-
-- **Problem**: Estimating patient-level time-varying treatment effect curves from right-censored survival data
-- **Approach**: R-learner framework with augmented inverse-probability-of-censoring-weighted (AIPW) pseudo-outcomes; integrated squared loss over time
-- **Key property**: Neyman orthogonality — nuisance estimation errors affect the treatment-effect loss only at second order
-- **Parametrization**: Covariate-gated mixture of survival-function differences (universally approximating, fully differentiable)
-- **Applications**: Precision medicine — e.g., cardiac surgery vs. PCI, stroke trials
