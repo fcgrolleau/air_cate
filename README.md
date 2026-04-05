@@ -46,14 +46,15 @@ The estimator follows a three-stage pipeline:
 
 2. **Pseudo-outcomes** -- Compute doubly-robust AIPCW pseudo-outcomes on a uniform time grid using efficient O(n*M) prefix sums.
 
-3. **CATE model** -- Minimize the empirical R-loss over a `CATEMixture` model: a covariate-gated mixture of K Gamma survival differences with structural guarantees (tau(0|x) = 0, tau in [-1, 1], tau -> 0 as t -> infinity).
+3. **CATE model** -- Minimize the empirical R-loss over a `CATEMixture` model: a covariate-gated Mixture of Gamma Differences (MGD) with structural guarantees (tau(0|x) = 0, tau in [-1, 1], tau -> 0 as t -> infinity). An alternative unconstrained `CATETensorProduct` model is also available.
 
 ## Examples
 
 | Script | Description |
 |---|---|
 | [`quickstart.py`](examples/quickstart.py) | End-to-end demo on synthetic data |
-| [`plot_convergence.py`](examples/plot_convergence.py) | iMSE vs sample size convergence curves with error bars |
+| [`plot_simulation.py`](examples/plot_simulation.py) | iMSE convergence across 6 methods, 2 DGPs (supports `--large` and `--plot-only`) |
+| [`plot_cate_curves.py`](examples/plot_cate_curves.py) | Predicted tv-CATE curves for a single test observation |
 
 Run any example with:
 
@@ -99,16 +100,18 @@ src/air_cate/
 ├── cate_model/
 │   ├── gamma_survival.py    # Gamma survival function
 │   ├── encoder.py           # Feature encoder MLP
-│   └── mixture.py           # CATEMixture Keras model
+│   ├── mixture.py           # CATEMixture Keras model (MGD)
+│   └── tensor_product.py    # CATETensorProduct (unconstrained baseline)
 ├── r_loss.py                # R-loss function
+├── baselines.py             # Survival Forest T-learner / S-learner
 └── estimator.py             # AIREstimator (top-level API)
 
-tests/                       # pytest suite (29 tests)
+tests/                       # pytest suite
 ├── conftest.py              # Synthetic DGPs: WeibullDGP, WeibullMixtureDGP, NullDGP
 └── test_*.py                # Unit + integration tests
 
 examples/                    # Demo scripts + figures
-latex/                       # Paper source
+latex/                       # Simulation study writeup
 ```
 
 ## Testing
@@ -128,4 +131,5 @@ uv run pytest tests/ -v -m slow
 
 - **JAX** -- Numerical computation, JIT-compiled training loop
 - **Keras 3** (JAX backend) -- Neural network layers and model abstraction
+- **scikit-survival** -- Random Survival Forest baselines
 - **NumPy / scikit-learn** -- Data handling and utilities

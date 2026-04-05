@@ -46,23 +46,28 @@ src/air_cate/                    # Python package (JAX + Keras 3)
 ├── cate_model/
 │   ├── gamma_survival.py        # G(t; alpha, lambda) via jax.scipy.special.gammaincc
 │   ├── encoder.py               # FeatureEncoder MLP (swappable)
-│   └── mixture.py               # CATEMixture Keras model
+│   ├── mixture.py               # CATEMixture Keras model (MGD)
+│   └── tensor_product.py        # CATETensorProduct (unconstrained baseline)
 ├── r_loss.py                    # Empirical R-loss function
+├── baselines.py                 # SurvivalForestTLearner, SurvivalForestSLearner
+├── nuisance/oracle.py           # Oracle nuisance builder for simulation studies
 └── estimator.py                 # AIREstimator: top-level fit/predict API
 
-tests/                           # pytest suite (29 tests)
+tests/                           # pytest suite
 ├── conftest.py                  # Synthetic DGPs: WeibullDGP, WeibullMixtureDGP, NullDGP
 ├── test_estimator.py            # Integration tests (@pytest.mark.slow)
 └── test_*.py                    # Unit tests for each module
 
-latex/                           # Paper source
+latex/                           # Paper & simulation writeup
 ├── main.tex                     # Main paper
 ├── main.bib                     # Bibliography
-└── related_work_frazier.tex     # Related work section
+├── related_work_frazier.tex     # Related work section
+└── simulation_study.tex         # Simulation study (DGPs, design, results)
 
 examples/
 ├── quickstart.py                # End-to-end demo on synthetic data
-└── plot_convergence.py          # iMSE vs sample size convergence
+├── plot_simulation.py           # iMSE convergence (6 methods × 2 DGPs, --large/--plot-only)
+└── plot_cate_curves.py          # Predicted tv-CATE curves for a single test observation
 ```
 
 ## Architecture: 3-Stage Pipeline
@@ -73,7 +78,7 @@ The AIREstimator follows Algorithm 1 from the paper:
 
 2. **Pseudo-outcomes** (`pseudo_outcome.py`): Compute AIPCW pseudo-outcomes on a uniform time grid. Has 3 terms: IPCW, censored augmentation, and integral augmentation (via efficient prefix sums). Pure JAX, no Keras.
 
-3. **CATE model** (`cate_model/`, `r_loss.py`): Minimize the R-loss over a CATEMixture model — a covariate-gated mixture of K Gamma survival differences. Custom JAX training loop with `stateless_call` for JIT compatibility.
+3. **CATE model** (`cate_model/`, `r_loss.py`): Minimize the R-loss over a CATEMixture model — a covariate-gated Mixture of Gamma Differences (MGD). Custom JAX training loop with `stateless_call` for JIT compatibility. An alternative `CATETensorProduct` model (unconstrained tensor-product basis) is available via `cate_model_class` parameter.
 
 ## Key Technical Details
 

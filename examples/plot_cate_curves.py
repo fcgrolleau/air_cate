@@ -2,7 +2,7 @@
 
 Fits 4 non-oracle methods on one training draw (Weibull DGP) and overlays
 their predicted tau(t|x) against the true tv-CATE for the test subject
-where Cross-fitted AIR w/ MDG tracks the truth most closely.
+where Cross-fitted AIR w/ MGD tracks the truth most closely.
 
 Usage:
   uv run python examples/plot_cate_curves.py
@@ -40,7 +40,7 @@ _JAMA = {
 }
 
 METHODS = [
-    ("Cross-fitted AIR w/ MDG",    _JAMA["teal"],   "-",  2.2),
+    ("Cross-fitted AIR w/ MGD",    _JAMA["teal"],   "-",  2.2),
     ("Cross-fitted AIR w/ TP",     _JAMA["orange"], "-",  2.2),
     ("Survival Forest T-learner",  _JAMA["red"],    "-",  2.2),
     ("Survival Forest S-learner",  _JAMA["green"],  "-",  2.2),
@@ -96,7 +96,7 @@ def fit_all_methods():
 def find_best_observation(delta, tau_true, tau_hats_all):
     """Find the test subject where:
       1. The true tv-CATE has a large dynamic range (interesting shape).
-      2. AIR w/ MDG has the lowest iMSE among all methods.
+      2. AIR w/ MGD has the lowest iMSE among all methods.
     """
     n_methods = len(tau_hats_all)
 
@@ -108,7 +108,7 @@ def find_best_observation(delta, tau_true, tau_hats_all):
     # Dynamic range of true tv-CATE per subject
     tau_range = tau_true.max(axis=1) - tau_true.min(axis=1)
 
-    # Filter: AIR w/ MDG must be the best method (lowest iMSE)
+    # Filter: AIR w/ MGD must be the best method (lowest iMSE)
     air_best = imse[0] == imse.min(axis=0)
 
     # Among those, pick the one with the largest true tv-CATE range

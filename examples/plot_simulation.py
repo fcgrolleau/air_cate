@@ -101,9 +101,9 @@ _JAMA = {
 }
 
 METHOD_LABELS = {
-    "AIR":         "Cross-fitted AIR w/ MDG",
+    "AIR":         "Cross-fitted AIR w/ MGD",
     "Tensor-prod": "Cross-fitted AIR w/ TP",
-    "AIR-oracle":  "AIR w/ MDG (oracle nuis.)",
+    "AIR-oracle":  "AIR w/ MGD (oracle nuis.)",
     "TP-oracle":   "AIR w/ TP (oracle nuis.)",
     "RSF-T":       "Survival Forest T-learner",
     "RSF-S":       "Survival Forest S-learner",
@@ -325,6 +325,10 @@ def plot_convergence(results, n_values, cfg, X_test):
         ax.set_title(f"{dgp_name} DGP", fontsize=11.5, fontweight="bold", pad=8)
         ax.set_xticks(n_values)
         ax.set_xticklabels([str(n) for n in n_values], fontsize=8.5)
+        from matplotlib.ticker import FixedLocator, FixedFormatter
+        y_ticks = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+        ax.yaxis.set_major_locator(FixedLocator(y_ticks))
+        ax.yaxis.set_major_formatter(FixedFormatter([str(v) for v in y_ticks]))
         ax.tick_params(axis="y", labelsize=8.5)
         ax.grid(True, alpha=0.12, linewidth=0.4)
 
@@ -341,9 +345,10 @@ def plot_convergence(results, n_values, cfg, X_test):
                columnspacing=1.5, handletextpad=0.6)
 
     fig.tight_layout(rect=[0, 0.10, 1, 1], w_pad=2.5)
-    path = os.path.join(FIGURES_DIR, "simulation_convergence.png")
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    print(f"Saved: {path}")
+    for ext in ("png", "pdf"):
+        path = os.path.join(FIGURES_DIR, f"simulation_convergence.{ext}")
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {path}")
     plt.close(fig)
 
 
