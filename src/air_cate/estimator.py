@@ -48,6 +48,8 @@ class AIREstimator:
         cate_lr: float = 1e-3,
         cate_batch_size: int = 256,
         weight_decay: float = 1e-4,
+        cate_model_class=None,
+        cate_model_kwargs: dict | None = None,
     ):
         self.K = K
         self.M = M
@@ -61,6 +63,8 @@ class AIREstimator:
         self.cate_lr = cate_lr
         self.cate_batch_size = cate_batch_size
         self.weight_decay = weight_decay
+        self.cate_model_class = cate_model_class
+        self.cate_model_kwargs = cate_model_kwargs or {}
 
         self.cate_model_ = None
         self.time_grid_ = None
@@ -73,6 +77,7 @@ class AIREstimator:
         Z: np.ndarray,
         Delta: np.ndarray,
         t_end: float,
+        nuisances=None,
         verbose: int = 0,
     ) -> "AIREstimator":
         """Fit the AIR estimator.
@@ -83,6 +88,7 @@ class AIREstimator:
             Z: Observed times min(D, C) (n,).
             Delta: Event indicator 1{D <= C} (n,).
             t_end: Maximum follow-up time.
+            nuisances: Pre-computed NuisanceEstimates (skip cross-fitting if provided).
             verbose: Verbosity level (0=silent).
 
         Returns:
@@ -98,26 +104,30 @@ class AIREstimator:
             Delta=jnp.array(Delta, dtype=jnp.float32),
         )
 
-        # Step 2: Cross-fit nuisance functions
-        nuisances = cross_fit_nuisances(
-            data,
-            self.time_grid_,
-            n_folds=self.n_folds,
-            propensity_config=self.propensity_config,
-            weibull_config=self.weibull_config,
-            training_config=self.nuisance_training_config,
-        )
+        # Step 2: Cross-fit nuisance functions (or use provided oracle)
+        if nuisances is None:
+            nuisances = cross_fit_nuisances(
+                data,
+                self.time_grid_,
+                n_folds=self.n_folds,
+                propensity_config=self.propensity_config,
+                weibull_config=self.weibull_config,
+                training_config=self.nuisance_training_config,
+            )
 
         # Step 3: Compute pseudo-outcomes
         Y_tilde, S_marg, e_clipped = compute_pseudo_outcomes(
             data, nuisances, self.time_grid_, self.delta_, eps=self.eps
         )
 
-        # Step 4: Build and train CATEMixture
-        self.cate_model_ = CATEMixture(
-            K=self.K,
-            encoder_hidden_sizes=self.encoder_hidden_sizes,
-        )
+        # Step 4: Build and train CATE model
+        if self.cate_model_class is not None:
+            self.cate_model_ = self.cate_model_class(**self.cate_model_kwargs)
+        else:
+            self.cate_model_ = CATEMixture(
+                K=self.K,
+                encoder_hidden_sizes=self.encoder_hidden_sizes,
+            )
 
         self.cate_model_.compile(
             optimizer=keras.optimizers.AdamW(

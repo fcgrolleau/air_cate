@@ -1,6 +1,6 @@
-"""CATE model: gamma survival, encoder, and mixture."""
+"""CATE model: gamma survival, encoder, mixture, and tensor-product."""
 
-__all__ = ["gamma_survival", "FeatureEncoder", "CATEMixture"]
+__all__ = ["gamma_survival", "FeatureEncoder", "CATEMixture", "CATETensorProduct"]
 
 
 def __getattr__(name):
@@ -13,4 +13,7 @@ def __getattr__(name):
     if name == "CATEMixture":
         from air_cate.cate_model.mixture import CATEMixture
         return CATEMixture
+    if name == "CATETensorProduct":
+        from air_cate.cate_model.tensor_product import CATETensorProduct
+        return CATETensorProduct
     raise AttributeError(f"module 'air_cate.cate_model' has no attribute {name!r}")
