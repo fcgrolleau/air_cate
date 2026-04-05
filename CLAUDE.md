@@ -51,7 +51,7 @@ src/air_cate/                    # Python package (JAX + Keras 3)
 └── estimator.py                 # AIREstimator: top-level fit/predict API
 
 tests/                           # pytest suite (29 tests)
-├── conftest.py                  # Synthetic DGPs: WeibullDGP, NullDGP
+├── conftest.py                  # Synthetic DGPs: WeibullDGP, WeibullMixtureDGP, NullDGP
 ├── test_estimator.py            # Integration tests (@pytest.mark.slow)
 └── test_*.py                    # Unit tests for each module
 
@@ -61,7 +61,8 @@ latex/                           # Paper source
 └── related_work_frazier.tex     # Related work section
 
 examples/
-└── quickstart.py                # End-to-end demo on synthetic data
+├── quickstart.py                # End-to-end demo on synthetic data
+└── plot_convergence.py          # iMSE vs sample size convergence
 ```
 
 ## Architecture: 3-Stage Pipeline

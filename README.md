@@ -53,11 +53,7 @@ The estimator follows a three-stage pipeline:
 | Script | Description |
 |---|---|
 | [`quickstart.py`](examples/quickstart.py) | End-to-end demo on synthetic data |
-| [`plot_cate_recovery.py`](examples/plot_cate_recovery.py) | 1D CATE recovery: individual curves, strata averages, scatter, iMSE by x1 |
-| [`plot_cate_2d.py`](examples/plot_cate_2d.py) | 2D CATE recovery over (x0, x1) for the single-Weibull DGP |
-| [`plot_cate_2d_mixture.py`](examples/plot_cate_2d_mixture.py) | 2D CATE recovery for the 3-component Weibull mixture DGP (K=3) |
 | [`plot_convergence.py`](examples/plot_convergence.py) | iMSE vs sample size convergence curves with error bars |
-| [`plot_learning_curve.py`](examples/plot_learning_curve.py) | Training loss over epochs |
 
 Run any example with:
 
@@ -111,7 +107,7 @@ tests/                       # pytest suite (29 tests)
 ├── conftest.py              # Synthetic DGPs: WeibullDGP, WeibullMixtureDGP, NullDGP
 └── test_*.py                # Unit + integration tests
 
-examples/                    # Visualization scripts + figures
+examples/                    # Demo scripts + figures
 latex/                       # Paper source
 ```
 
