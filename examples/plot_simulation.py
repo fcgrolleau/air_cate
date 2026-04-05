@@ -59,8 +59,8 @@ QUICK_CONFIG = dict(
 )
 
 LARGE_CONFIG = dict(
-    n_values=[500, 1000, 2000, 3000, 5000],
-    n_seeds=5,
+    n_values=[500, 1000, 2000, 5000, 10000],
+    n_seeds=20,
     n_test=1000,
     M=50,
     n_folds=3,
