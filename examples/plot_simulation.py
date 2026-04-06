@@ -19,6 +19,9 @@ import os
 import sys
 import time
 
+from scipy.stats import chi2 as chi2_dist
+from scipy.stats import t as t_dist
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -60,7 +63,7 @@ QUICK_CONFIG = dict(
 
 LARGE_CONFIG = dict(
     n_values=[500, 1000, 2000, 5000, 10000],
-    n_seeds=20,
+    n_seeds=50,
     n_test=1000,
     M=50,
     n_folds=3,
@@ -276,7 +279,9 @@ def _pop_avg_imse(dgp_class, X_test, M):
 
 
 def plot_convergence(results, n_values, cfg, X_test):
-    """Two-panel convergence plot (one per DGP), one curve per method."""
+    """Four-panel convergence plot: mean iMSE (top) and variance (bottom) per DGP."""
+    from matplotlib.ticker import FixedLocator, FixedFormatter
+
     plt.rcParams.update({
         "font.family": "serif",
         "mathtext.fontset": "cm",
@@ -287,26 +292,34 @@ def plot_convergence(results, n_values, cfg, X_test):
         "ytick.major.width": 0.6,
     })
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9),
+                             sharex="col", sharey="row")
+    ax_mean = axes[0]   # top row: mean iMSE
+    ax_var = axes[1]     # bottom row: variance of iMSE
 
-    for ax, (dgp_name, dgp_class) in zip(axes, DGPS):
+    for col, (dgp_name, dgp_class) in enumerate(DGPS):
         dgp_results = results[dgp_name]
 
-        # --- Population-average reference line ---
+        # --- Population-average reference line (top row only) ---
         pa_imse = _pop_avg_imse(dgp_class, X_test, cfg["M"])
-        ax.axhline(pa_imse, color="#888888", ls="--", linewidth=1.2,
-                    zorder=1, label="True tv-ATE")
+        ax_mean[col].axhline(pa_imse, color="#888888", ls="--", linewidth=1.2,
+                              zorder=1, label="True tv-ATE")
 
-        # --- Method curves with shaded SE bands ---
+        # --- Method curves ---
         for method_name, _ in METHODS:
             vals = dgp_results[method_name]
-            means = np.array([np.mean(vals[n]) for n in n_values])
-            ses = np.array([np.std(vals[n]) / max(np.sqrt(len(vals[n])), 1)
-                            for n in n_values])
             st = METHOD_STYLES[method_name]
             label = METHOD_LABELS[method_name]
 
-            ax.plot(
+            # --- Top row: mean iMSE with 95% CI (t-distribution) ---
+            means = np.array([np.mean(vals[n]) for n in n_values])
+            ses = np.array([np.std(vals[n], ddof=1) / np.sqrt(len(vals[n]))
+                            for n in n_values])
+            t_crit = np.array([t_dist.ppf(0.975, len(vals[n]) - 1)
+                               for n in n_values])
+            hw = t_crit * ses
+
+            ax_mean[col].plot(
                 n_values, means,
                 marker=st["marker"], ls=st["ls"],
                 linewidth=st["lw"], markersize=st["ms"],
@@ -314,37 +327,70 @@ def plot_convergence(results, n_values, cfg, X_test):
                 markeredgecolor="white", markeredgewidth=0.5,
                 label=label, zorder=st["zorder"],
             )
-            ax.fill_between(
-                n_values, means - ses, means + ses,
+            ax_mean[col].fill_between(
+                n_values, means - hw, means + hw,
                 color=st["color"], alpha=0.12, zorder=st["zorder"] - 1,
             )
 
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("Sample size", fontsize=10.5)
-        ax.set_title(f"{dgp_name} DGP", fontsize=11.5, fontweight="bold", pad=8)
-        ax.set_xticks(n_values)
-        ax.set_xticklabels([str(n) for n in n_values], fontsize=8.5)
-        from matplotlib.ticker import FixedLocator, FixedFormatter
-        y_ticks = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
-        ax.yaxis.set_major_locator(FixedLocator(y_ticks))
-        ax.yaxis.set_major_formatter(FixedFormatter([str(v) for v in y_ticks]))
-        ax.tick_params(axis="y", labelsize=8.5)
-        ax.grid(True, alpha=0.12, linewidth=0.4)
+            # --- Bottom row: variance of iMSE with 95% CI (chi-squared) ---
+            variances = np.array([np.var(vals[n], ddof=1) for n in n_values])
+            var_lo = np.array([
+                (len(vals[n]) - 1) * np.var(vals[n], ddof=1)
+                / chi2_dist.ppf(0.975, len(vals[n]) - 1)
+                for n in n_values
+            ])
+            var_hi = np.array([
+                (len(vals[n]) - 1) * np.var(vals[n], ddof=1)
+                / chi2_dist.ppf(0.025, len(vals[n]) - 1)
+                for n in n_values
+            ])
 
-    axes[0].set_ylabel("Mean Squared Error", fontsize=10.5)
+            ax_var[col].plot(
+                n_values, variances,
+                marker=st["marker"], ls=st["ls"],
+                linewidth=st["lw"], markersize=st["ms"],
+                color=st["color"],
+                markeredgecolor="white", markeredgewidth=0.5,
+                label=label, zorder=st["zorder"],
+            )
+            ax_var[col].fill_between(
+                n_values, var_lo, var_hi,
+                color=st["color"], alpha=0.12, zorder=st["zorder"] - 1,
+            )
 
-    # Shared legend below panels — order: reference, then solid, then dashed
-    handles, labels = axes[0].get_legend_handles_labels()
+        # --- Axes formatting ---
+        for row_axes in (ax_mean, ax_var):
+            row_axes[col].set_xscale("log")
+            row_axes[col].set_yscale("log")
+            row_axes[col].set_xticks(n_values)
+            row_axes[col].set_xticklabels([str(n) for n in n_values], fontsize=8.5)
+            row_axes[col].tick_params(axis="y", labelsize=8.5)
+            row_axes[col].grid(True, alpha=0.12, linewidth=0.4)
+
+        ax_mean[col].set_title(f"{dgp_name} DGP", fontsize=11.5,
+                                fontweight="bold", pad=8)
+        ax_var[col].set_xlabel("Sample size", fontsize=10.5)
+
+        # y-ticks for mean panels
+        y_ticks_mean = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+        ax_mean[col].yaxis.set_major_locator(FixedLocator(y_ticks_mean))
+        ax_mean[col].yaxis.set_major_formatter(
+            FixedFormatter([str(v) for v in y_ticks_mean]))
+
+    ax_mean[0].set_ylabel("Average MSE", fontsize=10.5)
+    ax_var[0].set_ylabel("Variance of MSE", fontsize=10.5)
+
+    # Shared legend below all panels
+    handles, labels = ax_mean[0].get_legend_handles_labels()
     # Reorder: True tv-ATE first, then solid methods, then oracle (dashed)
     order = [0, 1, 2, 5, 6, 3, 4]  # tv-ATE, AIR, TP, RSF-T, RSF-S, AIR-orc, TP-orc
     handles = [handles[i] for i in order]
     labels = [labels[i] for i in order]
     fig.legend(handles, labels, loc="lower center", ncol=4,
-               fontsize=7.5, frameon=False, bbox_to_anchor=(0.5, -0.04),
+               fontsize=7.5, frameon=False, bbox_to_anchor=(0.5, -0.02),
                columnspacing=1.5, handletextpad=0.6)
 
-    fig.tight_layout(rect=[0, 0.10, 1, 1], w_pad=2.5)
+    fig.tight_layout(rect=[0, 0.06, 1, 1], w_pad=2.5, h_pad=1.5)
     for ext in ("png", "pdf"):
         path = os.path.join(FIGURES_DIR, f"simulation_convergence.{ext}")
         fig.savefig(path, dpi=200, bbox_inches="tight")
