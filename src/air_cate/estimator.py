@@ -1,11 +1,11 @@
 """Top-level AIREstimator: orchestrates nuisance estimation, pseudo-outcomes, and CATE model."""
 
 import jax.numpy as jnp
-import keras
 import numpy as np
 
 from air_cate._types import SurvivalData
 from air_cate.cate_model.mixture import CATEMixture
+from air_cate.cate_model.train import train_cate
 from air_cate.nuisance.cross_fit import cross_fit_nuisances
 from air_cate.pseudo_outcome import compute_pseudo_outcomes
 from air_cate.utils import build_time_grid
@@ -32,6 +32,14 @@ class AIREstimator:
         cate_lr: Learning rate for the CATE model.
         cate_batch_size: Batch size for the CATE model.
         weight_decay: Weight decay for AdamW optimizer.
+        patience: Epochs without training-loss improvement before early stopping.
+            None trains the full `cate_epochs`.
+        rng_seed: Seed for minibatch shuffling. None uses fresh entropy.
+
+    Attributes (after fit):
+        cate_model_: The fitted CATE model.
+        time_grid_, delta_: The time grid and its step size.
+        history_: dict returned by `train_cate` (per-epoch loss trajectory).
     """
 
     def __init__(
@@ -48,6 +56,8 @@ class AIREstimator:
         cate_lr: float = 1e-3,
         cate_batch_size: int = 256,
         weight_decay: float = 1e-4,
+        patience: int | None = 10,
+        rng_seed: int | None = None,
         cate_model_class=None,
         cate_model_kwargs: dict | None = None,
     ):
@@ -63,12 +73,15 @@ class AIREstimator:
         self.cate_lr = cate_lr
         self.cate_batch_size = cate_batch_size
         self.weight_decay = weight_decay
+        self.patience = patience
+        self.rng_seed = rng_seed
         self.cate_model_class = cate_model_class
         self.cate_model_kwargs = cate_model_kwargs or {}
 
         self.cate_model_ = None
         self.time_grid_ = None
         self.delta_ = None
+        self.history_ = None
 
     def fit(
         self,
@@ -129,126 +142,28 @@ class AIREstimator:
                 encoder_hidden_sizes=self.encoder_hidden_sizes,
             )
 
-        self.cate_model_.compile(
-            optimizer=keras.optimizers.AdamW(
-                learning_rate=self.cate_lr,
-                weight_decay=self.weight_decay,
-            ),
+        # A custom training loop is needed because Keras model.fit() with dict x
+        # and dict y requires a Dataset that preserves the structure.
+        self.history_ = train_cate(
+            self.cate_model_,
+            X=data.X,
+            Y_tilde=Y_tilde,
+            S_marg=S_marg,
+            W=data.W,
+            e_clipped=e_clipped,
+            time_grid=self.time_grid_,
+            delta=self.delta_,
+            epochs=self.cate_epochs,
+            lr=self.cate_lr,
+            batch_size=self.cate_batch_size,
+            weight_decay=self.weight_decay,
+            monitor="train",
+            patience=self.patience,
+            rng_seed=self.rng_seed,
+            verbose=verbose,
         )
-
-        # Prepare training data: x is dict with X and time_grid, y is dict of nuisance quantities
-        x_train = {
-            "X": np.asarray(data.X),
-            "time_grid": np.asarray(self.time_grid_),
-        }
-        y_train = {
-            "Y_tilde": np.asarray(Y_tilde),
-            "S_marg": np.asarray(S_marg),
-            "W": np.asarray(data.W),
-            "e_clipped": np.asarray(e_clipped),
-            "delta": self.delta_,
-        }
-
-        # Use a custom training loop since Keras model.fit() with dict y
-        # and dict x requires a Dataset that preserves the structure
-        self._train_cate(x_train, y_train, verbose=verbose)
 
         return self
-
-    def _train_cate(self, x_train: dict, y_train: dict, verbose: int = 0):
-        """Custom training loop for CATEMixture."""
-        import jax
-
-        n = x_train["X"].shape[0]
-        X_jax = jnp.array(x_train["X"])
-        time_grid_jax = jnp.array(x_train["time_grid"])
-        Y_tilde_jax = jnp.array(y_train["Y_tilde"])
-        S_marg_jax = jnp.array(y_train["S_marg"])
-        W_jax = jnp.array(y_train["W"])
-        e_clipped_jax = jnp.array(y_train["e_clipped"])
-        delta = float(y_train["delta"])
-
-        optimizer = keras.optimizers.AdamW(
-            learning_rate=self.cate_lr,
-            weight_decay=self.weight_decay,
-        )
-        # Build the model by calling it once
-        self.cate_model_({"X": X_jax[:1], "time_grid": time_grid_jax})
-        optimizer.build(self.cate_model_.trainable_variables)
-
-        from air_cate.r_loss import r_loss as r_loss_fn
-
-        def _extract_vars(keras_vars):
-            """Extract JAX arrays from Keras variables."""
-            return [jnp.array(v.value) for v in keras_vars]
-
-        def _assign_vars(keras_vars, values):
-            """Assign JAX arrays back to Keras variables."""
-            for var, val in zip(keras_vars, values):
-                var.assign(val)
-
-        @jax.jit
-        def train_step(trainable_vars, non_trainable_vars, opt_vars, X_batch, Y_tilde_batch, S_marg_batch, W_batch, e_batch):
-            def loss_fn(trainable_vars):
-                tau_pred, _ = self.cate_model_.stateless_call(
-                    trainable_vars, non_trainable_vars,
-                    {"X": X_batch, "time_grid": time_grid_jax},
-                )
-                return r_loss_fn(tau_pred, Y_tilde_batch, S_marg_batch, W_batch, e_batch, delta)
-
-            loss, grads = jax.value_and_grad(loss_fn)(trainable_vars)
-            trainable_vars, opt_vars = optimizer.stateless_apply(opt_vars, grads, trainable_vars)
-            return loss, trainable_vars, opt_vars
-
-        best_loss = float("inf")
-        patience_counter = 0
-        patience = 10
-        best_weights = None
-
-        for epoch in range(self.cate_epochs):
-            perm = np.random.permutation(n)
-            epoch_losses = []
-
-            for start in range(0, n, self.cate_batch_size):
-                idx = perm[start : start + self.cate_batch_size]
-
-                # Extract pure JAX arrays from Keras variables
-                tv = _extract_vars(self.cate_model_.trainable_variables)
-                ntv = _extract_vars(self.cate_model_.non_trainable_variables)
-                ov = _extract_vars(optimizer.variables)
-
-                loss, new_tv, new_ov = train_step(
-                    tv, ntv, ov,
-                    X_jax[idx],
-                    Y_tilde_jax[idx],
-                    S_marg_jax[idx],
-                    W_jax[idx],
-                    e_clipped_jax[idx],
-                )
-
-                _assign_vars(self.cate_model_.trainable_variables, new_tv)
-                _assign_vars(optimizer.variables, new_ov)
-
-                epoch_losses.append(float(loss))
-
-            mean_loss = np.mean(epoch_losses)
-
-            if verbose > 0 and (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch + 1}/{self.cate_epochs}, loss: {mean_loss:.6f}")
-
-            if mean_loss < best_loss - 1e-6:
-                best_loss = mean_loss
-                patience_counter = 0
-                best_weights = _extract_vars(self.cate_model_.trainable_variables)
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    if verbose > 0:
-                        print(f"Early stopping at epoch {epoch + 1}")
-                    break
-
-        if best_weights is not None:
-            _assign_vars(self.cate_model_.trainable_variables, best_weights)
 
     def predict_tau(self, X: np.ndarray) -> np.ndarray:
         """Predict tau(t|x) on the training time grid.

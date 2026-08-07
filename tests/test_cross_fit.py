@@ -74,3 +74,20 @@ def test_cross_fit_propensity_range():
 
     assert jnp.all(nuisances.e_hat > 0)
     assert jnp.all(nuisances.e_hat < 1)
+
+
+def test_cross_fit_does_not_mutate_training_config():
+    """The caller's training_config dict is left untouched.
+
+    AIREstimatorCV reuses one config dict across many cross-fitting runs, so the
+    internal setdefault calls must operate on a copy.
+    """
+    data = _make_simple_data(n=200, p=3)
+    t_grid = jnp.linspace(0, 5.0, 21)
+
+    config = {"epochs": 5, "verbose": 0}
+    cross_fit_nuisances(data, t_grid, n_folds=2, training_config=config)
+
+    assert config == {"epochs": 5, "verbose": 0}, (
+        f"caller's config was mutated: {config}"
+    )

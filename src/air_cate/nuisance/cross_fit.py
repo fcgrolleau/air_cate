@@ -41,7 +41,9 @@ def cross_fit_nuisances(
     """
     prop_cfg = propensity_config or {}
     weib_cfg = weibull_config or {}
-    train_cfg = training_config or {}
+    # Copy: the setdefault calls below must not mutate the caller's dict, since
+    # AIREstimatorCV reuses one config dict across many cross-fitting runs.
+    train_cfg = dict(training_config or {})
     train_cfg.setdefault("epochs", 100)
     train_cfg.setdefault("batch_size", 256)
     train_cfg.setdefault("lr", 1e-3)
@@ -90,7 +92,8 @@ def cross_fit_nuisances(
 
             if X_arm.shape[0] < 20:
                 warnings.warn(
-                    f"Fold {fold_idx}, arm {w}: only {X_arm.shape[0]} subjects. "
+                    f"Fold {fold_idx}, arm {w}: only {X_arm.shape[0]} subjects "
+                    f"(block of n={n} split into {n_folds} folds). "
                     "Nuisance estimates may be unreliable.",
                     stacklevel=2,
                 )

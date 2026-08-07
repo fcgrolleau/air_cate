@@ -126,3 +126,31 @@ def test_estimator_predict_shapes():
 
     assert tau.shape == (10, 11)  # M=10, so M+1=11 grid points
     assert gamma.shape == (10, 11)
+
+
+def test_estimator_records_history():
+    """fit() exposes the per-epoch training loss trajectory on history_."""
+    from air_cate.estimator import AIREstimator
+
+    rng = np.random.default_rng(0)
+    n, p = 200, 5
+    X = rng.uniform(-1, 1, (n, p)).astype(np.float32)
+    W = rng.binomial(1, 0.5, n).astype(np.float32)
+    Z = rng.exponential(2.0, n).astype(np.float32)
+    Delta = rng.binomial(1, 0.7, n).astype(np.float32)
+
+    est = AIREstimator(
+        K=2, M=10, n_folds=2, eps=0.01,
+        encoder_hidden_sizes=(16,),
+        nuisance_training_config={"epochs": 5, "verbose": 0},
+        cate_epochs=10,
+        patience=None,  # train the full 10 epochs
+        rng_seed=0,
+    )
+    est.fit(X, W, Z, Delta, t_end=5.0, verbose=0)
+
+    assert est.history_ is not None
+    assert len(est.history_["train_loss"]) == 10
+    assert est.history_["val_loss"] is None, "no validation split in AIREstimator"
+    assert est.history_["monitor"] == "train"
+    assert np.all(np.isfinite(est.history_["train_loss"]))

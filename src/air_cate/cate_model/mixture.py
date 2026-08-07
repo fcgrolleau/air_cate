@@ -34,10 +34,17 @@ class CATEMixture(keras.Model):
         self.alpha_raw = self.add_weight(
             name="alpha_raw", shape=(), initializer="ones"
         )
+        # Random init breaks the symmetry between the two arms. With a constant
+        # initializer, lambda_{k,1} == lambda_{k,0} makes TE_k(t) identically 0,
+        # hence tau == 0 and d tau / d rho == 0: the encoder, the gate and
+        # alpha_raw all receive exactly zero gradient, and only lambda_raw can
+        # move. Escaping that state takes ~50-100 epochs, so patience-based
+        # early stopping usually halts training first and every tv-CATE curve
+        # collapses to 0.
         self.lambda_raw = self.add_weight(
             name="lambda_raw",
             shape=(K, 2),
-            initializer="ones",
+            initializer=keras.initializers.RandomNormal(mean=1.0, stddev=0.5),
         )
 
     def call(self, inputs):
