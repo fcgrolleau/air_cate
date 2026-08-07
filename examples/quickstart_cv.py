@@ -48,14 +48,6 @@ def screen_K(X, W, Z, Delta, t_end):
         nuisance_training_config={"epochs": 40, "verbose": 0},
         cate_epochs=100,
         cate_lr=1e-3,
-        # Each epoch's *training* loss is a mean over minibatches, while the
-        # held-out loss is one clean full-block pass. The R-loss weights subjects
-        # by 1/e_clipped, so it is heavy-tailed: with the default batch_size=256
-        # an 800-row training block gives only ~3 minibatches per epoch, and a
-        # single extreme subject swings that mean far more than the held-out curve
-        # ever moves -- which makes the convergence grid unreadable. Smaller
-        # batches average more of that noise away.
-        cate_batch_size=64,
     )
     cv.fit(X, W, Z, Delta, t_end, verbose=1)
     return cv
@@ -144,7 +136,6 @@ def main():
         nuisance_training_config={"epochs": 40, "verbose": 0},
         cate_epochs=150,
         cate_lr=1e-3,
-        cate_batch_size=64,  # match the screen, so K carries over meaningfully
     )
     est.fit(X, W, Z, Delta, t_end, verbose=1)
 

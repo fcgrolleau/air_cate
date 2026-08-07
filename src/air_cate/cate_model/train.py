@@ -67,7 +67,10 @@ def train_cate(
 
     Returns:
         history: dict with keys
-            train_loss: list of per-epoch mean training R-loss.
+            train_loss: list of per-epoch training R-loss, averaged over
+                minibatches weighted by batch size (so each subject counts once
+                per epoch). Still a running average over the epoch's parameter
+                trajectory rather than the loss at a single parameter value.
             val_loss: list of per-epoch validation R-loss, or None.
             best_epoch: 0-indexed epoch minimizing the monitored loss.
             best_train_loss: training loss at best_epoch.
@@ -146,7 +149,7 @@ def train_cate(
     for epoch in range(epochs):
         stopped_epoch = epoch
         perm = rng.permutation(n)
-        epoch_losses = []
+        epoch_loss_sum = 0.0
 
         for start in range(0, n, batch_size):
             idx = perm[start : start + batch_size]
@@ -168,9 +171,19 @@ def train_cate(
             _assign_vars(model.trainable_variables, new_tv)
             _assign_vars(optimizer.variables, new_ov)
 
-            epoch_losses.append(float(loss))
+            # Weight each batch by its size rather than equally. The R-loss is a
+            # mean over subjects, so an equal-weight average over unequal batches
+            # over-weights the final short batch of n % batch_size rows -- 32 rows
+            # carrying 1/4 of the weight at n=800, batch_size=256. The per-subject
+            # loss is heavy-tailed (top contributions ~5x the mean), so reshuffling
+            # alone then moves the epoch number by sd ~0.39 against a real
+            # epoch-to-epoch movement of ~0.05: the training curve becomes almost
+            # pure shuffle noise, and early stopping on it fires at random.
+            # Size-weighting makes each subject count once per epoch, so the epoch
+            # loss is shuffle-invariant.
+            epoch_loss_sum += float(loss) * len(idx)
 
-        mean_loss = float(np.mean(epoch_losses))
+        mean_loss = epoch_loss_sum / n
         train_history.append(mean_loss)
 
         if validation_data is not None:
