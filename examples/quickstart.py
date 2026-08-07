@@ -1,8 +1,20 @@
-"""Quickstart example: estimate time-varying CATE on synthetic Weibull data."""
+"""Quickstart example: estimate time-varying CATE on synthetic Weibull data.
+
+Usage:
+  uv run python examples/quickstart.py                  # fit and print
+  uv run --extra plots python examples/quickstart.py    # also save the convergence plot
+"""
+
+import os
 
 import numpy as np
 
 from air_cate import AIREstimator
+
+# Imported after air_cate, which sets KERAS_BACKEND=jax before Keras loads.
+import keras  # noqa: E402
+
+FIGURES_DIR = os.path.join(os.path.dirname(__file__), "figures")
 
 
 def generate_data(n=1000, p=5, rng_seed=0):
@@ -35,7 +47,44 @@ def true_cate(t, X):
     return np.exp(-((t[None, :] / s1) ** shape)) - np.exp(-((t[None, :] / s0) ** shape))
 
 
+def save_convergence_figure(est):
+    """Save the CATE stage's training curve, if matplotlib is installed.
+
+    Worth a look on every fit: the curve is what says whether `cate_epochs` was
+    enough. AIREstimator early-stops on the training loss, which here descends
+    essentially monotonically, so patience never fires and the run uses its full
+    budget -- meaning a curve still sloping down at the right edge is a signal to
+    raise the budget, not evidence that the optimizer had finished.
+    """
+    try:
+        import matplotlib
+    except ImportError:
+        print("\nmatplotlib not installed; skipping the convergence figure.")
+        print("Install with: uv sync --extra plots")
+        return
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(FIGURES_DIR, exist_ok=True)
+    path = os.path.join(FIGURES_DIR, "quickstart_convergence.png")
+
+    fig, _ = est.plot_convergence()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    n_epochs = len(est.history_["train_loss"])
+    best = est.history_["best_epoch"] + 1  # history is 0-indexed
+    print(f"\nRan {n_epochs} CATE epochs; best training loss at epoch {best}.")
+    print(f"Saved: {path}")
+
+
 def main():
+    # Seed network initialization and Keras-side shuffling; `rng_seed` below seeds
+    # the CATE minibatch order. Without both, the printed iMSE and the saved
+    # convergence figure move from run to run.
+    keras.utils.set_random_seed(0)
+
     print("Generating synthetic data...")
     X_train, W, Z, Delta = generate_data(n=1500, rng_seed=42)
     t_end = 5.0
@@ -49,6 +98,7 @@ def main():
         nuisance_training_config={"epochs": 50, "verbose": 0},
         cate_epochs=150,
         cate_lr=1e-3,
+        rng_seed=0,
     )
     est.fit(X_train, W, Z, Delta, t_end, verbose=1)
 
@@ -72,6 +122,8 @@ def main():
     print(f"\nSubject {idx} (x_1 = {X_test[idx, 1]:.2f}):")
     for m in [0, 10, 25, 40, 50]:
         print(f"  t={t_grid[m]:.1f}: tau_hat={tau_hat[idx, m]:.4f}, tau_true={tau_true[idx, m]:.4f}")
+
+    save_convergence_figure(est)
 
 
 if __name__ == "__main__":

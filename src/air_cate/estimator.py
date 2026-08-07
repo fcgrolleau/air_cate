@@ -40,6 +40,7 @@ class AIREstimator:
         cate_model_: The fitted CATE model.
         time_grid_, delta_: The time grid and its step size.
         history_: dict returned by `train_cate` (per-epoch loss trajectory).
+            `plot_convergence()` draws it.
     """
 
     def __init__(
@@ -164,6 +165,32 @@ class AIREstimator:
         )
 
         return self
+
+    def plot_convergence(self, **kwargs):
+        """Plot the training AIR CATE loss against epoch. See `air_cate.plotting`.
+
+        A convergence check on the CATE stage: if the curve is still descending at
+        the last epoch, `cate_epochs` was too small. Because `fit` trains with no
+        validation split, this is a training curve only -- it says whether the
+        optimizer converged, not whether the chosen K generalizes. Use
+        `AIREstimatorCV.plot_convergence_grid` for held-out curves.
+
+        Requires matplotlib, which ships in the optional [plots] extra:
+        `uv sync --extra plots`.
+
+        Args:
+            **kwargs: Forwarded to `air_cate.plotting.plot_convergence`
+                (`ax`, `log_y`, `mark_best`, `title`, `figsize`).
+
+        Returns:
+            (fig, ax)
+        """
+        if self.history_ is None:
+            raise RuntimeError("Call fit() before plot_convergence().")
+
+        from air_cate.plotting import plot_convergence
+
+        return plot_convergence(self.history_, **kwargs)
 
     def predict_tau(self, X: np.ndarray) -> np.ndarray:
         """Predict tau(t|x) on the training time grid.

@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from air_cate.plotting import (  # noqa: E402
     _paired_stats,
+    plot_convergence,
     plot_convergence_grid,
     plot_cv_curve,
     plot_cv_paired,
@@ -102,6 +103,157 @@ def test_paired_stats_reference_choice_shifts_but_does_not_reorder():
 
     np.testing.assert_allclose(mean_2 - mean_0, mean_2[0] - mean_0[0])
     assert np.argmin(mean_0) == np.argmin(mean_2) == 2
+
+
+# ---------------------------------------------------------------------------
+# plot_convergence
+# ---------------------------------------------------------------------------
+
+def _fake_history(with_val=False, best=None, monitor=None):
+    """One `train_cate`-shaped history for a single fit.
+
+    The training curve decays monotonically; the validation curve, when present,
+    bottoms out at epoch index 3 and rises after it, so a val-monitored best epoch
+    lands somewhere the train-monitored one never would.
+    """
+    epochs = np.arange(N_EPOCHS, dtype=float)
+    train = 3.0 - 0.05 * epochs
+    val = 3.5 + 0.02 * (epochs - 3.0) ** 2
+    if monitor is None:
+        monitor = "val" if with_val else "train"
+    if best is None:
+        best = int(np.argmin(val)) if monitor == "val" else N_EPOCHS - 1
+    return {
+        "train_loss": train.tolist(),
+        "val_loss": val.tolist() if with_val else None,
+        "best_epoch": best,
+        "best_train_loss": float(train[best]),
+        "best_val_loss": float(val[best]) if with_val else None,
+        "stopped_epoch": N_EPOCHS - 1,
+        "monitor": monitor,
+    }
+
+
+def _best_marker(ax):
+    """The single-point Line2D drawn for the best epoch, or None."""
+    for line in ax.lines:
+        if len(line.get_xdata()) == 1:
+            return line
+    return None
+
+
+def test_plot_convergence_draws_one_curve_without_validation():
+    """AIREstimator has no validation split, so the usual case is a lone curve."""
+    fig, ax = plot_convergence(_fake_history())
+    try:
+        curves = [line for line in ax.lines if len(line.get_ydata()) == N_EPOCHS]
+        assert len(curves) == 1
+        # The x axis counts epochs from 1, not from 0.
+        assert list(curves[0].get_xdata()) == list(range(1, N_EPOCHS + 1))
+        assert ax.get_ylabel() == "Training AIR CATE loss"
+        assert ax.get_xlabel() == "Epoch"
+    finally:
+        plt.close(fig)
+
+
+def test_plot_convergence_adds_the_validation_curve_when_present():
+    fig, ax = plot_convergence(_fake_history(with_val=True))
+    try:
+        curves = [line for line in ax.lines if len(line.get_ydata()) == N_EPOCHS]
+        assert len(curves) == 2
+        _, labels = ax.get_legend_handles_labels()
+        assert "Training loss" in labels
+        assert "Held-out loss" in labels
+        assert ax.get_ylabel() == "AIR CATE loss"
+    finally:
+        plt.close(fig)
+
+
+def test_plot_convergence_marks_the_best_epoch_one_indexed():
+    """`best_epoch` is 0-indexed in the history; the marker must be shifted by one."""
+    history = _fake_history(best=4, monitor="train")
+    fig, ax = plot_convergence(history)
+    try:
+        marker = _best_marker(ax)
+        assert marker is not None, "no best-epoch marker drawn"
+        assert float(marker.get_xdata()[0]) == pytest.approx(5.0)
+        assert float(marker.get_ydata()[0]) == pytest.approx(
+            history["train_loss"][4]
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_plot_convergence_marks_best_on_the_monitored_curve():
+    """A val-monitored run kept the best *validation* epoch's weights.
+
+    Marking the training curve there would name a loss that no selection rule ever
+    looked at, so the marker must follow `history["monitor"]`.
+    """
+    history = _fake_history(with_val=True)
+    assert history["monitor"] == "val"
+    best = history["best_epoch"]
+    fig, ax = plot_convergence(history)
+    try:
+        marker = _best_marker(ax)
+        assert float(marker.get_ydata()[0]) == pytest.approx(
+            history["val_loss"][best]
+        )
+        assert float(marker.get_ydata()[0]) != pytest.approx(
+            history["train_loss"][best]
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_plot_convergence_shades_only_when_the_best_is_not_the_last_epoch():
+    """The shaded tail is the stretch that failed to improve; a monotone run has none."""
+    fig, ax = plot_convergence(_fake_history(best=N_EPOCHS - 1, monitor="train"))
+    try:
+        _, labels = ax.get_legend_handles_labels()
+        assert "No further improvement" not in labels
+    finally:
+        plt.close(fig)
+
+    fig, ax = plot_convergence(_fake_history(with_val=True))
+    try:
+        _, labels = ax.get_legend_handles_labels()
+        assert "No further improvement" in labels
+    finally:
+        plt.close(fig)
+
+
+def test_plot_convergence_mark_best_off_drops_the_marker():
+    fig, ax = plot_convergence(_fake_history(best=4, monitor="train"), mark_best=False)
+    try:
+        assert _best_marker(ax) is None
+    finally:
+        plt.close(fig)
+
+
+def test_plot_convergence_log_y():
+    fig, ax = plot_convergence(_fake_history(), log_y=True)
+    try:
+        assert ax.get_yscale() == "log"
+    finally:
+        plt.close(fig)
+
+
+def test_plot_convergence_draws_into_a_supplied_axes():
+    """So a caller can compose it into a multi-panel figure."""
+    fig, (ax_left, ax_right) = plt.subplots(1, 2)
+    try:
+        fig_out, ax_out = plot_convergence(_fake_history(), ax=ax_right)
+        assert ax_out is ax_right
+        assert fig_out is fig
+        assert not ax_left.lines
+    finally:
+        plt.close(fig)
+
+
+def test_plot_convergence_rejects_an_empty_history():
+    with pytest.raises(ValueError, match="empty"):
+        plot_convergence({"train_loss": [], "val_loss": None})
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,132 @@ def _paired_stats(fold_loss, ref_index: int):
     return diff, mean, se
 
 
+def plot_convergence(
+    history: dict,
+    ax=None,
+    log_y: bool = False,
+    mark_best: bool = True,
+    title: str | None = "AIR CATE loss by training epoch",
+    figsize: tuple[float, float] = (6.0, 3.8),
+    **plot_kwargs,
+):
+    """Plot the AIR CATE loss against training epoch for a single fit.
+
+    This is the single-fit counterpart to `plot_convergence_grid`: one panel for one
+    model, rather than a grid over (K, fold). Use it to check that the CATE stage
+    actually converged before reading anything off the fitted model.
+
+    The x axis counts epochs from 1, while `history["best_epoch"]` is 0-indexed as
+    `train_cate` returns it; the conversion happens here so callers never see it.
+
+    Both curves are plotted on one shared axis, without the per-curve normalization
+    `plot_convergence_grid` defaults to. That is safe here because a single fit's
+    training and validation losses come from nuisances cross-fit on the same rows, so
+    they sit at comparable levels -- unlike the grid, where the held-out block's
+    nuisances are estimated from far fewer rows and the level gap swamps the
+    trajectories. `AIREstimator` trains with no validation split at all, so in the
+    usual case there is one curve.
+
+    How to read it: a curve still descending at the last epoch means the budget was
+    too small -- raise `cate_epochs`. A curve flat from early on means the budget was
+    ample. When a validation curve is present, judge overfitting by its slope turning
+    upward, and note that the epochs after the marked best one are the ones early
+    stopping was measuring against; the fitted weights are the best epoch's, not the
+    last one's.
+
+    Args:
+        history: The `history_` dict from AIREstimator (or one value of
+            AIREstimatorCV's `histories_`), as returned by `train_cate`.
+        ax: Optional existing axes to draw into.
+        log_y: Use a log y scale. Useful when the first few epochs dwarf the rest.
+        mark_best: Mark the best epoch on the monitored curve, and shade the epochs
+            after it -- the stretch over which the loss failed to improve.
+        title: Axes title. None suppresses it.
+        figsize: Figure size when creating a new figure.
+        **plot_kwargs: Forwarded to `ax.plot` for the training curve.
+
+    Returns:
+        (fig, ax)
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.ticker import MaxNLocator
+
+    apply_style()
+
+    train = np.asarray(history["train_loss"], dtype=float)
+    if train.size == 0:
+        raise ValueError("history['train_loss'] is empty; nothing to plot.")
+    val = history.get("val_loss")
+    val = None if val is None else np.asarray(val, dtype=float)
+    epochs = np.arange(1, len(train) + 1)
+
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+    else:
+        fig = ax.figure
+
+    plot_kwargs.setdefault("lw", 2.0)
+    ax.plot(
+        epochs, train,
+        color=_JAMA["teal"], ls="-",
+        label="Training loss", zorder=3, **plot_kwargs,
+    )
+    if val is not None:
+        ax.plot(
+            epochs, val,
+            color=_JAMA["orange"], ls="--", lw=2.0,
+            label="Held-out loss", zorder=4,
+        )
+
+    # The best epoch is chosen on whichever curve `train_cate` monitored, so mark it
+    # there: on a validation-monitored run the minimum of the training curve is a
+    # different epoch, and marking that one would misreport which weights were kept.
+    monitored = val if (history.get("monitor") == "val" and val is not None) else train
+    if mark_best and "best_epoch" in history:
+        best = int(history["best_epoch"])
+        if 0 <= best < len(monitored):
+            # Shade the tail first so the curves and marker draw over it.
+            if best < len(monitored) - 1:
+                ax.axvspan(
+                    best + 1, len(monitored),
+                    color="#888888", alpha=0.06, zorder=0,
+                    label="No further improvement",
+                )
+            ax.axvline(best + 1, color="#888888", ls=":", lw=0.8, zorder=1)
+            ax.plot(
+                best + 1, monitored[best],
+                marker="o", markersize=10, markerfacecolor="none",
+                markeredgecolor=_JAMA["red"], markeredgewidth=1.6,
+                linestyle="none", zorder=5,
+                label=f"Best epoch ({best + 1}, loss {monitored[best]:.4f})",
+            )
+
+    if log_y:
+        ax.set_yscale("log")
+
+    ax.set_xlabel("Epoch", fontsize=10.5)
+    ax.set_ylabel(
+        "AIR CATE loss" if val is not None else "Training AIR CATE loss",
+        fontsize=10.5,
+    )
+    if title is not None:
+        ax.set_title(title, fontsize=11.5, fontweight="bold", pad=8)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.tick_params(labelsize=8.5)
+    ax.grid(True, alpha=0.12, linewidth=0.4)
+    # The best epoch is very often the last one (a monotone training curve never
+    # trips patience), which puts the marker on the axes boundary and clips it.
+    ax.margins(x=0.02, y=0.10)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(handles, labels, fontsize=8, frameon=False, loc="best")
+
+    fig.tight_layout()
+    return fig, ax
+
+
 def plot_cv_curve(
     cv_results: dict,
     ax=None,

@@ -154,3 +154,27 @@ def test_estimator_records_history():
     assert est.history_["val_loss"] is None, "no validation split in AIREstimator"
     assert est.history_["monitor"] == "train"
     assert np.all(np.isfinite(est.history_["train_loss"]))
+
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = est.plot_convergence()
+    try:
+        curve = next(
+            line for line in ax.lines if len(line.get_ydata()) == 10
+        )
+        np.testing.assert_allclose(
+            curve.get_ydata(), est.history_["train_loss"], rtol=1e-12
+        )
+        assert ax.get_ylabel() == "Training AIR CATE loss"
+    finally:
+        plt.close(fig)
+
+
+def test_plot_convergence_before_fit_raises():
+    """The error names the fix, rather than surfacing a None dereference."""
+    from air_cate.estimator import AIREstimator
+
+    with pytest.raises(RuntimeError, match="Call fit"):
+        AIREstimator().plot_convergence()
