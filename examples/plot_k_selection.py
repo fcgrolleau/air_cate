@@ -6,7 +6,7 @@ arms -- and produces two figures:
   k_selection_cv           CV AIR CATE loss against K, on two scales: absolute
                            (shows the level and the fold offsets) and paired
                            against the reference K (decide K from this one).
-  k_selection_convergence  Grid of convergence curves: columns = K, rows = CV run.
+  k_selection_convergence  Grid of convergence curves: columns = K, rows = CV fold.
                            Each panel plots training vs held-out AIR loss by epoch,
                            each as the change from its own epoch-1 value.
 

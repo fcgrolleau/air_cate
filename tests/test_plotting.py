@@ -221,8 +221,12 @@ def test_plot_k_selection_returns_two_distinct_panels():
 # plot_convergence_grid
 # ---------------------------------------------------------------------------
 
-def test_convergence_grid_layout_is_K_by_run():
-    """Columns are K, rows are CV run -- the requested orientation."""
+def test_convergence_grid_layout_is_K_by_fold():
+    """Columns are K, rows are CV fold -- the requested orientation.
+
+    Rows are labelled "Fold", not "Run": K counts mixture clusters, and a reader who
+    sees "K" next to "Run" tends to read it as the number of folds instead.
+    """
     histories = _fake_histories()
     fig, axes = plot_convergence_grid(
         histories, K_grid=K_GRID, n_cv_folds=N_FOLDS
@@ -232,7 +236,19 @@ def test_convergence_grid_layout_is_K_by_run():
         top_titles = [axes[0][c].get_title() for c in range(len(K_GRID))]
         assert top_titles == [f"$K = {k}$" for k in K_GRID]
         left_labels = [axes[r][0].get_ylabel() for r in range(N_FOLDS)]
-        assert left_labels == [f"Run {r + 1}" for r in range(N_FOLDS)]
+        assert left_labels == [f"Fold {r + 1}" for r in range(N_FOLDS)]
+    finally:
+        plt.close(fig)
+
+
+def test_convergence_grid_legend_says_block_not_fold():
+    """The curve labels must not reuse "fold", which now names the row."""
+    histories = _fake_histories()
+    fig, axes = plot_convergence_grid(histories, K_grid=K_GRID, n_cv_folds=N_FOLDS)
+    try:
+        _, labels = axes[0][0].get_legend_handles_labels()
+        assert "Training block" in labels
+        assert "Held-out block" in labels
     finally:
         plt.close(fig)
 

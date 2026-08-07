@@ -4,9 +4,17 @@ matplotlib is imported lazily inside each function: it ships only in the
 optional [plots] extra, so importing this module must not require it.
 
 Series identity is carried by BOTH color and linestyle (solid = training,
-dashed = validation) so the figures stay readable in grayscale print and for
+dashed = held out) so the figures stay readable in grayscale print and for
 colorblind readers, and every multi-series axes carries a legend.
+
+Terminology, kept consistent across every figure here: a *fold* is one outer
+cross-validation split (a row of the convergence grid); a *block* is a row-set a
+curve is computed on (training block = the other folds pooled, held-out block =
+that row's own fold); and *K* is the number of clusters in the mixture of gamma
+differences, never a fold count.
 """
+
+import textwrap
 
 # JAMA palette, shared with examples/plot_simulation.py and plot_cate_curves.py.
 _JAMA = {
@@ -65,18 +73,23 @@ def plot_cv_curve(
     ax=None,
     show_folds: bool = False,
     one_se_rule: bool = False,
-    title: str = "Cross-validated AIR CATE loss by number of clusters",
+    title: str = (
+        "Cross-validated AIR CATE loss by the number of clusters $K$ "
+        "in the mixture of gamma differences"
+    ),
     figsize: tuple[float, float] = (6.5, 4.2),
 ):
     """Plot the cross-validated AIR CATE loss against K, on the absolute scale.
 
     This panel shows the *level* of the loss and how much it varies between folds.
-    It is usually NOT the panel to pick K from: the fold-to-fold spread is
+    It is usually NOT the panel to select K from: the fold-to-fold spread is
     typically an order of magnitude larger than the differences between K values,
-    because every held-out block has its own nuisance noise level. That common
-    offset inflates the plotted marginal SEs but cancels in any comparison of two
-    K values. Use `plot_cv_paired` (or `plot_k_selection`, which shows both) to
-    decide K.
+    because each held-out block's nuisances are estimated within that block and so
+    carry their own estimation error. That error dominates the level -- on
+    WeibullMixtureDGP at n=1200 with three folds it accounts for roughly two thirds
+    of it -- and is common to every K within a fold, so it inflates the plotted
+    marginal SEs but cancels in any comparison of two K values. Use `plot_cv_paired`
+    (or `plot_k_selection`, which shows both) to select K.
 
     `one_se_rule` defaults to False here for the same reason. The textbook
     one-standard-error rule uses the across-fold SE, which is the right error term
@@ -294,9 +307,21 @@ def plot_k_selection(
     """Two-panel K-selection figure: absolute scale (left) and paired scale (right).
 
     The left panel is the honest picture of the loss level and its fold-to-fold
-    spread; the right panel is the one to decide K from. Two panels rather than two
+    spread; the right panel is the one to select K from. Two panels rather than two
     y-axes on one plot: the quantities differ by an order of magnitude, and a
     twin-axis chart would make their relative size meaningless.
+
+    Why the left panel is labelled "held-out nuisance error dominates". Each outer
+    fold re-cross-fits its nuisances inside its own held-out block, so each fold's
+    validation pseudo-outcomes carry that block's nuisance estimation error. On
+    WeibullMixtureDGP at n=1200 with three outer folds, recomputing the same three
+    held-out blocks under one common set of nuisances fitted on all n rows moved the
+    loss level from about 9.6 to about 3.4 and cut the fold-to-fold range from 1.67
+    to 0.58. So the level is mostly held-out nuisance error rather than signal, and
+    that error is also the majority driver of the offsets between folds; the
+    remainder is ordinary subject sampling. Neither figure is harmed by this,
+    because the offset is common to every K within a fold -- which is exactly what
+    the paired panel differences away.
 
     Args:
         cv_results: The `cv_results_` dict from AIREstimatorCV.
@@ -314,15 +339,16 @@ def plot_k_selection(
 
     plot_cv_curve(
         cv_results, ax=axes[0], show_folds=True, one_se_rule=False,
-        title="Absolute scale (fold offsets dominate)",
+        title="Absolute scale -- held-out nuisance error dominates",
     )
     plot_cv_paired(
         cv_results, ref_K=ref_K, ax=axes[1], show_folds=True, one_se_rule=True,
-        title="Paired scale -- decide $K$ here",
+        title="Paired scale -- select $K$ here",
     )
 
     fig.suptitle(
-        "Cross-validated AIR CATE loss by number of clusters $K$",
+        "Cross-validated AIR CATE loss by the number of clusters $K$ "
+        "in the mixture of gamma differences",
         fontsize=12.5, fontweight="bold", y=1.02,
     )
     fig.tight_layout()
@@ -336,29 +362,34 @@ def plot_convergence_grid(
     sharey: str = "row",
     mark_best: bool = True,
     normalize: str = "first",
-    title: str = "AIR CATE loss convergence by $K$ (columns) and CV run (rows)",
+    title: str = (
+        "AIR CATE loss convergence by the number of clusters $K$ in the mixture of "
+        "gamma differences (columns)\nand cross-validation fold (rows)"
+    ),
     panel_size: tuple[float, float] = (2.1, 1.75),
 ):
-    """Grid of per-run convergence curves: columns = K, rows = CV run.
+    """Grid of per-fold convergence curves: columns = K, rows = cross-validation fold.
 
-    Each panel shows the AIR CATE loss against epoch for one (K, fold) training
-    run: the training block (n_cv_folds - 1 folds) and the held-out validation
-    fold.
+    Each panel shows the AIR CATE loss against epoch for one (K, fold) fit. Within a
+    row, the *training block* is the other n_cv_folds - 1 folds pooled, and the
+    *held-out block* is that row's own fold. Both curves are labelled "block" rather
+    than "fold" so that "fold" refers unambiguously to the row -- K counts mixture
+    clusters, not folds.
 
-    Why `normalize="first"` is the default. The validation nuisances are cross-fit
-    *within* the held-out block, so they come from roughly 1/n_cv_folds as many
-    rows as the training-block nuisances. Their noisier pseudo-outcomes carry a
-    much larger irreducible residual, so the validation curve sits far above the
-    training curve -- in practice a level difference several times the training
-    loss itself, not a modest offset. On a shared absolute axis that gap swamps the
-    epoch-to-epoch movement both curves are drawn to show, and each panel collapses
-    into two flat lines. Plotting each curve minus its own epoch-1 value puts both
-    trajectories on one axis at a readable scale, which is what a convergence plot
-    is for. Pass `normalize="none"` to see the absolute levels instead.
+    Why `normalize="first"` is the default. The held-out block's nuisances are
+    cross-fit *within* that block, so they come from roughly 1/n_cv_folds as many
+    rows as the training block's. Their noisier pseudo-outcomes carry a much larger
+    irreducible residual, so the held-out curve sits far above the training curve --
+    in practice a level difference several times the training loss itself, not a
+    modest offset. On a shared absolute axis that gap swamps the epoch-to-epoch
+    movement both curves are drawn to show, and each panel collapses into two flat
+    lines. Plotting each curve minus its own epoch-1 value puts both trajectories on
+    one axis at a readable scale, which is what a convergence plot is for. Pass
+    `normalize="none"` to see the absolute levels instead.
 
     The level gap is NOT a measure of overfitting -- it is a property of the
     nuisance sample sizes and is common to every K within a row, so it does not
-    distort the comparison across K. What diagnoses overfitting is the validation
+    distort the comparison across K. What diagnoses overfitting is the held-out
     curve *turning upward* as epochs increase. Judge by slope, never by the gap.
 
     Args:
@@ -367,7 +398,7 @@ def plot_convergence_grid(
         n_cv_folds: Number of rows. Inferred from the keys if None.
         sharey: Passed to plt.subplots. "row" keeps each fold on a common scale
             (comparable across K within a fold) while letting folds differ.
-        mark_best: Mark the best-validation epoch in each panel.
+        mark_best: Mark the best held-out epoch in each panel.
         normalize: "first" (default) plots each curve minus its own epoch-1 value;
             "none" plots the raw loss.
         title: Figure suptitle.
@@ -418,7 +449,7 @@ def plot_convergence_grid(
             ax.plot(
                 epochs, train,
                 color=_JAMA["teal"], ls="-", lw=1.6,
-                label="Training folds", zorder=3,
+                label="Training block", zorder=3,
             )
 
             val = history.get("val_loss")
@@ -429,7 +460,7 @@ def plot_convergence_grid(
                 ax.plot(
                     epochs, val,
                     color=_JAMA["orange"], ls="--", lw=1.6,
-                    label="Held-out fold", zorder=4,
+                    label="Held-out block", zorder=4,
                 )
 
                 if mark_best:
@@ -451,7 +482,7 @@ def plot_convergence_grid(
             if row == 0:
                 ax.set_title(f"$K = {K}$", fontsize=10, fontweight="bold", pad=6)
             if col == 0:
-                ax.set_ylabel(f"Run {row + 1}", fontsize=9)
+                ax.set_ylabel(f"Fold {row + 1}", fontsize=9)
             if row == n_cv_folds - 1:
                 ax.set_xlabel("Epoch", fontsize=9)
 
@@ -477,20 +508,29 @@ def plot_convergence_grid(
 
     if normalize == "first":
         caption = (
-            "Each curve is shown as the change from its own epoch-1 value, so the "
-            "training and held-out trajectories share one axis despite their very "
-            "different levels. Judge overfitting by the held-out slope turning "
-            "upward."
+            "Rows are cross-validation folds; columns are candidate numbers of "
+            "clusters $K$ in the mixture of gamma differences. Each curve is shown "
+            "as the change from its own epoch-1 value, so the two trajectories "
+            "share one axis despite their very different levels. Judge overfitting "
+            "by the held-out slope turning upward, never by the gap between curves."
         )
     else:
         caption = (
-            "The held-out curve sits above the training curve because its nuisances "
-            "use fewer rows; judge overfitting by its slope, not the gap."
+            "Rows are cross-validation folds; columns are candidate numbers of "
+            "clusters $K$ in the mixture of gamma differences. The held-out curve "
+            "sits above the training curve because its nuisances are estimated from "
+            "fewer rows; judge overfitting by its slope, not the gap."
         )
 
+    # Wrap the caption to the figure's own width. Callers save with
+    # bbox_inches="tight", which grows the canvas to fit any overhanging artist -- so
+    # an unwrapped caption pads the figure out to its own length and squashes the
+    # panels. ~17 characters per inch at 7.5pt italic.
     fig.text(
-        0.5, -0.045, caption,
+        0.5, -0.045,
+        textwrap.fill(caption, width=int(fig.get_figwidth() * 17)),
         ha="center", va="top", fontsize=7.5, color="#666666", style="italic",
+        linespacing=1.5,
     )
 
     fig.tight_layout(rect=[0, 0.02, 1, 0.98])

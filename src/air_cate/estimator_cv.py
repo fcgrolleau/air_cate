@@ -409,7 +409,7 @@ class AIREstimatorCV:
         return plot_k_selection(self.cv_results_, **kwargs)
 
     def plot_convergence_grid(self, **kwargs):
-        """Plot the grid of per-run convergence curves. See air_cate.plotting."""
+        """Plot the per-fold convergence grid (rows) by K (columns). See air_cate.plotting."""
         from air_cate.plotting import plot_convergence_grid
 
         kwargs.setdefault("K_grid", list(self.K_grid))
@@ -454,8 +454,8 @@ class AIREstimatorCV:
         n_at_zero = int((np.asarray(cv["fold_best_epoch"]) == 0).sum())
         if n_at_zero:
             lines.append(
-                f"\nNote: {n_at_zero} run(s) scored at epoch 0 -- validation loss "
-                "never improved on the untrained model, so those scores reflect "
-                "initialization rather than a fitted model."
+                f"\nNote: {n_at_zero} (K, fold) fit(s) scored at epoch 0 -- the "
+                "held-out loss never improved on the untrained model, so those "
+                "scores reflect initialization rather than a fitted model."
             )
         return "\n".join(lines)

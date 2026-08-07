@@ -7,7 +7,7 @@ R-loss, so you can pick one from a plot instead of guessing.
 It is a *diagnostic only*: no predict methods, no final refit. The workflow is
 
     1. cv = AIREstimatorCV(K_grid=...).fit(...)   # score every K
-    2. read K off cv.summary() and the two figures
+    2. read K -- and an epoch budget -- off cv.summary() and the two figures
     3. AIREstimator(K=<your choice>).fit(...)     # refit on the full data
 
 Data here is WeibullMixtureDGP, a 3-component Weibull mixture in each arm, so the
@@ -84,6 +84,24 @@ def read_off_K(cv):
     return selected
 
 
+def refit_epoch_budget(cv, K):
+    """How many epochs to give the refit, read off the screen.
+
+    AIREstimator early-stops on the *training* loss, which decreases essentially
+    monotonically here, so patience never fires and the refit runs its full budget.
+    The screen already measured where the held-out loss bottoms out, so use that
+    instead of guessing: past it, the convergence grid's held-out curves turn upward.
+
+    Median, not mean, across folds: a fold whose held-out loss never improves on the
+    untrained model is scored at epoch 0, and one such fold would drag a mean far
+    below where the other folds actually turned.
+    """
+    K_list = list(cv.cv_results_["K_grid"])
+    best_epochs = np.asarray(cv.cv_results_["fold_best_epoch"])[K_list.index(K)]
+    # +1 converts a 0-indexed epoch to a count of epochs to run.
+    return max(20, int(np.median(best_epochs)) + 1)
+
+
 def make_figures(cv):
     """Save the two diagnostic figures, if matplotlib is installed."""
     try:
@@ -109,7 +127,7 @@ def make_figures(cv):
     fig, _ = cv.plot_k_selection()
     save(fig, "quickstart_cv_k")
 
-    # Columns = K, rows = CV run. Each panel: training vs held-out loss by epoch.
+    # Columns = K, rows = CV fold. Each panel: training vs held-out loss by epoch.
     # A held-out curve turning upward means that K overfits.
     fig, _ = cv.plot_convergence_grid()
     save(fig, "quickstart_cv_convergence")
@@ -125,16 +143,18 @@ def main():
     K = read_off_K(cv)
     make_figures(cv)
 
-    # Step 3: refit on the full data at the chosen K. The screen hands over nothing
-    # but the integer -- the nuisance stage is re-run here on all n rows.
-    print(f"\nRefitting AIREstimator(K={K}) on the full sample...")
+    # Step 3: refit on the full data at the chosen K. The screen hands over two
+    # numbers and nothing else -- K and an epoch budget. The nuisance stage is
+    # deliberately re-run here on all n rows.
+    epochs = refit_epoch_budget(cv, K)
+    print(f"\nRefitting AIREstimator(K={K}) on the full sample for {epochs} epochs...")
     est = AIREstimator(
         K=K,
         M=50,
         n_folds=3,
         encoder_hidden_sizes=(32, 16),
         nuisance_training_config={"epochs": 40, "verbose": 0},
-        cate_epochs=150,
+        cate_epochs=epochs,
         cate_lr=1e-3,
     )
     est.fit(X, W, Z, Delta, t_end, verbose=1)
