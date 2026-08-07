@@ -25,6 +25,10 @@ _JAMA = {
     "green":  "#79af97",
 }
 
+#: Public alias for the palette, so example scripts import it instead of
+#: re-declaring the hex codes and drifting out of sync with the package figures.
+PALETTE = _JAMA
+
 _RC = {
     "font.family": "serif",
     "mathtext.fontset": "cm",
@@ -36,11 +40,22 @@ _RC = {
 }
 
 
-def apply_style():
-    """Apply the shared figure style (serif, CM math, thin recessive spines)."""
+def apply_style(width_scale: float = 1.0):
+    """Apply the shared figure style (serif, CM math, thin recessive spines).
+
+    Args:
+        width_scale: Multiplier on spine and tick widths. Presentation-size
+            figures scale their fonts up, and a 0.6pt hairline axis under a 20pt
+            label reads as no axis at all, so line weights have to move with the
+            type. Leave at 1.0 for the paper-size defaults.
+    """
     import matplotlib.pyplot as plt
 
-    plt.rcParams.update(_RC)
+    rc = dict(_RC)
+    if width_scale != 1.0:
+        for key in ("axes.linewidth", "xtick.major.width", "ytick.major.width"):
+            rc[key] = _RC[key] * width_scale
+    plt.rcParams.update(rc)
 
 
 def _paired_stats(fold_loss, ref_index: int):

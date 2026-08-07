@@ -13,7 +13,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from air_cate.plotting import (  # noqa: E402
+    PALETTE,
     _paired_stats,
+    _RC,
+    apply_style,
     plot_convergence,
     plot_convergence_grid,
     plot_cv_curve,
@@ -65,6 +68,46 @@ def _fake_histories(drop=()):
                 "monitor": "val",
             }
     return histories
+
+
+# ---------------------------------------------------------------------------
+# Style
+# ---------------------------------------------------------------------------
+
+_WIDTH_KEYS = ("axes.linewidth", "xtick.major.width", "ytick.major.width")
+
+
+@pytest.fixture
+def restore_rc():
+    """Undo apply_style's global rcParams mutation, so test order cannot matter."""
+    saved = {k: plt.rcParams[k] for k in _WIDTH_KEYS}
+    yield
+    plt.rcParams.update(saved)
+
+
+def test_apply_style_defaults_to_hairline_widths(restore_rc):
+    apply_style()
+    for key in _WIDTH_KEYS:
+        assert plt.rcParams[key] == pytest.approx(_RC[key])
+
+
+def test_apply_style_width_scale_thickens_spines_and_ticks(restore_rc):
+    """Presentation-size figures scale fonts up; a 0.6pt axis under a 20pt label
+    reads as no axis at all, so the line weights have to follow."""
+    apply_style(width_scale=2.5)
+    for key in _WIDTH_KEYS:
+        assert plt.rcParams[key] == pytest.approx(_RC[key] * 2.5)
+    # Non-width entries are unaffected by the scale.
+    assert plt.rcParams["font.family"] == [_RC["font.family"]]
+
+
+def test_palette_is_the_shared_dict_not_a_copy():
+    """Examples import PALETTE instead of redeclaring hex codes; it must be the
+    same object the package's own figures draw from."""
+    from air_cate.plotting import _JAMA
+
+    assert PALETTE is _JAMA
+    assert set(PALETTE) == {"teal", "orange", "blue", "red", "green"}
 
 
 # ---------------------------------------------------------------------------

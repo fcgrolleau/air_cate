@@ -67,7 +67,8 @@ latex/                           # Paper & simulation writeup
 examples/
 ├── quickstart.py                # End-to-end demo on synthetic data
 ├── plot_simulation.py           # iMSE convergence (6 methods × 2 DGPs, --large/--plot-only)
-└── plot_cate_curves.py          # Predicted tv-CATE curves for a single test observation
+└── plot_cate_curves.py          # Predicted tv-CATE curves (contact sheet + single subject;
+                                 #   --seed/--obs/--preset, .npz cache with a config fingerprint)
 ```
 
 ## Architecture: 3-Stage Pipeline
