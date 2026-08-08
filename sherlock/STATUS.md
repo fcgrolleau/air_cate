@@ -1,5 +1,11 @@
 # Sherlock Simulation — Status & Resume Guide
 
+> **Looking for the commands to type? See [RUNBOOK.md](RUNBOOK.md).** It is a linear,
+> copy-paste walkthrough written for someone who has not used Sherlock in a while: what a
+> login node is, how to activate the conda env, submit, monitor, collect, and a
+> symptom-to-fix troubleshooting table. **This** file is the design record — why the run is
+> shaped the way it is, what it costs, and what was decided and measured along the way.
+
 ## Planned run: 999 seeds (3600 tasks) on `full-sherlock-sims`
 
 Branch `full-sherlock-sims` reruns the same design as the archived 100-seed run, but
@@ -49,6 +55,12 @@ command was not recorded anywhere, so it is written down here now. Excludes matt
 is ~490 MB, almost all of it generator-only IST-3 assets, against a 15 GB `$HOME` quota.
 `IST3TextDGP.load()` needs only `config.json` and `super_population.npz`.
 
+Goes to a **new** directory, `~/air_cate_full`, not the archived run's `~/air_cate`. Without
+`--delete` an overlay would leave `sherlock-sims`-only files (`dgp/ist3.py`, `dgp/train.py`)
+sitting in the tree, and it would destroy the copy the published table came from. The submit
+scripts no longer hardcode a path — they use `SLURM_SUBMIT_DIR`, so they run from whichever
+tree `sbatch` was invoked in.
+
 ```bash
 # Dry run first -- lists what would transfer, writes nothing.
 rsync -avz --dry-run \
@@ -58,14 +70,33 @@ rsync -avz --dry-run \
   --exclude 'src/air_cate/dgp/artifacts_text/embeddings.npz' \
   --exclude 'src/air_cate/dgp/artifacts_text/clinical_notes.json.gz' \
   ~/Desktop/github_repos/git_repo_2026/air_cate/ \
-  grolleau@login.sherlock.stanford.edu:air_cate/
+  grolleau@login.sherlock.stanford.edu:air_cate_full/
 
 # Then the same command without --dry-run.
 ```
 
+The trailing slash on the source means *contents of*, so files land at `~/air_cate_full/…`
+rather than nested one level deeper.
+
 Deliberately **no `--delete`**: it would remove anything on the cluster not present locally,
-including `super_population.npz` (excluded above, already transferred for the 100-seed run)
-and any results still sitting in `~/air_cate`. Add it only with a specific reason.
+including the excluded `super_population.npz`. Add it only with a specific reason.
+
+Then, on the cluster, register the package and carry the IST-3 artifact over from the old
+tree (5 MB, gitignored, so `rsync` never sends it):
+
+```bash
+ssh grolleau@login.sherlock.stanford.edu
+source $GROUP_HOME/$USER/miniforge3/bin/activate
+eval "$(mamba shell hook --shell bash)"
+mamba activate air_cate
+cd ~/air_cate_full
+pip install -e . --no-deps
+cp ~/air_cate/src/air_cate/dgp/artifacts_text/super_population.npz \
+   src/air_cate/dgp/artifacts_text/
+# Generating, not just importing: this is what actually proves the .npz is readable.
+# Expect "IST-3 OK (100, 15) t_end 5.0" preceded by the loader's own banner line.
+python -c 'from air_cate.dgp import IST3TextDGP as D; D.load(); X,W,Z,Dl,te = D.generate(n=100); print("IST-3 OK", X.shape, "t_end", te)'
+```
 
 `.git/` is excluded, so the cluster copy carries no branch or commit information — record
 which commit was sent. This run: `831778b` on `full-sherlock-sims`.

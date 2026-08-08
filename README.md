@@ -200,7 +200,18 @@ tests/                       # pytest suite
 
 examples/                    # Demo scripts + figures
 latex/                       # Paper and simulation study writeup
+sherlock/                    # Running the large simulation on the Sherlock HPC cluster
+├── RUNBOOK.md               # Copy-paste walkthrough: transfer, submit, monitor, collect
+├── STATUS.md                # Design record: array mapping, cost estimates, decisions
+├── submit_pilot.sh          # ~10 min confirmation run (18 tasks, small n)
+├── submit_array.sh          # Full run (3600 tasks = 3 DGPs x 6 methods x 200 seed-blocks)
+└── collect_results.sh       # Merge partial JSONs and render figures
 ```
+
+The large-scale simulation behind the paper's table runs on Stanford's Sherlock cluster.
+Start at [`sherlock/RUNBOOK.md`](sherlock/RUNBOOK.md) — it assumes no recent SLURM
+familiarity. Note that Sherlock's glibc 2.17 is too old for modern jaxlib wheels, so the
+cluster uses **conda**, not `uv`.
 
 ## Testing
 

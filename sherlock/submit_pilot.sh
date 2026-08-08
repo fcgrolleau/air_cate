@@ -60,7 +60,11 @@ source $GROUP_HOME/$USER/miniforge3/bin/activate
 eval "$(mamba shell hook --shell bash)"
 mamba activate air_cate
 
-cd $HOME/air_cate
+# Run from wherever sbatch was invoked, so a tree at ~/air_cate_full works without
+# editing this script. SLURM sets SLURM_SUBMIT_DIR to the submitting directory; the
+# $HOME/air_cate fallback preserves the old behaviour, and AIR_CATE_DIR overrides both.
+cd "${AIR_CATE_DIR:-${SLURM_SUBMIT_DIR:-$HOME/air_cate}}" || exit 1
+echo "Running from: $(pwd)"
 
 # A separate directory from the full run's $SCRATCH/air_cate_results. The in-task
 # resume logic skips (n, seed) cells already present in the output file, so pilot
