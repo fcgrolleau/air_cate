@@ -220,7 +220,18 @@ mkdir -p sherlock/logs
 sbatch --array=0-17 sherlock/submit_pilot.sh
 ```
 
-**Expected:** `Submitted batch job <JOBID>`. Write the job ID down — you need it for `sacct`.
+**Expected:** `Submitted batch job 38156448` (your number will differ). Immediately store it in a
+shell variable, so every monitoring command below can be pasted verbatim:
+
+```bash
+# Replace the number with whatever sbatch just printed.
+# Do this in each new shell -- shell variables do not survive logout.
+JOBID=38156448
+```
+
+> Commands below use `$JOBID`, never a `<PLACEHOLDER>`. If you ever paste something like
+> `sacct -j <JOBID>` literally, bash reads `<` as an input redirect and fails with
+> `-bash: JOBID: No such file or directory`. Harmless, but confusing.
 
 The script requests 20 min, 1 CPU, 32 GB per task, and writes to `$SCRATCH/air_cate_pilot`
 — deliberately **not** the full run's `$SCRATCH/air_cate_results`. The harness resumes by
@@ -239,6 +250,13 @@ real results directory would silently poison the 999-seed run.
 squeue -u $USER
 ```
 
+**How to read the array notation.** While every task is pending, the whole array collapses to
+one row, `38156448_[0-17]`. As tasks start, the bracketed range shrinks from the left: a row
+reading `38156448_[2-17]` means **tasks 0 and 1 have already left the pending state** — this is
+your first sign of progress, and it appears well before any output file does. Narrow terminal
+columns truncate the range with a `+`, so `38156448_[2+` is the same thing. Started tasks then
+appear as their own rows, `38156448_0`, `38156448_1`, …
+
 `squeue` shows only **live** jobs, so finished tasks disappear from it — and an empty listing
 looks the same whether they succeeded or died. For actual outcomes use `sacct`:
 
@@ -248,7 +266,10 @@ looks the same whether they succeeded or died. For actual outcomes use `sacct`:
 #   Elapsed: wall time
 #   MaxRSS:  peak memory -- tracked per job STEP, so it shows on the `.batch`
 #            rows rather than the parent rows. That is expected, not missing data.
-sacct -j <JOBID> --format=JobID,State,Elapsed,MaxRSS,NodeList
+#
+# Note the accounting database lags a few seconds behind squeue, so a task that
+# squeue already shows as running may not have a row here yet.
+sacct -j $JOBID --format=JobID,State,Elapsed,MaxRSS,NodeList
 ```
 
 ```bash
@@ -266,9 +287,13 @@ the `normal` partition is, so total wall time can exceed 10 minutes.
 
 ```bash
 # Cancel if you need to.
-scancel <JOBID>        # the whole array
-scancel <JOBID>_3      # just task 3
+scancel $JOBID         # the whole array
+scancel ${JOBID}_3     # just task 3 -- braces so the shell does not look for
+                       # a variable named JOBID_3
 ```
+
+Cancelling a fully-pending array costs nothing (`TIME 0:00` = no work done), so if the queue
+wait looks wrong, diagnose and resubmit rather than waiting it out.
 
 ### Collecting the results
 
@@ -424,6 +449,8 @@ still describes 2 DGPs and 20 seeds, stale in either direction.
 | `PD` with `(None)` / `(Priority)` / `(Resources)` | normal queueing | wait — `(None)` means not yet evaluated, `(Priority)` means queued behind others, `(Resources)` means waiting for a free node |
 | `PD` for a long time, `TIME 0:00` | usually an oversized `--mem-per-cpu`: 32G against 1 CPU is ~5 cores' worth of memory on every node model | check `squeue --start` and `scontrol show job <id>`; if the estimate is far out, `scancel` and resubmit with `--mem-per-cpu=8G` (safe below n=5000) |
 | `PD` with `(QOSMaxJobsPerUserLimit)` | too many jobs submitted at once | wait; they release as others finish. `sh_part` shows the limits |
+| `-bash: JOBID: No such file or directory` | a `<PLACEHOLDER>` was pasted literally; the shell read `<` as an input redirect | set `JOBID=<number>` once, then use `$JOBID` |
+| `sacct` shows only a `_[2-17]` row and no per-task rows | the array's *pending* range now starts at 2, i.e. tasks 0–1 have started; the accounting DB also lags `squeue` by seconds | progress, not a problem — cross-check with `squeue -u $USER` |
 | `ls: cannot access $SCRATCH/air_cate_pilot` | directory is created by the first task that *runs* | wait for `ST=R` |
 | `ModuleNotFoundError: No module named 'air_cate'` | conda env not activated in this shell, or `pip install -e .` never run in it | redo step 2's activate block |
 | `ModuleNotFoundError: No module named 'tensorflow'` | something imported `keras` before `air_cate`, so `KERAS_BACKEND=jax` was never set | import `air_cate` first |
@@ -439,16 +466,17 @@ still describes 2 DGPs and 20 seeds, stale in either direction.
 ### Command cheat sheet
 
 ```bash
+JOBID=38156448                   # set this first; everything below reuses it
 sbatch --array=0-17 script.sh    # submit an array job
 squeue -u $USER                  # my live jobs
 squeue -u $USER -t RUNNING       # only the running ones
 squeue -u $USER --start          # estimated start times (N/A = not yet computed)
-sacct -j <JOBID> --format=JobID,State,Elapsed,MaxRSS   # outcomes, incl. finished
-sprio -j <JOBID>                 # why my priority is what it is
+sacct -j $JOBID --format=JobID,State,Elapsed,MaxRSS,NodeList  # outcomes, incl. finished
+sprio -j $JOBID                  # why my priority is what it is
 sinfo -p normal -o "%P %a %D %t" # is the partition full?
-scancel <JOBID>                  # cancel a whole array
-scancel <JOBID>_3                # cancel one task
-scontrol show job <JOBID>        # everything SLURM knows about a job
+scancel $JOBID                   # cancel a whole array
+scancel ${JOBID}_3               # cancel one task
+scontrol show job $JOBID         # everything SLURM knows about a job
 sh_part                          # submission limits per partition
 sh_dev -t 00:30:00 -m 8G         # interactive compute node
 scontrol show config | grep -i maxarray          # the array cap (assumed 1000)
@@ -464,4 +492,4 @@ transfer here.
 | Date | Local commit | Branch | Target | Note |
 |---|---|---|---|---|
 | 2026-04-30 | (unrecorded) | `sherlock-sims` | `~/air_cate` | the archived 100-seed run; exact command was never written down |
-| 2026-08-07 | `9c6e628` + uncommitted script edits | `full-sherlock-sims` | `~/air_cate_full` | pilot job `38154411` (`--array=0-17`) |
+| 2026-08-07 | `9c6e628` + uncommitted script edits | `full-sherlock-sims` | `~/air_cate_full` | pilot `38154411` at 32G never left `PD`; cancelled and resubmitted as `38156448` with `--mem-per-cpu=8G`, which placed within minutes. `submit_pilot.sh` now defaults to 8G, so the flag is no longer needed once `sherlock/` is re-synced. |
