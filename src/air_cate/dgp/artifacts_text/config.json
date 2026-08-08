@@ -1,0 +1,17 @@
+{
+  "p_struct": 10,
+  "p_embed": 5,
+  "alpha_0": 1.5,
+  "a_alpha": 0.3,
+  "lambda_base": 3.0,
+  "a_lambda": 1.0,
+  "gamma_intercept": 0.7,
+  "beta": 0.5,
+  "lambda_cens_base": 5.0,
+  "b_lambda_cens": 0.3,
+  "sigma_embed": 1.0,
+  "t_end": 5.0,
+  "corr_z_prog_z_treat": 0.0009386842508973824,
+  "n_subjects": 100000,
+  "mechanism": "two-index-one-factor"
+}

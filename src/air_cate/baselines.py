@@ -21,6 +21,9 @@ def _make_surv_y(Z, Delta):
 def _predict_survival_on_grid(forest, X, time_grid):
     """Predict survival curves from a fitted RSF and evaluate on a time grid.
 
+    Safely extrapolates beyond the step function's domain by holding the last
+    known survival value constant (flat tail).
+
     Returns:
         S: (n, M+1) survival probabilities on the grid.
     """
@@ -30,7 +33,9 @@ def _predict_survival_on_grid(forest, X, time_grid):
     T = len(t_grid)
     S = np.ones((n, T), dtype=np.float32)
     for i, fn in enumerate(surv_fns):
-        S[i] = fn(t_grid)
+        domain_max = fn.domain[1]
+        safe_t = np.minimum(t_grid, domain_max)
+        S[i] = fn(safe_t)
     return S
 
 
@@ -43,12 +48,13 @@ class SurvivalForestTLearner:
     """
 
     def __init__(self, M=30, n_estimators=100, max_depth=None, min_samples_leaf=15,
-                 random_state=None):
+                 random_state=None, n_jobs=-1):
         self.M = M
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.min_samples_leaf = min_samples_leaf
         self.random_state = random_state
+        self.n_jobs = n_jobs
         self.forest_0_ = None
         self.forest_1_ = None
         self.time_grid_ = None
@@ -62,7 +68,7 @@ class SurvivalForestTLearner:
             max_depth=self.max_depth,
             min_samples_leaf=self.min_samples_leaf,
             random_state=self.random_state,
-            n_jobs=-1,
+            n_jobs=self.n_jobs,
         )
 
         mask0 = W.ravel() == 0
@@ -92,12 +98,13 @@ class SurvivalForestSLearner:
     """
 
     def __init__(self, M=30, n_estimators=100, max_depth=None, min_samples_leaf=15,
-                 random_state=None):
+                 random_state=None, n_jobs=-1):
         self.M = M
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.min_samples_leaf = min_samples_leaf
         self.random_state = random_state
+        self.n_jobs = n_jobs
         self.forest_ = None
         self.time_grid_ = None
         self.delta_ = None
@@ -112,7 +119,7 @@ class SurvivalForestSLearner:
             max_depth=self.max_depth,
             min_samples_leaf=self.min_samples_leaf,
             random_state=self.random_state,
-            n_jobs=-1,
+            n_jobs=self.n_jobs,
         )
         self.forest_.fit(X_aug, _make_surv_y(Z, Delta))
 

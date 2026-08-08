@@ -21,6 +21,14 @@ dev = [
 plots = [
     "matplotlib>=3.7",
 ]
+# Only needed to regenerate the IST-3 text DGP's super-population from source
+# (dgp/generate_notes.py, dgp/embed_notes.py, dgp/train_text_dgp.py). Running
+# the simulation needs neither: IST3TextDGP reads the pre-built artifacts.
+text = [
+    "anthropic>=0.25",
+    "transformers>=4.35",
+    "torch>=2.0",
+]
 
 [build-system]
 requires = ["hatchling"]

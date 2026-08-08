@@ -29,8 +29,14 @@ class WeibullAFT:
 
     @staticmethod
     def _get_params(raw_params):
-        """Map raw MLP outputs to positive shape k and scale lambda."""
-        k = keras.activations.softplus(raw_params[:, 0]) + 1e-4
+        """Map raw MLP outputs to positive shape k and scale lambda.
+
+        The shape floor is 0.3 rather than 1e-4: as k -> 0 the Weibull hazard
+        diverges at t = 0 and the log-likelihood gradient blows up, which
+        destabilizes the IST-3 nuisance fits. Keep this in sync with the
+        identical mapping in `_WeibullTrainModel.compute_loss`.
+        """
+        k = keras.activations.softplus(raw_params[:, 0]) + 0.3
         lam = keras.activations.softplus(raw_params[:, 1]) + 1e-4
         return k, lam
 
@@ -55,7 +61,9 @@ class WeibullAFT:
 
         # Custom training step via a wrapper model
         weibull_model = _WeibullTrainModel(self.model_)
-        weibull_model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr))
+        weibull_model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0)
+        )
 
         # Pack targets as (T, event) matrix
         y = np.stack([T, event], axis=-1).astype(np.float32)
@@ -123,7 +131,8 @@ class _WeibullTrainModel(keras.Model):
         T = y[:, 0]
         event = y[:, 1]
 
-        k = keras.activations.softplus(y_pred[:, 0]) + 1e-4
+        # Must match WeibullAFT._get_params: shape floor 0.3, scale floor 1e-4.
+        k = keras.activations.softplus(y_pred[:, 0]) + 0.3
         lam = keras.activations.softplus(y_pred[:, 1]) + 1e-4
 
         # log S(t|x) = -(t/lambda)^k

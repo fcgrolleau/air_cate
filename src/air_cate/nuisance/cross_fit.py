@@ -123,6 +123,13 @@ def cross_fit_nuisances(
                 S_cens_1_grid[val_idx] = S_ce_grid
                 S_cens_1_at_Z[val_idx] = S_ce_at_Z
 
+            # Drop the Keras models as soon as their predictions are stored.
+            # A simulation task fits 5 models per fold across many (n, seed)
+            # draws in one process; without this the retained graphs push the
+            # n=20000 fits past their memory budget.
+            del event_model, cens_model
+        del prop_model
+
     return NuisanceEstimates(
         e_hat=jnp.array(e_hat),
         S_event_0_grid=jnp.array(S_event_0_grid),
