@@ -36,9 +36,9 @@ class AIREstimatorCV:
     validation loss; the CV score for K is the mean over folds.
 
     Cost: `n_cv_folds * (n_folds + val_n_folds) * 5` Keras nuisance models -- 250 at
-    the defaults -- plus `n_cv_folds * len(K_grid)` CATE fits. The val-block models
-    are individually cheap (they see ~n/n_cv_folds rows). For a first screen, use
-    `n_folds=2, val_n_folds=2`.
+    the defaults -- plus `n_cv_folds * len(K_grid) * n_restarts` CATE fits (30 at the
+    defaults). The val-block models are individually cheap (they see ~n/n_cv_folds
+    rows). For a first screen, use `n_folds=2, val_n_folds=2`.
 
     Sample-size rule of thumb: each val-block nuisance model trains on roughly
     `n / n_cv_folds * (1 - 1/val_n_folds)` rows, then splits per arm. You want
@@ -64,6 +64,14 @@ class AIREstimatorCV:
             trains the full `cate_epochs` so the convergence grid shows complete,
             equal-length trajectories. Scoring at the best-val epoch needs only the
             minimum, not early stopping.
+        n_restarts: Independent CATE fits per (K, fold), keeping the one with the
+            lowest *training* loss and only then recording its validation loss --
+            ranking restarts by validation loss would let the held-out block pick the
+            model it also scores. Defaults to 1, matching `AIREstimator`, so the
+            screen reflects how the final model will actually be fit. Raising it is
+            not recommended: see the `n_restarts` entry on `AIREstimator` for the
+            measurements: restarts here differ by <1% in training loss, and
+            selecting the minimum inflates spurious effect estimates.
         cate_model_class: Optional alternative CATE model class.
         cate_model_kwargs: Extra kwargs for `cate_model_class`.
         k_param_name: Name of the constructor argument that sets K on the model
@@ -95,6 +103,7 @@ class AIREstimatorCV:
         cate_batch_size: int = 256,
         weight_decay: float = 1e-4,
         cv_patience: int | None = None,
+        n_restarts: int = 1,
         cate_model_class=None,
         cate_model_kwargs: dict | None = None,
         k_param_name: str = "K",
@@ -115,6 +124,9 @@ class AIREstimatorCV:
         self.cate_batch_size = cate_batch_size
         self.weight_decay = weight_decay
         self.cv_patience = cv_patience
+        if n_restarts < 1:
+            raise ValueError(f"n_restarts must be >= 1, got {n_restarts}")
+        self.n_restarts = n_restarts
         self.cate_model_class = cate_model_class
         self.cate_model_kwargs = cate_model_kwargs or {}
         self.k_param_name = k_param_name
@@ -269,29 +281,52 @@ class AIREstimatorCV:
 
             for i, K in enumerate(self.K_grid):
                 run_seed = self.cv_rng_seed + 1000 * j + 100 + K
-                keras.utils.set_random_seed(run_seed)
-                model = self._build_model(K)
 
-                history = train_cate(
-                    model,
-                    X=block_A.X,
-                    Y_tilde=Y_A,
-                    S_marg=S_A,
-                    W=block_A.W,
-                    e_clipped=e_A,
-                    time_grid=self.time_grid_,
-                    delta=self.delta_,
-                    epochs=self.cate_epochs,
-                    lr=self.cate_lr,
-                    batch_size=self.cate_batch_size,
-                    weight_decay=self.weight_decay,
-                    validation_data=validation_data,
-                    monitor="val",
-                    patience=self.cv_patience,
-                    rng_seed=run_seed,
-                    verbose=0,
-                )
+                # Best of n_restarts, ranked by TRAINING loss. Ranking by validation
+                # loss would let the held-out block choose among the candidates and
+                # then also report the winner's score, biasing every cell downward;
+                # and since AIREstimator picks its restart on training loss, matching
+                # it here keeps the screen predictive of the final fit. At the default
+                # n_restarts=1 this loop runs once and neither concern arises.
+                best_train = float("inf")
+                best_history = None
+                for restart in range(self.n_restarts):
+                    # 1e6 spacing: run_seed already encodes fold (x1000) and K, so a
+                    # smaller stride would collide across (K, restart) pairs.
+                    restart_seed = run_seed + 1_000_000 * restart
+                    keras.utils.set_random_seed(restart_seed)
+                    model = self._build_model(K)
 
+                    history = train_cate(
+                        model,
+                        X=block_A.X,
+                        Y_tilde=Y_A,
+                        S_marg=S_A,
+                        W=block_A.W,
+                        e_clipped=e_A,
+                        time_grid=self.time_grid_,
+                        delta=self.delta_,
+                        epochs=self.cate_epochs,
+                        lr=self.cate_lr,
+                        batch_size=self.cate_batch_size,
+                        weight_decay=self.weight_decay,
+                        validation_data=validation_data,
+                        monitor="val",
+                        patience=self.cv_patience,
+                        rng_seed=restart_seed,
+                        verbose=0,
+                    )
+
+                    # min over epochs, not history["best_train_loss"] -- the latter
+                    # is the training loss *at the val-selected epoch*, so it leaks
+                    # the validation block back in through the epoch index.
+                    train_score = min(history["train_loss"])
+                    if train_score < best_train:
+                        best_train = train_score
+                        best_history = history
+                    del model
+
+                history = best_history
                 histories[(K, j)] = history
                 fold_val_loss[i, j] = history["best_val_loss"]
                 fold_best_epoch[i, j] = history["best_epoch"]
@@ -344,6 +379,7 @@ class AIREstimatorCV:
             "n_folds": self.n_folds,
             "val_n_folds": self.val_n_folds,
             "cate_epochs": self.cate_epochs,
+            "n_restarts": self.n_restarts,
             "cv_results": {
                 "K_grid": list(self.K_grid),
                 "fold_val_loss": self.cv_results_["fold_val_loss"].tolist(),
@@ -364,6 +400,8 @@ class AIREstimatorCV:
             n_folds=d["n_folds"],
             val_n_folds=d["val_n_folds"],
             cate_epochs=d["cate_epochs"],
+            # .get: screens serialized before n_restarts existed had one fit per cell.
+            n_restarts=d.get("n_restarts", 1),
         )
         cv = d["cv_results"]
         obj.cv_results_ = {

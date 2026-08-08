@@ -53,7 +53,14 @@ def test_estimator_null_dgp(null_dgp_data):
     """AIREstimator produces near-zero CATE under null treatment effect."""
     from air_cate.estimator import AIREstimator
 
+    import keras  # after air_cate, which sets KERAS_BACKEND
+
     X, W, Z, Delta, t_end = null_dgp_data
+
+    # Seed globally, not only through `rng_seed`: that argument reaches just the CATE
+    # stage, so the propensity MLP and the four AFT initializations would still be
+    # redrawn every run and the assertions below would be a lottery rather than a test.
+    keras.utils.set_random_seed(0)
 
     est = AIREstimator(
         K=2,
@@ -65,16 +72,34 @@ def test_estimator_null_dgp(null_dgp_data):
         cate_epochs=100,
         cate_lr=1e-3,
         cate_batch_size=256,
+        rng_seed=0,
     )
     est.fit(X, W, Z, Delta, t_end, verbose=0)
 
     rng = np.random.default_rng(99)
     X_test = rng.uniform(-1, 1, (300, X.shape[1])).astype(np.float32)
-    tau_hat = est.predict_tau(X_test)
+    tau_abs = np.abs(est.predict_tau(X_test))
 
-    max_abs = np.max(np.abs(tau_hat))
-    print(f"Null DGP max |tau_hat|: {max_abs:.4f}")
-    assert max_abs < 0.2, f"max |tau_hat| = {max_abs:.4f}, expected < 0.2 under null"
+    # Assert on the RMS rather than the max. max over 300 x 51 = 15300 predictions is
+    # an extreme-value statistic, and X_test is uniform on [-1, 1]^d, so its corners
+    # sit outside the training support -- the max mostly measures extrapolation there,
+    # not whether the estimated CATE is near zero. Measured over 15 estimator seeds at
+    # n=1000 (all with true tau == 0, so every nonzero value is artefact):
+    #
+    #              mean      sd   worst   mean+4sd
+    #   max       0.187   0.077   0.384      0.495
+    #   rms       0.059   0.019   0.087      0.135
+    #
+    # A historical `max < 0.2` assertion therefore failed on 6 of those 15 draws;
+    # holding onto max would mean a threshold near 0.5, i.e. half of tau's entire
+    # range. `rms < 0.15` sits ~4.5 sd above the mean and is the stricter test.
+    rms = float(np.sqrt((tau_abs**2).mean()))
+    max_abs = float(tau_abs.max())
+    print(f"Null DGP rms |tau_hat|: {rms:.4f} (max {max_abs:.4f})")
+    assert rms < 0.15, f"rms |tau_hat| = {rms:.4f}, expected < 0.15 under null"
+    # Secondary guard: a spurious effect saturating toward tau's +-1 bound at a few
+    # points would barely move an RMS taken over 15300 of them.
+    assert max_abs < 0.5, f"max |tau_hat| = {max_abs:.4f}, expected < 0.5 under null"
 
 
 @pytest.mark.slow

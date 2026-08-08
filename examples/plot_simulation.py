@@ -81,6 +81,12 @@ QUICK_CONFIG = dict(
     cate_epochs=200,
     cate_lr=1e-3,
     cate_patience=30,
+    # 1, not the archived run's 5. Best-of-5 buys nothing here at 5x the CATE-stage
+    # cost: the restarts land within ~0.7% of each other in training loss, so there is
+    # no local optimum for the search to escape. Ranking them by *training* loss also
+    # selects for noise-fit, which on a null DGP looked worse rather than better,
+    # though not decisively. See the n_restarts entry on AIREstimator.
+    n_restarts=1,
     K=2,
     encoder_hidden=(16,),
     n_time_basis=8,
@@ -103,6 +109,8 @@ LARGE_CONFIG = dict(
     cate_epochs=200,
     cate_lr=1e-3,
     cate_patience=30,
+    # See QUICK_CONFIG: 1 rather than the archived run's 5, deliberately.
+    n_restarts=1,
     K=2,
     encoder_hidden=(16,),
     n_time_basis=8,
@@ -191,10 +199,11 @@ def make_estimator(cfg, oracle, tensor, rsf, is_text_dgp=False):
         nuisance_training_config={"epochs": cfg["nuisance_epochs"], "verbose": 0},
         cate_epochs=cfg["cate_epochs"],
         cate_lr=cfg["cate_lr"],
-        # `patience` (was `cate_patience`); the multi-restart search this used to
-        # pair with is gone -- CATEMixture now breaks the arm symmetry at init, so
-        # a single run no longer risks the collapse-to-zero that restarts covered.
+        # `patience` is main's name for what sherlock-sims called `cate_patience`.
         patience=cfg["cate_patience"],
+        # 1 at both configs' defaults -- see the comment in QUICK_CONFIG for why the
+        # archived run's best-of-5 was dropped rather than carried over.
+        n_restarts=cfg["n_restarts"],
     )
     if nuis_hidden:
         common["weibull_config"] = {"hidden_sizes": nuis_hidden}
@@ -220,10 +229,11 @@ def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf):
     # different point than a fresh one.
     #
     # This makes the draw and the init order-independent, but NOT bit-reproducible:
-    # two identical invocations still differ by ~1-2% in iMSE, because XLA's CPU
-    # reductions are not run-to-run deterministic and early stopping amplifies a
-    # tiny numeric difference into a different stopping epoch. That is well under
-    # the ~20% between-seed spread, so it does not bias the averages.
+    # two identical invocations still differ, because XLA's CPU reductions are not
+    # run-to-run deterministic and early stopping amplifies a tiny numeric difference
+    # into a different stopping epoch. Measured on one cell (Weibull/AIR-oracle/
+    # n=5000/seed 0) the spread over four runs was 0.0152-0.0163, ~7%. That is well
+    # under the ~20-25% between-seed spread, so it does not bias the averages.
     keras.utils.set_random_seed(seed)
     t_start = time.time()
     X_train_raw, W, Z, Delta, t_end = dgp_class.generate(n=n, rng_seed=seed)
@@ -269,13 +279,24 @@ def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf):
     imse = float(np.sum(delta * mse_per_timepoint))
     runtime = time.time() - t_start
 
-    return {
+    out = {
         "seed": seed,
         "imse": imse,
         "mse_per_timepoint": [float(v) for v in mse_per_timepoint],
         "time_grid": [float(v) for v in t_grid],
         "runtime_seconds": round(runtime, 1),
     }
+
+    # Record the per-restart training losses so the run itself answers whether
+    # best-of-n_restarts is earning its ~5x CATE-stage cost. If the spread within a
+    # cell is negligible, every restart found the same optimum and the search is
+    # waste; if the winner is well below the others, it is not. The RSF baselines
+    # have no restart loop, hence the getattr guard.
+    restart_losses = getattr(est, "restart_losses_", None)
+    if restart_losses:
+        out["restart_losses"] = [float(v) for v in restart_losses]
+
+    return out
 
 
 # ---------------------------------------------------------------------------

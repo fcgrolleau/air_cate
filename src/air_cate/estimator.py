@@ -1,6 +1,7 @@
 """Top-level AIREstimator: orchestrates nuisance estimation, pseudo-outcomes, and CATE model."""
 
 import jax.numpy as jnp
+import keras
 import numpy as np
 
 from air_cate._types import SurvivalData
@@ -34,13 +35,44 @@ class AIREstimator:
         weight_decay: Weight decay for AdamW optimizer.
         patience: Epochs without training-loss improvement before early stopping.
             None trains the full `cate_epochs`.
-        rng_seed: Seed for minibatch shuffling. None uses fresh entropy.
+        rng_seed: Seed for minibatch shuffling and, with `n_restarts > 1`, for the
+            per-restart weight initialization. None uses fresh entropy.
+        n_restarts: Number of independent CATE fits from different initializations,
+            keeping the one with the lowest training R-loss. **Defaults to 1, and
+            raising it is not recommended** -- it is retained for diagnostics.
+
+            The R-loss is non-convex in the mixture parameters, so best-of-N looks
+            like cheap insurance against a bad local optimum. Measured on this
+            implementation, it is not:
+
+            - There is nothing to escape. Across 5 restarts the training losses
+              differ by ~0.7% (e.g. 2.4833 to 2.4973); every initialization reaches
+              an equally good optimum. Check `restart_losses_` before assuming
+              otherwise.
+            - Selection has no upside and plausibly a downside. `fit` holds nothing
+              out, so restarts are ranked by *training* loss -- which ranks partly by
+              how well each fit the noise. On a null DGP (true tau == 0, so every
+              nonzero value is artefact) mean max|tau_hat| was 0.187 at 1 restart
+              (15 draws, sd 0.077) against 0.261 at 5 (5 draws): directionally worse,
+              but ~1.8 standard errors, so suggestive rather than established. The
+              case for 1 rests on the point above, not on this one.
+
+            The apparent evidence for restarts, a right tail in iMSE with occasional
+            seeds near 2x the median, is unrelated: that tail is equally present in
+            runs that used 5 restarts, so it is the sampling distribution of iMSE
+            across data draws, not optimizer failure.
+
+            Costs about `n_restarts` times the CATE stage. The nuisance stage is
+            unaffected, so the multiplier is smaller for cross-fitted fits than for
+            ones given oracle nuisances.
 
     Attributes (after fit):
-        cate_model_: The fitted CATE model.
+        cate_model_: The fitted CATE model (the winning restart).
         time_grid_, delta_: The time grid and its step size.
-        history_: dict returned by `train_cate` (per-epoch loss trajectory).
-            `plot_convergence()` draws it.
+        history_: dict returned by `train_cate` for the winning restart (per-epoch
+            loss trajectory). `plot_convergence()` draws it.
+        restart_losses_: best training R-loss of each restart, in order. A wide
+            spread here is the diagnostic that restarts are earning their cost.
     """
 
     def __init__(
@@ -59,6 +91,7 @@ class AIREstimator:
         weight_decay: float = 1e-4,
         patience: int | None = 10,
         rng_seed: int | None = None,
+        n_restarts: int = 1,
         cate_model_class=None,
         cate_model_kwargs: dict | None = None,
     ):
@@ -76,6 +109,9 @@ class AIREstimator:
         self.weight_decay = weight_decay
         self.patience = patience
         self.rng_seed = rng_seed
+        if n_restarts < 1:
+            raise ValueError(f"n_restarts must be >= 1, got {n_restarts}")
+        self.n_restarts = n_restarts
         self.cate_model_class = cate_model_class
         self.cate_model_kwargs = cate_model_kwargs or {}
 
@@ -83,6 +119,7 @@ class AIREstimator:
         self.time_grid_ = None
         self.delta_ = None
         self.history_ = None
+        self.restart_losses_ = None
 
     def fit(
         self,
@@ -134,35 +171,73 @@ class AIREstimator:
             data, nuisances, self.time_grid_, self.delta_, eps=self.eps
         )
 
-        # Step 4: Build and train CATE model
-        if self.cate_model_class is not None:
-            self.cate_model_ = self.cate_model_class(**self.cate_model_kwargs)
-        else:
-            self.cate_model_ = CATEMixture(
-                K=self.K,
-                encoder_hidden_sizes=self.encoder_hidden_sizes,
+        # Step 4: Build and train the CATE model. With the default n_restarts=1 this
+        # is a single fit and the loop is a no-op.
+        #
+        # Selection is on TRAINING R-loss because `fit` holds nothing out, so there
+        # is no honest held-out score to rank by -- and scoring restarts on a block
+        # that then also reports the result would leak. That is precisely why
+        # n_restarts > 1 is not recommended: ranking by training loss ranks partly by
+        # noise-fit. See the `n_restarts` entry in the class docstring.
+        best_loss = float("inf")
+        self.cate_model_ = None
+        self.history_ = None
+        self.restart_losses_ = []
+
+        for restart in range(self.n_restarts):
+            # Distinct initializations are the entire point of restarting. With
+            # rng_seed set, seed Keras per restart so the *set* of restarts is
+            # reproducible; with rng_seed None, leave the global RNG untouched and
+            # let it advance on its own, which also gives distinct draws.
+            restart_seed = None if self.rng_seed is None else self.rng_seed + restart
+            if restart_seed is not None:
+                keras.utils.set_random_seed(restart_seed)
+
+            if self.cate_model_class is not None:
+                model = self.cate_model_class(**self.cate_model_kwargs)
+            else:
+                model = CATEMixture(
+                    K=self.K,
+                    encoder_hidden_sizes=self.encoder_hidden_sizes,
+                )
+
+            # A custom training loop is needed because Keras model.fit() with dict x
+            # and dict y requires a Dataset that preserves the structure.
+            history = train_cate(
+                model,
+                X=data.X,
+                Y_tilde=Y_tilde,
+                S_marg=S_marg,
+                W=data.W,
+                e_clipped=e_clipped,
+                time_grid=self.time_grid_,
+                delta=self.delta_,
+                epochs=self.cate_epochs,
+                lr=self.cate_lr,
+                batch_size=self.cate_batch_size,
+                weight_decay=self.weight_decay,
+                monitor="train",
+                patience=self.patience,
+                rng_seed=restart_seed,
+                verbose=verbose,
             )
 
-        # A custom training loop is needed because Keras model.fit() with dict x
-        # and dict y requires a Dataset that preserves the structure.
-        self.history_ = train_cate(
-            self.cate_model_,
-            X=data.X,
-            Y_tilde=Y_tilde,
-            S_marg=S_marg,
-            W=data.W,
-            e_clipped=e_clipped,
-            time_grid=self.time_grid_,
-            delta=self.delta_,
-            epochs=self.cate_epochs,
-            lr=self.cate_lr,
-            batch_size=self.cate_batch_size,
-            weight_decay=self.weight_decay,
-            monitor="train",
-            patience=self.patience,
-            rng_seed=self.rng_seed,
-            verbose=verbose,
-        )
+            loss = history["best_train_loss"]
+            self.restart_losses_.append(loss)
+
+            if loss < best_loss:
+                best_loss = loss
+                # Retain the model object rather than copying its weights out:
+                # every restart builds a fresh model, so at most two are ever live.
+                self.cate_model_ = model
+                self.history_ = history
+            else:
+                del model
+
+            if verbose > 0 and self.n_restarts > 1:
+                print(
+                    f"  Restart {restart}: train loss={loss:.6f} (best={best_loss:.6f})"
+                )
 
         return self
 

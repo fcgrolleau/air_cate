@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=air_cate
 #SBATCH --partition=normal
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=32G
 #SBATCH --output=sherlock/logs/task_%a.out
@@ -25,8 +25,20 @@
 # task_id -> (dgp_idx, method_idx, block_idx); block_idx varies fastest.
 #
 # Each task runs one (DGP, method) over 5 consecutive seeds x all 6 sample sizes.
-# Worst per-seed cost on the 100-seed run was ~12.6 min (IST-3, cross-fitted MGD),
-# so a 5-seed block is ~63 min worst case -- hence the 2h wall limit.
+#
+# Wall limit: 3h. Two effects pull in opposite directions from the archived 100-seed
+# run, whose worst consecutive-5-seed block was 86 min (IST-3 / cross-fitted MGD):
+#
+#   - DOWN 5x on the CATE stage. This run uses n_restarts=1; the archive used 5.
+#   - UP on the oracle methods. With oracle nuisances the pseudo-outcomes are clean
+#     enough that the training loss keeps improving, so patience=30 trips later.
+#     Locally, AIR-oracle/AIR at Weibull n=5000 gave ratio 1.72 where the archive had
+#     0.60. That was measured at 5 restarts, so how much survives at 1 is unknown.
+#
+# Net expectation is comfortably under the archive, hence well under 2h -- but the
+# oracle effect is not yet quantified at n_restarts=1, so 3h buys margin at no real
+# cost (SLURM bills actual usage; over-requesting costs only scheduling priority).
+# Check the pilot's recorded runtime_seconds and tighten before the full submission.
 
 DGPS=("Weibull" "Mixture" "IST-3")
 METHODS=("AIR" "Tensor-prod" "AIR-oracle" "TP-oracle" "RSF-T" "RSF-S")
