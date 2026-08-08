@@ -169,6 +169,40 @@ Two caveats on those numbers, both from the [Sherlock docs](https://www.sherlock
 The 3 h limit is comfortably inside the partition's 2-day maximum, so the `long` QOS is never
 needed here.
 
+#### Measured: confirmation run, job `38156448` (2026-08-07)
+
+18/18 tasks at `--mem-per-cpu=8G`, one seed, n ∈ {500, 1000, 2000}. Nothing failed and nothing
+came close to the memory limit:
+
+| | |
+|---|---|
+| Peak `MaxRSS` across all 18 tasks | **~1.5 GiB** (max 1 553 100 K, Mixture/AIR) |
+| Lowest | 0.60 GiB (IST-3/RSF-S) |
+| Elapsed | 0:38 – 4:00, against a 20 min request |
+
+So at n ≤ 2000 even 8 G is ~5× generous and the original 32 G was ~21×. **This does not license
+8 G for the full run** — the archive OOM'd at 8 G with RSF at n=20000, ten times this data — but
+it does mean the wider pilot's `MaxRSS` at n=20000 is the number to size `submit_array.sh` from,
+and it is likely well below 32 G.
+
+Note RSF was *not* the memory peak here (1.10–1.26 GiB); AIR and Tensor-prod were. RSF's
+n=20000 OOM is therefore a large-n effect specific to that method, not visible at this scale.
+
+**Oracle cost: early evidence that the 5× saving survives.** The open question above was whether
+main's longer oracle training eats the gain from `n_restarts=1`. Measured ratios of oracle to
+cross-fitted wall time:
+
+| DGP | AIR-oracle / AIR | TP-oracle / Tensor-prod |
+|---|---|---|
+| Weibull | 0.55 | 0.40 |
+| Mixture | 0.54 | 0.47 |
+| IST-3 | 0.53 | — (task still running) |
+
+Consistent with the archive's 0.52–0.85×, and *not* with the 1.72× measured locally at
+Weibull n=5000 under 5 restarts. Treat as encouraging but unsettled: at n ≤ 2000 a large share
+of each task is fixed JAX import and JIT cost, which could mask the effect. The n ≥ 5000 pilot
+is still the test.
+
 The archived run's own per-fit `runtime_seconds` are the measured baseline. They were
 recorded with `n_restarts=5`, so this run should come in **below** them:
 
