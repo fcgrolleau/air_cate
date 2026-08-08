@@ -40,6 +40,60 @@ for r in 0-999 1000-1999 2000-2999 3000-3599; do
 done
 ```
 
+### Getting the code onto Sherlock
+
+**This repo has no git remote** — it was created with `git init` and has never been cloned,
+fetched, or pushed (empty `FETCH_HEAD`, no `refs/remotes`, reflog starts at `commit
+(initial)`). The 100-seed run's code reached the cluster as a file copy, and the exact
+command was not recorded anywhere, so it is written down here now. Excludes matter: `src/`
+is ~490 MB, almost all of it generator-only IST-3 assets, against a 15 GB `$HOME` quota.
+`IST3TextDGP.load()` needs only `config.json` and `super_population.npz`.
+
+```bash
+# Dry run first -- lists what would transfer, writes nothing.
+rsync -avz --dry-run \
+  --exclude '.git/' --exclude '.venv/' --exclude '__pycache__/' --exclude '*.pyc' \
+  --exclude '.pytest_cache/' --exclude 'examples/figures/' \
+  --exclude 'src/air_cate/dgp/artifacts_text/Bio_ClinicalBERT/' \
+  --exclude 'src/air_cate/dgp/artifacts_text/embeddings.npz' \
+  --exclude 'src/air_cate/dgp/artifacts_text/clinical_notes.json.gz' \
+  ~/Desktop/github_repos/git_repo_2026/air_cate/ \
+  grolleau@login.sherlock.stanford.edu:air_cate/
+
+# Then the same command without --dry-run.
+```
+
+Deliberately **no `--delete`**: it would remove anything on the cluster not present locally,
+including `super_population.npz` (excluded above, already transferred for the 100-seed run)
+and any results still sitting in `~/air_cate`. Add it only with a specific reason.
+
+`.git/` is excluded, so the cluster copy carries no branch or commit information — record
+which commit was sent. This run: `831778b` on `full-sherlock-sims`.
+
+Sherlock SSH requires Duo two-factor, so this has to be run somewhere a push notification
+can be approved; it is not scriptable unattended.
+
+### Fast confirmation run (~10 min)
+
+Before either pilot, `sherlock/submit_pilot.sh` gives a look at real results quickly:
+
+```bash
+mkdir -p sherlock/logs
+sbatch --array=0-17 sherlock/submit_pilot.sh
+```
+
+18 tasks = 3 DGPs × 6 methods, one seed, `n_values=500,1000,2000` only. Cost scales with n
+and that is ~9% of the full 500–20000 ladder, so each task is ~1–3 min against the archive's
+~8 min per (cell, seed); all 18 run concurrently and a 20-minute wall request backfills
+quickly. Writes to `$SCRATCH/air_cate_pilot`, deliberately **not** the full run's
+`$SCRATCH/air_cate_results`, so its partials cannot poison a later submission via the resume
+logic.
+
+It confirms every (DGP, method) pair runs on main's package, the conda env resolves, the
+IST-3 artifact is present, merge/plot round-trips, and iMSE decreases in n. It does **not**
+test the 32 GB ceiling (that binds on RSF at n=20000, skipped here) and its runtimes cannot
+be extrapolated to the full run — the oracle-cost question below needs n ≥ 5000.
+
 ### Pilot first (Phase 2)
 
 Before the full run, submit only the 18 tasks with `BLOCK_IDX=0` — seeds 0–4 for every
