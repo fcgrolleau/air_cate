@@ -151,6 +151,24 @@ resume from them, which is harmless, but any *other* stale file is not).
 - Partition: `normal` (CPU only, AMD EPYC 7502)
 - 1 CPU, 32 GB RAM, **3 h** wall limit
 
+Two caveats on those numbers, both from the [Sherlock docs](https://www.sherlock.stanford.edu/docs/user-guide/running-jobs/):
+
+- **32 GB against 1 CPU is a large ask, and it costs queue time.** `normal` nodes carry 20–64
+  cores against 128–384 GB (≈2–19 GB/core; cluster default 6 GB/core), so this reserves roughly
+  five cores' worth of memory per task — 3,600 times over. The docs are explicit that
+  over-requesting lengthens the wait. It is justified only because RSF at n=20000 OOM'd at 8 GB
+  and each task spans the whole n ladder. **Lower it to the smallest safe value using the wider
+  pilot's `MaxRSS`** before submitting the full run; `submit_pilot.sh` already defaults to 8 G
+  since it stops at n=2000.
+- **The archive's runtimes assume the same hardware.** Sherlock spans 18 CPU models, and the
+  100-seed run's `runtime_seconds` were recorded on EPYC 7502. `normal` does not guarantee that
+  model, so a per-task comparison against the archive is only meaningful once you check
+  `NodeList`/`sacct` and confirm comparable hardware. A wall-clock difference of tens of percent
+  can be the node, not the code.
+
+The 3 h limit is comfortably inside the partition's 2-day maximum, so the `long` QOS is never
+needed here.
+
 The archived run's own per-fit `runtime_seconds` are the measured baseline. They were
 recorded with `n_restarts=5`, so this run should come in **below** them:
 

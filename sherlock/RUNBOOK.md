@@ -38,6 +38,42 @@ You need this much mental model and no more:
   Everything runs in a **conda** env (`air_cate`) under `$GROUP_HOME`, because conda ships its
   own glibc. This is the single most common source of confusion when coming from local dev.
 
+### Sizing your request — the main lever on queue time
+
+Per the [Sherlock docs](https://www.sherlock.stanford.edu/docs/user-guide/running-jobs/), the
+`normal` partition:
+
+| | |
+|---|---|
+| Cores per node | 20–64 |
+| Memory per node | 128–384 GB |
+| **Default memory per core** | **6 GB** |
+| Default wall time | 2 hours |
+| Max wall time | **2 days** (7 with the `long` QOS — we never need it) |
+
+The consequence, and the thing to internalize: **memory, not CPU, is what makes our tasks hard
+to place.** Nodes carry roughly 2–19 GB per core, so a `--mem-per-cpu=32G` request against
+1 CPU reserves the memory of about *five* cores on every node model in the partition. The
+scheduler has to find that much contiguous free memory, and for an 18- or 3600-task array it
+has to find it that many times. The docs say it directly: *"To minimize queue time, request only
+the resources necessary for your workload. Overestimating resource needs can result in longer
+wait times."*
+
+So the rule here is: **request 8G for anything that stops below n=5000, and 32G only for runs
+that reach n=20000** (where RSF genuinely OOM'd at 8G). `submit_pilot.sh` defaults to 8G for
+this reason; `submit_array.sh` keeps 32G because each of its tasks spans the whole n ladder and
+must be sized for its largest fit.
+
+Before the 3,600-task run, read `MaxRSS` off the wider pilot (`sacct`, section 4) and lower
+`submit_array.sh` to the smallest safe value. At that scale the difference between a 16G and a
+32G request is hours of queueing.
+
+```bash
+# Submission limits per partition -- the documented way to see them.
+# Relevant because the full run goes in batches of ~1000.
+sh_part
+```
+
 ---
 
 ## 1. Send the code from your Mac
@@ -291,10 +327,17 @@ driven wider — no edits needed:
 # "keep the rest of my environment too"; omit it and the job starts nearly bare.
 # Note N_VALUES contains commas -- that is fine, the script forwards the whole string
 # to --n-values, which parses comma-separated ints.
-sbatch --array=0-17 --time=03:00:00 \
+#
+# --mem-per-cpu=32G overrides the script's 8G default: THIS run reaches n=20000, where
+# RSF OOM'd at 8G. Expect it to queue much longer than the small pilot for that reason
+# (see "Sizing your request" below).
+sbatch --array=0-17 --time=03:00:00 --mem-per-cpu=32G \
   --export=ALL,N_VALUES=500,1000,2000,5000,10000,20000,N_SEEDS=5 \
   sherlock/submit_pilot.sh
 ```
+
+Record its `MaxRSS` — see the sizing note below, because it is what should set the full
+run's memory request.
 
 This one *does* exercise the 32 GB ceiling. Compare its recorded `runtime_seconds` against the
 archive's **10.4 min** (IST-3/AIR-oracle) and **8.3 min** (TP-oracle) per seed — both measured
@@ -378,8 +421,9 @@ still describes 2 DGPs and 20 seeds, stale in either direction.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `PD` with `(None)` / `(Priority)` / `(Resources)` | normal queueing | wait |
-| `PD` with `(QOSMaxJobsPerUserLimit)` | too many jobs submitted at once | wait; they release as others finish |
+| `PD` with `(None)` / `(Priority)` / `(Resources)` | normal queueing | wait — `(None)` means not yet evaluated, `(Priority)` means queued behind others, `(Resources)` means waiting for a free node |
+| `PD` for a long time, `TIME 0:00` | usually an oversized `--mem-per-cpu`: 32G against 1 CPU is ~5 cores' worth of memory on every node model | check `squeue --start` and `scontrol show job <id>`; if the estimate is far out, `scancel` and resubmit with `--mem-per-cpu=8G` (safe below n=5000) |
+| `PD` with `(QOSMaxJobsPerUserLimit)` | too many jobs submitted at once | wait; they release as others finish. `sh_part` shows the limits |
 | `ls: cannot access $SCRATCH/air_cate_pilot` | directory is created by the first task that *runs* | wait for `ST=R` |
 | `ModuleNotFoundError: No module named 'air_cate'` | conda env not activated in this shell, or `pip install -e .` never run in it | redo step 2's activate block |
 | `ModuleNotFoundError: No module named 'tensorflow'` | something imported `keras` before `air_cate`, so `KERAS_BACKEND=jax` was never set | import `air_cate` first |
@@ -398,13 +442,16 @@ still describes 2 DGPs and 20 seeds, stale in either direction.
 sbatch --array=0-17 script.sh    # submit an array job
 squeue -u $USER                  # my live jobs
 squeue -u $USER -t RUNNING       # only the running ones
+squeue -u $USER --start          # estimated start times (N/A = not yet computed)
 sacct -j <JOBID> --format=JobID,State,Elapsed,MaxRSS   # outcomes, incl. finished
+sprio -j <JOBID>                 # why my priority is what it is
+sinfo -p normal -o "%P %a %D %t" # is the partition full?
 scancel <JOBID>                  # cancel a whole array
 scancel <JOBID>_3                # cancel one task
 scontrol show job <JOBID>        # everything SLURM knows about a job
+sh_part                          # submission limits per partition
 sh_dev -t 00:30:00 -m 8G         # interactive compute node
 scontrol show config | grep -i maxarray          # the array cap (assumed 1000)
-sacctmgr show qos format=Name,MaxSubmitJobsPerUser
 ```
 
 ---

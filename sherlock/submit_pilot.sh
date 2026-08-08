@@ -3,9 +3,18 @@
 #SBATCH --partition=normal
 #SBATCH --time=00:20:00
 #SBATCH --cpus-per-task=1
-#SBATCH --mem-per-cpu=32G
+#SBATCH --mem-per-cpu=8G
 #SBATCH --output=sherlock/logs/pilot_%a.out
 #SBATCH --error=sherlock/logs/pilot_%a.err
+
+# 8G, NOT the full run's 32G. This is a scheduling decision, not a guess about need.
+# Sherlock's `normal` nodes carry 20-64 cores against 128-384 GB, i.e. ~2-19 GB per
+# core, and the cluster default is 6 GB/core. A 32 GB request against 1 CPU therefore
+# reserves the memory of roughly five cores on every node model in the partition, so
+# the scheduler must find 18 such slots before anything starts -- and the Sherlock
+# docs are explicit that over-requesting costs queue time. The full run needs 32G
+# because RSF at n=20000 OOM'd at 8G; this run stops at n=2000, a tenth of that.
+# The wider n>=5000 invocation below must therefore put 32G back.
 
 # Fast confirmation run, ~10 minutes wall clock:
 #
@@ -30,8 +39,11 @@
 #     so patience=30 trips later) eats the 5x saving from n_restarts=1. Answering it
 #     needs a task that actually reaches n >= 5000; see the larger pilot in STATUS.md.
 #
-# Overridable, so this same script serves a wider run without editing it:
-#   sbatch --array=0-17 --time=03:00:00 --export=ALL,N_VALUES=500,1000,2000,5000,10000,20000,N_SEEDS=5 \
+# Overridable, so this same script serves a wider run without editing it. Note the
+# --mem-per-cpu=32G: that run reaches n=20000, where RSF needs it. Expect it to queue
+# considerably longer than this one for exactly that reason.
+#   sbatch --array=0-17 --time=03:00:00 --mem-per-cpu=32G \
+#       --export=ALL,N_VALUES=500,1000,2000,5000,10000,20000,N_SEEDS=5 \
 #       sherlock/submit_pilot.sh
 
 N_VALUES="${N_VALUES:-500,1000,2000}"
