@@ -8,6 +8,13 @@
 #   RESULTS_DIR=$SCRATCH/air_cate_pilot PATTERN='pilot_*.json' \
 #   MERGED_NAME=pilot_merged.json FIGURES_DIR=examples/figures/pilot \
 #       bash sherlock/collect_results.sh
+#
+# Or the ~15 minute IST-3 gate from submit_confirm.sh, which likewise writes its own
+# directory and prefix:
+#
+#   RESULTS_DIR=$SCRATCH/air_cate_confirm PATTERN='confirm_*.json' \
+#   MERGED_NAME=confirm_merged.json FIGURES_DIR=examples/figures/confirm \
+#       bash sherlock/collect_results.sh
 
 source $GROUP_HOME/$USER/miniforge3/bin/activate
 eval "$(mamba shell hook --shell bash)"
@@ -27,7 +34,14 @@ MERGED="${RESULTS_DIR}/${MERGED_NAME}"
 
 # Unquoted on purpose: this must glob into a list of paths for --merge, which takes
 # nargs="+". Quoting it would pass the literal pattern as a single filename.
-PARTIALS=$(ls ${RESULTS_DIR}/${PATTERN} 2>/dev/null)
+#
+# The grep -vxF is not cosmetic. MERGED lands *inside* RESULTS_DIR, so a pattern like
+# 'pilot_*.json' matches the merge output as well as the inputs, and re-running this
+# script would feed the previous merge back into itself -- the giveaway is a file count
+# one higher than the number of tasks (19 for an 18-task array). Means come out
+# unchanged, but per-seed lists get duplicated, so any variance or count is wrong.
+# -v invert, -x whole-line only, -F literal (no regex metacharacters from the path).
+PARTIALS=$(ls ${RESULTS_DIR}/${PATTERN} 2>/dev/null | grep -vxF "$MERGED")
 N_FILES=$(echo "$PARTIALS" | wc -w)
 
 echo "Found ${N_FILES} files matching ${PATTERN} in ${RESULTS_DIR}"

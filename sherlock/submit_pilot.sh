@@ -39,11 +39,27 @@
 #     so patience=30 trips later) eats the 5x saving from n_restarts=1. Answering it
 #     needs a task that actually reaches n >= 5000; see the larger pilot in STATUS.md.
 #
-# Overridable, so this same script serves a wider run without editing it. Note the
-# --mem-per-cpu=32G: that run reaches n=20000, where RSF needs it. Expect it to queue
-# considerably longer than this one for exactly that reason.
-#   sbatch --array=0-17 --time=03:00:00 --mem-per-cpu=32G \
-#       --export=ALL,N_VALUES=500,1000,2000,5000,10000,20000,N_SEEDS=5 \
+# Overridable, so this same script serves a wider run without editing it.
+#
+# Pass the overrides as an ENVIRONMENT PREFIX, never through --export. SLURM splits
+# --export on commas and gives no way to escape them, so `--export=ALL,N_VALUES=500,1000`
+# parses as N_VALUES=500 plus two bare names -- the job would silently run n=500 only and
+# finish suspiciously fast. A `VAR=... sbatch` prefix puts the variable in sbatch's own
+# environment, and sbatch defaults to --export=ALL, so the job inherits it intact.
+#
+# Split by memory rather than submitting all 18 at 32G. Only RSF needs 32G (it OOM'd at
+# 8G at n=20000); the four AIR/TP methods peaked at 1.5 GiB at n=2000 and are dominated
+# by fixed XLA overhead, so 16G is already generous for them. Asking for 32G on 18 slots
+# is what left the first confirmation run stuck in PD -- see the transfer log in
+# RUNBOOK.md. METHOD_IDX = TASK_ID % 6, and RSF-T/RSF-S are indices 4 and 5, hence the
+# two array lists below.
+#
+#   N_VALUES=500,1000,2000,5000,10000,20000 N_SEEDS=5 \
+#       sbatch --array=0-3,6-9,12-15 --time=03:00:00 --mem-per-cpu=16G \
+#       sherlock/submit_pilot.sh
+#
+#   N_VALUES=500,1000,2000,5000,10000,20000 N_SEEDS=5 \
+#       sbatch --array=4,5,10,11,16,17 --time=03:00:00 --mem-per-cpu=32G \
 #       sherlock/submit_pilot.sh
 
 N_VALUES="${N_VALUES:-500,1000,2000}"

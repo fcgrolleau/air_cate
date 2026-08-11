@@ -340,34 +340,76 @@ at 8 GB, and nothing here goes near that. Runtimes likewise do not extrapolate.
 
 ---
 
-## 4. Wider pilot — before the full run
+## 4. The ~15 minute scientific gate — IST-3 to n=20000
 
-The open cost question is whether main's longer oracle training (with oracle nuisances the
-pseudo-outcomes are clean, so the training loss keeps improving and `patience=30` trips later)
-eats the 5× saving from `n_restarts=1`. It only shows up at n ≥ 5000, so the same script is
-driven wider — no edits needed:
+**This is the run that decides whether the full 999-seed run is worth submitting.** Section 3
+proves the pipeline executes; this one asks whether the *result* still holds.
+
+The claim under test: on IST-3, AIR beats RSF-T at n=20000 by ~1.45× (archive, 100 seeds:
+AIR 0.0854 vs RSF-T 0.1239). The crossover sits between n=10000 and n=20000, so **no run that
+stops below n=10000 can test it** — which is why section 3's pilot cannot substitute.
+
+Why it needs measuring rather than assuming: local paired runs on the ported package reproduce
+the archive *exactly* at n=500 (cross-fitted AIR 0.3300 vs 0.3271) but come in 1.35× worse at
+n=2000 (0.4106 vs 0.3034). The deficit grows with n and is confined to the **cross-fitted**
+arms — both oracle arms converge normally. Extrapolating that trend upward is precisely what
+cannot be done from below.
 
 ```bash
-# --export=ALL,VAR=value passes environment variables into the job. ALL first means
-# "keep the rest of my environment too"; omit it and the job starts nearly bare.
-# Note N_VALUES contains commas -- that is fine, the script forwards the whole string
-# to --n-values, which parses comma-separated ints.
-#
-# --mem-per-cpu=32G overrides the script's 8G default: THIS run reaches n=20000, where
-# RSF OOM'd at 8G. Expect it to queue much longer than the small pilot for that reason
-# (see "Sizing your request" below).
-sbatch --array=0-17 --time=03:00:00 --mem-per-cpu=32G \
-  --export=ALL,N_VALUES=500,1000,2000,5000,10000,20000,N_SEEDS=5 \
-  sherlock/submit_pilot.sh
+mkdir -p sherlock/logs
+
+# AIR + AIR-oracle -- 20 tasks at the script's 16G default.
+sbatch --array=0-19 sherlock/submit_confirm.sh
+
+# RSF-T -- 10 tasks at 32G. RSF OOM'd at 8G at n=20000 and 16G is untested for it.
+sbatch --array=20-29 --mem-per-cpu=32G sherlock/submit_confirm.sh
 ```
 
-Record its `MaxRSS` — see the sizing note below, because it is what should set the full
-run's memory request.
+Two calls, not one, because asking 32G on all 30 slots is what left an earlier run stuck in
+`PD` (see the transfer log). 20 tasks at 16G backfill almost immediately.
 
-This one *does* exercise the 32 GB ceiling. Compare its recorded `runtime_seconds` against the
-archive's **10.4 min** (IST-3/AIR-oracle) and **8.3 min** (TP-oracle) per seed — both measured
-at 5 restarts, so at 1 restart these should come in well under. If they match or exceed, raise
-`--time` in `submit_array.sh` before submitting 3,600 tasks.
+Each task runs **one seed of the full ladder** and all 30 run concurrently, so wall clock is
+one slowest task (~8.6 min, from the pilot's own recorded `runtime_seconds` extrapolated up
+the ladder) rather than a sum. Ten seeds per method is the statistical power; the `--time` is
+set to 30 min because the RSF timings are fitted from sub-second measurements and are the
+least trustworthy numbers in the estimate.
+
+If you want more seeds, **widen `--array` and `N_SEEDS_TOTAL` together** — the script derives
+the method from `TASK_ID / N_SEEDS_TOTAL`, so changing one alone silently reassigns which
+method each task runs:
+
+```bash
+# Pass overrides as an ENVIRONMENT PREFIX, never through --export.
+#
+# SLURM splits --export on commas with no way to escape them, so
+# `--export=ALL,N_VALUES=500,1000` parses as N_VALUES=500 plus two bare names --
+# the job would silently run n=500 only and finish suspiciously fast. A `VAR=... sbatch`
+# prefix puts the variable in sbatch's own environment, and sbatch defaults to
+# --export=ALL, so the job inherits it intact.
+N_SEEDS_TOTAL=20 sbatch --array=0-39 sherlock/submit_confirm.sh
+N_SEEDS_TOTAL=20 sbatch --array=40-59 --mem-per-cpu=32G sherlock/submit_confirm.sh
+```
+
+Collect it into its own directory and figures folder, so nothing touches the publication
+outputs:
+
+```bash
+RESULTS_DIR=$SCRATCH/air_cate_confirm PATTERN='confirm_*.json' \
+MERGED_NAME=confirm_merged.json FIGURES_DIR=examples/figures/confirm \
+  bash sherlock/collect_results.sh
+```
+
+**Read it against these three numbers.** The run has failed the gate if any hold:
+
+| check | archive says | failure looks like |
+|---|---|---|
+| RSF-T / AIR at n=20000 | ~1.45× | at or below 1.0 |
+| AIR falls with n | 0.303 (n=2000) → 0.085 (n=20000) | a flat tail |
+| AIR / AIR-oracle at n=20000 | ~1.29× | still ~2.2×, as at n=2000 |
+
+Also record `MaxRSS` (`sacct -j <jobid> --format=JobID,MaxRSS,Elapsed,State`) — it is what
+should set the full run's memory request, and this run is the only one that reaches n=20000
+before the full submission.
 
 ---
 
@@ -462,6 +504,11 @@ still describes 2 DGPs and 20 seeds, stale in either direction.
 | Run finishes suspiciously fast, results incomplete | stale partials, skipped via resume | `rm -f $SCRATCH/air_cate_results/partial_*.json`, resubmit |
 | Figures look wrong after a pilot | `FIGURES_DIR` override omitted, so pilot plots overwrote the real ones | `git checkout examples/figures/` |
 | Per-cell iMSE differs slightly on rerun | XLA CPU reductions are not run-to-run deterministic; early stopping amplifies it (~1–7%) | not a bug — see [STATUS.md](STATUS.md#not-bit-reproducible) |
+| `SyntaxError: Missing parentheses in call to 'print'` | bare `python` on a login node is **Python 2**; the conda env was not activated | redo step 2's activate block. Inside the env, `python -V` must print 3.x |
+| A job sees none of the variables you set | `--export=VAR=value` **replaces** the environment instead of adding to it | always `--export=ALL,VAR=value` — `ALL` first keeps the rest. Beware that a value containing commas is parsed as further `VAR=value` pairs, so quote it and keep comma-valued settings (like `N_VALUES=500,1000`) as a single quoted argument |
+| Runtime per fit looks 10× too slow | the harness prints **cumulative** elapsed seconds per line, not per-fit | subtract consecutive lines; e.g. `(31s)` after `(15s)` is a 16 s fit |
+| `rsync` reports `received 151 bytes` and no files appear | it was run **on Sherlock**, so it pulled the cluster's own files onto the cluster | every `rsync` in this runbook runs **on your Mac**. Check your prompt: a Sherlock shell shows `sh0x-lognn` |
+| Locally, a multi-flag variable arrives as one giant argument | zsh (the Mac default) does **not** word-split unquoted expansions the way bash does, so `$ARGS` stays a single word | use an array: `ARGS=(--large --dgp IST-3)` then `cmd "${ARGS[@]}"` |
 
 ### Command cheat sheet
 
