@@ -2,6 +2,7 @@
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from air_cate.cate_model.mixture import CATEMixture
 from air_cate.cate_model.train import train_cate
@@ -104,3 +105,34 @@ def test_epoch_train_loss_is_shuffle_invariant():
     np.testing.assert_allclose(
         history_a["train_loss"], history_b["train_loss"], atol=1e-4
     )
+
+
+def test_a_non_finite_loss_raises_instead_of_returning_a_nan_model():
+    """Training must fail loudly rather than hand back a model full of NaN.
+
+    The failure this guards against was silent and therefore expensive: a NaN
+    reaching the weights left `best_weights` unset, the `is not None` check then
+    skipped weight restoration, and the caller received a model whose predictions
+    were entirely NaN. Scored in a simulation that tolerates NaN when plotting, it
+    surfaced only as iMSE = nan in roughly 10% of fits -- with no warning at all,
+    and it would have quietly contaminated a 999-seed run.
+    """
+    import keras
+
+    X, Y_tilde, S_marg, W, e_clipped, time_grid, delta = _heavy_tailed_inputs()
+
+    # One NaN pseudo-outcome is enough: the R-loss sums over subjects, so it makes
+    # every epoch's loss non-finite from the very first batch.
+    Y_tilde = Y_tilde.copy()
+    Y_tilde[0, 0] = np.nan
+
+    keras.utils.set_random_seed(0)
+    model = CATEMixture(K=2, encoder_hidden_sizes=(4,))
+
+    with pytest.raises(RuntimeError, match="no usable weights"):
+        train_cate(
+            model, X=X, Y_tilde=Y_tilde, S_marg=S_marg, W=W, e_clipped=e_clipped,
+            time_grid=time_grid, delta=delta,
+            epochs=3, lr=1e-3, weight_decay=0.0, batch_size=BATCH_SIZE,
+            patience=None, rng_seed=0, verbose=0,
+        )

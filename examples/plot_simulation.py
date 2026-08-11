@@ -81,6 +81,25 @@ QUICK_CONFIG = dict(
     cate_epochs=200,
     cate_lr=1e-3,
     cate_patience=30,
+    # Without a held-out block, `cate_patience` is inert: it would monitor the TRAINING
+    # R-loss, which falls monotonically, so early stopping never fires and every fit
+    # runs the full `cate_epochs` and over-fits. Measured on IST-3 at n=2000 over 20
+    # paired seeds, that cost 0.192 vs 0.149 iMSE with oracle nuisances and 0.563 vs
+    # 0.411 cross-fitted -- i.e. the whole of the apparent IST-3 regression against the
+    # archived 100-seed run, which had been early-stopping by accident (a NaN killed
+    # its fits at epoch 60-120; see gamma_survival.py).
+    #
+    # 0.2 rather than a tuned epoch cap: a hard cap at 100 epochs scored marginally
+    # better here (0.374 cross-fitted, paired t=0.79 against the archive vs t=1.33 for
+    # the split) but the number was chosen by looking at this DGP's answer and has no
+    # defence beyond that. Held-out R-loss needs no new justification -- it is the same
+    # criterion AIREstimatorCV uses to select K.
+    cate_val_frac=0.2,
+    # Rescale t to [0,1] inside CATEMixture. On by default because it is what the
+    # archived 100-seed run did and it is measurably better: with it off, the oracle
+    # IST-3 arm sits well above the archive, with it on it reproduces it (0.147 vs
+    # 0.146). Affects the MGD model only; CATETensorProduct always normalizes.
+    mgd_normalize_time=True,
     # 1, not the archived run's 5. Best-of-5 buys nothing here at 5x the CATE-stage
     # cost: the restarts land within ~0.7% of each other in training loss, so there is
     # no local optimum for the search to escape. Ranking them by *training* loss also
@@ -109,6 +128,11 @@ LARGE_CONFIG = dict(
     cate_epochs=200,
     cate_lr=1e-3,
     cate_patience=30,
+    # See QUICK_CONFIG: without this, `cate_patience` cannot fire and every fit
+    # over-trains to `cate_epochs`.
+    cate_val_frac=0.2,
+    # See QUICK_CONFIG: matches the archived run and reproduces its oracle arm.
+    mgd_normalize_time=True,
     # See QUICK_CONFIG: 1 rather than the archived run's 5, deliberately.
     n_restarts=1,
     K=2,
@@ -204,6 +228,12 @@ def make_estimator(cfg, oracle, tensor, rsf, is_text_dgp=False):
         # 1 at both configs' defaults -- see the comment in QUICK_CONFIG for why the
         # archived run's best-of-5 was dropped rather than carried over.
         n_restarts=cfg["n_restarts"],
+        # 0 unless --cate-val-frac is passed, i.e. no split and `patience` stays inert.
+        cate_val_frac=cfg.get("cate_val_frac", 0.0),
+        # Off unless --cate-refit-full is passed. Requires cate_val_frac > 0: the
+        # split picks the stopping point, then the final model is refit on all n rows
+        # for the same number of optimizer steps. Not a config default until measured.
+        cate_refit_full=cfg.get("cate_refit_full", False),
     )
     if nuis_hidden:
         common["weibull_config"] = {"hidden_sizes": nuis_hidden}
@@ -217,6 +247,12 @@ def make_estimator(cfg, oracle, tensor, rsf, is_text_dgp=False):
     else:
         common["K"] = cfg.get("text_K", cfg["K"]) if is_text_dgp else cfg["K"]
         common["encoder_hidden_sizes"] = encoder_hidden
+        # Off by default. The archived 100-seed run normalized t unconditionally;
+        # this key exists so that behaviour can be A/B'd against the current one
+        # without a code edit. See `normalize_time` in CATEMixture.
+        common["cate_model_kwargs"] = dict(
+            normalize_time=cfg.get("mgd_normalize_time", False),
+        )
     return AIREstimator(**common)
 
 
@@ -234,7 +270,17 @@ def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf):
     # into a different stopping epoch. Measured on one cell (Weibull/AIR-oracle/
     # n=5000/seed 0) the spread over four runs was 0.0152-0.0163, ~7%. That is well
     # under the ~20-25% between-seed spread, so it does not bias the averages.
-    keras.utils.set_random_seed(seed)
+    if cfg.get("legacy_seeding", False):
+        # Diagnostic only (--legacy-seeding): exactly what the archived 100-seed run
+        # did. Seeding numpy alone leaves the Keras generator advancing on its own,
+        # which is the order-dependence described above -- but it is also the only
+        # remaining difference between this harness and the archive on the
+        # cross-fitted path, whose nuisance code is byte-identical and whose config
+        # matches. Running both arms over the same seeds settles whether the seeding
+        # accounts for the gap.
+        np.random.seed(seed)
+    else:
+        keras.utils.set_random_seed(seed)
     t_start = time.time()
     X_train_raw, W, Z, Delta, t_end = dgp_class.generate(n=n, rng_seed=seed)
 
@@ -671,6 +717,41 @@ def main():
                              "holds the tracked publication figures)")
     parser.add_argument("--merge", nargs="+", metavar="FILE",
                         help="Merge partial result files into simulation_results.json")
+    # The two knobs that separate this package from the archived 100-seed run.
+    # Both exist so that run can be reproduced from the command line, without
+    # editing a config constant and risking it being committed by accident.
+    parser.add_argument("--mgd-normalize-time", action="store_true",
+                        help="Rescale t to [0,1] inside CATEMixture, as the archived "
+                             "100-seed run did. Affects AIR and AIR-oracle only; the "
+                             "tensor-product model always normalizes.")
+    parser.add_argument("--n-restarts", type=int, default=None,
+                        help="Independent CATE fits per cell, best training loss wins. "
+                             "The archived 100-seed run used 5; the default is 1.")
+    parser.add_argument("--legacy-seeding", action="store_true",
+                        help="Seed numpy only, as the archived 100-seed run did, instead "
+                             "of also seeding the Keras global generator. Diagnostic: "
+                             "isolates whether the seeding change explains the "
+                             "cross-fitted IST-3 gap. Reintroduces the order-dependence "
+                             "described at the top of run_single, so do not use it for "
+                             "production runs.")
+    parser.add_argument("--cate-epochs", type=int, default=None,
+                        help="Epoch cap for the CATE stage (default 200). Diagnostic: now "
+                             "that the t=0 NaN is fixed, nothing actually stops CATE "
+                             "training -- patience monitors the *train* R-loss, which falls "
+                             "monotonically, so every fit runs to the cap. Sweeping this "
+                             "measures how much of the archived run's accuracy came from "
+                             "its fits dying early rather than converging.")
+    parser.add_argument("--cate-val-frac", type=float, default=None,
+                        help="Hold out this fraction of rows from the CATE fit and early-stop "
+                             "on their R-loss (default 0 = no split, train to the epoch cap). "
+                             "This is the principled alternative to --cate-epochs: it makes "
+                             "`patience` a real stopping rule instead of an inert one.")
+    parser.add_argument("--cate-refit-full", action="store_true",
+                        help="After the held-out split picks a stopping point, refit the "
+                             "CATE model from scratch on ALL rows for the same number of "
+                             "optimizer steps. Recovers the rows --cate-val-frac spends, "
+                             "at the cost of a second CATE fit. Requires --cate-val-frac "
+                             "> 0 (or a config that sets it).")
     args = parser.parse_args()
 
     # --- Merge mode ---
@@ -708,6 +789,46 @@ def main():
             parser.error("--n-values must list at least one sample size")
         cfg = dict(cfg)  # shallow copy so we don't mutate the constant
         cfg["n_values"] = n_values
+
+    # Applied after --n-values so both overrides can be combined. Each takes its own
+    # shallow copy, which is cheap and keeps the module constants immutable whichever
+    # subset of flags is passed.
+    if args.mgd_normalize_time:
+        cfg = dict(cfg)
+        cfg["mgd_normalize_time"] = True
+    if args.n_restarts is not None:
+        if args.n_restarts < 1:
+            parser.error(f"--n-restarts must be >= 1, got {args.n_restarts}")
+        cfg = dict(cfg)
+        cfg["n_restarts"] = args.n_restarts
+    if args.legacy_seeding:
+        cfg = dict(cfg)
+        cfg["legacy_seeding"] = True
+    if args.cate_epochs is not None:
+        if args.cate_epochs < 1:
+            parser.error(f"--cate-epochs must be >= 1, got {args.cate_epochs}")
+        cfg = dict(cfg)
+        cfg["cate_epochs"] = args.cate_epochs
+    if args.cate_val_frac is not None:
+        if not 0.0 <= args.cate_val_frac < 1.0:
+            parser.error(
+                f"--cate-val-frac must be in [0, 1), got {args.cate_val_frac}"
+            )
+        cfg = dict(cfg)
+        cfg["cate_val_frac"] = args.cate_val_frac
+    if args.cate_refit_full:
+        # Checked here, against the *effective* config, rather than left to
+        # AIREstimator's ctor: without a split there is no honest stopping point to
+        # refit at, and a run that would die on fit #1 should die at argument-parse
+        # time instead. Reads cfg, so it must follow the --cate-val-frac block.
+        if cfg.get("cate_val_frac", 0.0) <= 0.0:
+            parser.error(
+                "--cate-refit-full needs a held-out split to select the stopping "
+                "point, but the effective cate_val_frac is "
+                f"{cfg.get('cate_val_frac', 0.0)}. Pass --cate-val-frac 0.2."
+            )
+        cfg = dict(cfg)
+        cfg["cate_refit_full"] = True
 
     # --- DGP / method filters ---
     dgps = DGPS

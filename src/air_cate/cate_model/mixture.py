@@ -17,16 +17,33 @@ class CATEMixture(keras.Model):
     - tau(0|x) = 0  (Gamma survival = 1 at t=0 for both arms)
     - tau(t|x) in [-1, 1]
     - tau(t|x) -> 0 as t -> inf
+
+    Args:
+        K: Number of mixture components.
+        encoder_hidden_sizes: Hidden layer widths of the covariate encoder.
+        normalize_time: Rescale the time grid to [0, 1] before evaluating the Gamma
+            survival profiles. Off by default, which evaluates G at the raw times.
+            Turn it on when t_end is large relative to 1/lambda: lambda is
+            initialized near softplus(1.0) ~ 1.31, so with t_end = 5 the product
+            lambda * t reaches ~6.5 and G has already decayed to 0.04 by t_end,
+            leaving the back half of the grid nearly flat. The model can only spread
+            the effect over [0, t_end] by driving lambda_raw from +1.0 down to about
+            -1.2 -- roughly four initializer SDs -- using gradient from the very
+            region it has flattened, which patience-based early stopping tends to
+            cut short. Normalizing keeps lambda * t in [0, 1.31] instead.
+            `CATETensorProduct` normalizes unconditionally.
     """
 
     def __init__(
         self,
         K: int = 4,
         encoder_hidden_sizes: tuple[int, ...] = (64, 32),
+        normalize_time: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.K = K
+        self.normalize_time = normalize_time
         self.encoder = FeatureEncoder(hidden_sizes=encoder_hidden_sizes)
         self.gate_dense = keras.layers.Dense(K)
 
@@ -67,14 +84,21 @@ class CATEMixture(keras.Model):
         alpha_bar = keras.activations.softplus(self.alpha_raw) + 1e-4
         lambdas = keras.activations.softplus(self.lambda_raw) + 1e-4  # (K, 2)
 
+        # Optionally map t onto [0, 1] so the Gamma scales work across DGP time
+        # scales. See `normalize_time` in the class docstring.
+        if self.normalize_time:
+            t_eval = time_grid / jnp.maximum(time_grid[-1], 1e-6)
+        else:
+            t_eval = time_grid
+
         # Treatment effect profiles: TE_k(t) = G(t; alpha, lambda_{k,1}) - G(t; alpha, lambda_{k,0})
-        # time_grid is (T,), lambdas[:, w] is (K,)
+        # t_eval is (T,), lambdas[:, w] is (K,)
         # G(t; alpha, lam) evaluated for each k: shape (K, T)
         G1 = gamma_survival(
-            time_grid[None, :], alpha_bar, lambdas[:, 1:2]
+            t_eval[None, :], alpha_bar, lambdas[:, 1:2]
         )  # (K, T)
         G0 = gamma_survival(
-            time_grid[None, :], alpha_bar, lambdas[:, 0:1]
+            t_eval[None, :], alpha_bar, lambdas[:, 0:1]
         )  # (K, T)
         TE = G1 - G0  # (K, T)
 

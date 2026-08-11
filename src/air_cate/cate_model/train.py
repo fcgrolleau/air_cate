@@ -204,16 +204,33 @@ def train_cate(
                 msg += f", val_loss: {val_history[-1]:.6f}"
             print(msg)
 
-        if monitored < best_loss - 1e-6:
-            best_loss = monitored
-            best_epoch = epoch
-            patience_counter = 0
-            # Snapshot non-trainable variables too: harmless today (no BN in the
-            # encoder) but correct if stateful layers are ever added.
-            best_weights = (
+        # Snapshot non-trainable variables too: harmless today (no BN in the
+        # encoder) but correct if stateful layers are ever added.
+        candidate = None
+        improved = bool(np.isfinite(monitored)) and monitored < best_loss - 1e-6
+        if improved:
+            candidate = (
                 _extract_vars(model.trainable_variables),
                 _extract_vars(model.non_trainable_variables),
             )
+            # A finite `monitored` is not enough to trust these weights. The epoch
+            # loss averages the *pre-update* loss of each minibatch, so a NaN
+            # created by the epoch's final batch does not appear in `monitored` --
+            # it first shows up an epoch later. Snapshotting on the loss alone
+            # therefore lets a NaN model be recorded as "best" under a perfectly
+            # finite loss and restored below, yielding NaN predictions with no
+            # warning of any kind. Checking the weights themselves is what closes
+            # that window.
+            if not all(
+                bool(jnp.all(jnp.isfinite(v))) for v in candidate[0] + candidate[1]
+            ):
+                improved = False
+
+        if improved:
+            best_loss = monitored
+            best_epoch = epoch
+            patience_counter = 0
+            best_weights = candidate
         else:
             patience_counter += 1
             if patience is not None and patience_counter >= patience:
@@ -221,7 +238,19 @@ def train_cate(
                     print(f"Early stopping at epoch {epoch + 1}")
                 break
 
-    if restore_best and best_weights is not None:
+    # No finite snapshot at all means every epoch was either non-improving from the
+    # start or numerically broken, and the model still holds whatever training left
+    # in it -- possibly NaN. Returning it would score as iMSE = nan and, in a large
+    # simulation, quietly contaminate the averages instead of failing. Fail loudly.
+    if best_weights is None:
+        first_loss = train_history[0] if train_history else float("nan")
+        raise RuntimeError(
+            f"CATE training produced no usable weights in {stopped_epoch + 1} epoch(s): "
+            f"every epoch was non-improving or non-finite (first epoch loss "
+            f"{first_loss:.6g}). Refusing to return a model that may hold NaN."
+        )
+
+    if restore_best:
         _assign_vars(model.trainable_variables, best_weights[0])
         _assign_vars(model.non_trainable_variables, best_weights[1])
 

@@ -1,9 +1,11 @@
 """Integration tests for AIREstimator."""
 
+import math
+
 import numpy as np
 import pytest
 
-from conftest import WeibullDGP, NullDGP
+from conftest import WeibullDGP
 
 
 @pytest.mark.slow
@@ -176,7 +178,7 @@ def test_estimator_records_history():
 
     assert est.history_ is not None
     assert len(est.history_["train_loss"]) == 10
-    assert est.history_["val_loss"] is None, "no validation split in AIREstimator"
+    assert est.history_["val_loss"] is None, "cate_val_frac defaults to 0, so no split"
     assert est.history_["monitor"] == "train"
     assert np.all(np.isfinite(est.history_["train_loss"]))
 
@@ -195,6 +197,155 @@ def test_estimator_records_history():
         assert ax.get_ylabel() == "Training AIR CATE loss"
     finally:
         plt.close(fig)
+
+
+def test_cate_val_frac_makes_early_stopping_real():
+    """A validation split must actually reach train_cate and drive the monitor.
+
+    At the default cate_val_frac=0 the monitored quantity is the *training* R-loss,
+    which falls monotonically, so `patience` never fires and every fit runs to
+    cate_epochs. That inert stopping rule cost ~35% in iMSE on the IST-3 DGP (oracle
+    nuisances, 20 paired seeds at n=2000: 0.192 at 200 epochs vs 0.142 at 100). This
+    pins the wiring that fixes it: a split is drawn, val_loss is recorded, and the
+    monitor resolves to "val" rather than silently staying on "train".
+    """
+    from air_cate.estimator import AIREstimator
+
+    rng = np.random.default_rng(0)
+    n, p = 200, 5
+    X = rng.uniform(-1, 1, (n, p)).astype(np.float32)
+    W = rng.binomial(1, 0.5, n).astype(np.float32)
+    Z = rng.exponential(2.0, n).astype(np.float32)
+    Delta = rng.binomial(1, 0.7, n).astype(np.float32)
+
+    est = AIREstimator(
+        K=2, M=10, n_folds=2, eps=0.01,
+        encoder_hidden_sizes=(16,),
+        nuisance_training_config={"epochs": 5, "verbose": 0},
+        cate_epochs=10,
+        patience=None,  # keep all 10 epochs so the histories stay comparable
+        cate_val_frac=0.25,
+        rng_seed=0,
+    )
+    est.fit(X, W, Z, Delta, t_end=5.0, verbose=0)
+
+    assert est.history_["monitor"] == "val", "the split did not reach train_cate"
+    assert est.history_["val_loss"] is not None
+    assert len(est.history_["val_loss"]) == 10
+    assert np.all(np.isfinite(est.history_["val_loss"]))
+    # Restart ranking must switch to the held-out score, not stay on the train loss.
+    assert est.restart_losses_ == [est.history_["best_val_loss"]]
+    # Predictions still cover every subject: only the CATE *fit* is subsetted.
+    assert est.predict_tau(X).shape == (n, 11)
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.0, 1.5])
+def test_cate_val_frac_out_of_range_raises(bad):
+    """Reject at construction, not with an opaque indexing error mid-fit."""
+    from air_cate.estimator import AIREstimator
+
+    with pytest.raises(ValueError, match="cate_val_frac"):
+        AIREstimator(cate_val_frac=bad)
+
+
+def test_cate_val_frac_too_small_for_n_raises():
+    """A fraction that rounds to zero held-out rows must fail, not silently no-op.
+
+    Without the guard, n_val = 0 yields an empty validation set whose R-loss is NaN,
+    which the refuse-NaN-model check in train_cate would then report as a training
+    failure -- a confusing symptom several layers from the actual cause.
+    """
+    from air_cate.estimator import AIREstimator
+
+    rng = np.random.default_rng(0)
+    n, p = 20, 3
+    X = rng.uniform(-1, 1, (n, p)).astype(np.float32)
+    W = rng.binomial(1, 0.5, n).astype(np.float32)
+    Z = rng.exponential(2.0, n).astype(np.float32)
+    Delta = rng.binomial(1, 0.7, n).astype(np.float32)
+
+    est = AIREstimator(
+        K=2, M=5, n_folds=2, eps=0.01,
+        encoder_hidden_sizes=(8,),
+        nuisance_training_config={"epochs": 2, "verbose": 0},
+        cate_epochs=2, patience=None,
+        cate_val_frac=0.01,  # 0.01 * 20 = 0.2 -> rounds to 0
+        rng_seed=0,
+    )
+    with pytest.raises(ValueError, match="leaves 0 validation"):
+        est.fit(X, W, Z, Delta, t_end=5.0, verbose=0)
+
+
+def test_cate_refit_full_matches_budget_in_steps_not_epochs():
+    """The refit must reproduce the selected budget in optimizer *steps*.
+
+    The stopping point is measured with ceil(n_fit / B) updates per epoch; the refit
+    sees ceil(n / B), a factor 1/(1 - cate_val_frac) more. Reusing the epoch count
+    verbatim would train ~25% longer at cate_val_frac=0.2 than the held-out block ever
+    endorsed -- reintroducing the over-training the split exists to prevent. Batch 32
+    with n=200 makes the two rates differ (5 vs 7 steps/epoch) so the conversion is
+    actually exercised; at the default batch 256 both round to 1 and the test is vacuous.
+    """
+    from air_cate.estimator import AIREstimator
+
+    rng = np.random.default_rng(0)
+    n, p = 200, 5
+    X = rng.uniform(-1, 1, (n, p)).astype(np.float32)
+    W = rng.binomial(1, 0.5, n).astype(np.float32)
+    Z = rng.exponential(2.0, n).astype(np.float32)
+    Delta = rng.binomial(1, 0.7, n).astype(np.float32)
+
+    est = AIREstimator(
+        K=2, M=10, n_folds=2, eps=0.01,
+        encoder_hidden_sizes=(16,),
+        nuisance_training_config={"epochs": 5, "verbose": 0},
+        cate_epochs=10,
+        cate_batch_size=32,
+        patience=None,  # spend all 10 epochs, so best_epoch is chosen on merit
+        cate_val_frac=0.25,
+        cate_refit_full=True,
+        rng_seed=0,
+    )
+    est.fit(X, W, Z, Delta, t_end=5.0, verbose=0)
+
+    n_fit = n - int(round(0.25 * n))
+    steps_sel = math.ceil(n_fit / 32)      # 150 -> 5
+    steps_full = math.ceil(n / 32)         # 200 -> 7
+    assert steps_sel < steps_full, "batch size chosen so the two rates differ"
+    selected_epochs = est.history_["best_epoch"] + 1
+    expected = max(1, round(selected_epochs * steps_sel / steps_full))
+    assert est.refit_epochs_ == expected
+
+    # history_ still describes the *selection* fit -- that is what plot_convergence
+    # draws, and what earned the epoch count.
+    assert est.history_["monitor"] == "val"
+    # The refit holds nothing out, so it has no val curve to monitor.
+    assert est.refit_history_ is not None
+    assert est.refit_history_ is not est.history_
+    assert est.refit_history_["monitor"] == "train"
+    assert est.refit_history_["val_loss"] is None
+    assert len(est.refit_history_["train_loss"]) == est.refit_epochs_
+    assert np.all(np.isfinite(est.refit_history_["train_loss"]))
+    assert est.predict_tau(X).shape == (n, 11)
+
+
+def test_cate_refit_full_leaves_attributes_none_when_off():
+    """Off by default: the refit attributes exist but stay None, so callers can test
+    `refit_history_ is None` instead of hasattr."""
+    from air_cate.estimator import AIREstimator
+
+    est = AIREstimator()
+    assert est.refit_history_ is None
+    assert est.refit_epochs_ is None
+
+
+def test_cate_refit_full_without_split_raises():
+    """Reject at construction: with nothing held out there is no honest stopping point
+    to refit at, and the failure should not wait until the first fit."""
+    from air_cate.estimator import AIREstimator
+
+    with pytest.raises(ValueError, match="cate_refit_full"):
+        AIREstimator(cate_refit_full=True)  # cate_val_frac defaults to 0.0
 
 
 def test_plot_convergence_before_fit_raises():
