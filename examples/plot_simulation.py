@@ -252,6 +252,10 @@ def make_estimator(cfg, oracle, tensor, rsf, is_text_dgp=False):
         # without a code edit. See `normalize_time` in CATEMixture.
         common["cate_model_kwargs"] = dict(
             normalize_time=cfg.get("mgd_normalize_time", False),
+            # Off by default. The archived run drew lambda_raw from N(0, 1); the
+            # current default N(1.0, 0.5) has 2.4x less relative spread in the
+            # resulting decay rates. See `legacy_lambda_init` in CATEMixture.
+            legacy_lambda_init=cfg.get("mgd_legacy_lambda_init", False),
         )
     return AIREstimator(**common)
 
@@ -649,10 +653,24 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
     ax_mean[0].set_ylabel("Average MSE", fontsize=10.5)
     ax_var[0].set_ylabel("Variance of MSE", fontsize=10.5)
 
-    # Shared legend below all panels
+    # Shared legend below all panels.
+    #
+    # Ordered BY LABEL, not by position. A hardcoded index permutation
+    # (order = [0, 1, 2, 5, 6, 3, 4]) worked only when all six methods were
+    # plotted: any --methods subset yields fewer handles and index 5 raises
+    # IndexError -- after the fits are done and the summary is printed, so the
+    # expensive work is already complete when the plot dies.
     handles, labels = ax_mean[0].get_legend_handles_labels()
-    # Reorder: True tv-ATE first, then solid methods, then oracle (dashed)
-    order = [0, 1, 2, 5, 6, 3, 4]  # tv-ATE, AIR, TP, RSF-T, RSF-S, AIR-orc, TP-orc
+    # True tv-ATE first, then the solid (cross-fitted) methods, then the dashed
+    # oracle ones, so the legend reads in the same visual grouping as the panels.
+    preferred = ["True tv-ATE"] + [
+        METHOD_LABELS[m]
+        for m in ("AIR", "Tensor-prod", "RSF-T", "RSF-S", "AIR-oracle", "TP-oracle")
+    ]
+    rank = {label: i for i, label in enumerate(preferred)}
+    # Unknown labels sort last in their existing order rather than being dropped:
+    # a legend entry silently missing from a figure is worse than one out of place.
+    order = sorted(range(len(labels)), key=lambda i: (rank.get(labels[i], len(rank)), i))
     handles = [handles[i] for i in order]
     labels = [labels[i] for i in order]
     fig.legend(handles, labels, loc="lower center", ncol=4,
@@ -727,6 +745,21 @@ def main():
     parser.add_argument("--n-restarts", type=int, default=None,
                         help="Independent CATE fits per cell, best training loss wins. "
                              "The archived 100-seed run used 5; the default is 1.")
+    parser.add_argument("--mgd-legacy-lambda-init", action="store_true",
+                        help="Draw CATEMixture's lambda_raw from N(0, 1), as the archived "
+                             "100-seed run did, instead of the current N(1.0, 0.5). "
+                             "Affects AIR and AIR-oracle only. The current default was "
+                             "chosen against a constant initializer, not against this one, "
+                             "and it starts the mixture components with 2.4x less relative "
+                             "spread in their decay rates.")
+    parser.add_argument("--mgd-k", type=int, default=None,
+                        help="Number of MGD mixture components, overriding BOTH `K` and "
+                             "`text_K` so it takes effect on the text DGP too (which reads "
+                             "text_K, not K -- setting only one silently does nothing on "
+                             "IST-3). Diagnostic: capacity is fixed at K=2 / text_K=4 while "
+                             "n grows 40x across the ladder, and a saturating model is "
+                             "indistinguishable from the plateau we are chasing. No effect "
+                             "on the tensor-product or RSF methods.")
     parser.add_argument("--legacy-seeding", action="store_true",
                         help="Seed numpy only, as the archived 100-seed run did, instead "
                              "of also seeding the Keras global generator. Diagnostic: "
@@ -801,6 +834,18 @@ def main():
             parser.error(f"--n-restarts must be >= 1, got {args.n_restarts}")
         cfg = dict(cfg)
         cfg["n_restarts"] = args.n_restarts
+    if args.mgd_legacy_lambda_init:
+        cfg = dict(cfg)
+        cfg["mgd_legacy_lambda_init"] = True
+    if args.mgd_k is not None:
+        if args.mgd_k < 1:
+            parser.error(f"--mgd-k must be >= 1, got {args.mgd_k}")
+        cfg = dict(cfg)
+        # Both keys, deliberately: make_estimator reads text_K for the text DGP and
+        # falls back to K otherwise, so setting one alone is a silent no-op on
+        # whichever DGP the run actually targets.
+        cfg["K"] = args.mgd_k
+        cfg["text_K"] = args.mgd_k
     if args.legacy_seeding:
         cfg = dict(cfg)
         cfg["legacy_seeding"] = True

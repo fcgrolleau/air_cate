@@ -351,9 +351,13 @@ stops below n=10000 can test it** — which is why section 3's pilot cannot subs
 
 Why it needs measuring rather than assuming: local paired runs on the ported package reproduce
 the archive *exactly* at n=500 (cross-fitted AIR 0.3300 vs 0.3271) but come in 1.35× worse at
-n=2000 (0.4106 vs 0.3034). The deficit grows with n and is confined to the **cross-fitted**
-arms — both oracle arms converge normally. Extrapolating that trend upward is precisely what
-cannot be done from below.
+n=2000 (0.4106 vs 0.3034). The deficit grows with n, and extrapolating that trend upward is
+precisely what cannot be done from below.
+
+> **This gate has been run, and it FAILED.** See section 4b for the numbers and the follow-up
+> diagnostic. Section 5's full run is blocked until 4b resolves. An earlier version of this
+> section added that the deficit "is confined to the cross-fitted arms — both oracle arms
+> converge normally"; the gate falsified that, and the sentence is gone.
 
 ```bash
 mkdir -p sherlock/logs
@@ -410,6 +414,191 @@ MERGED_NAME=confirm_merged.json FIGURES_DIR=examples/figures/confirm \
 Also record `MaxRSS` (`sacct -j <jobid> --format=JobID,MaxRSS,Elapsed,State`) — it is what
 should set the full run's memory request, and this run is the only one that reaches n=20000
 before the full submission.
+
+---
+
+## 4b. Gate result (2026-08-10) and the restart diagnostic
+
+**The gate failed.** 10 seeds per method, full ladder:
+
+| n | AIR | AIR-oracle | RSF-T | RSF-T / AIR |
+|---|---|---|---|---|
+| 500 | 0.3374 | 0.1882 | 0.1749 | 0.52× |
+| 1000 | 0.3827 | 0.1548 | 0.1559 | 0.41× |
+| 2000 | 0.4600 | 0.1512 | 0.1482 | 0.32× |
+| 5000 | 0.3969 | 0.1309 | 0.1344 | 0.34× |
+| 10000 | 0.2682 | 0.1102 | 0.1278 | 0.48× |
+| 20000 | 0.1559 | 0.0882 | 0.1239 | **0.79×** ← target 1.45× |
+
+Checks 1 and 3 both fired: RSF-T/AIR is 0.79× rather than ~1.45×, and AIR/AIR-oracle is 1.77×
+rather than ~1.29×. AIR is also non-monotone — it *rises* to n=2000 before falling — and ends
+1.83× above the archive's 0.0854.
+
+**The finding that redirects the search: AIR-oracle degrades too.** It tracks the archive at
+n=500 (0.188 vs 0.179) and n=2000 (0.151 vs 0.146), but is 1.29× worse at n=10000 (0.110 vs
+0.0855) and 1.33× worse at n=20000 (0.0882 vs 0.0664). The oracle arm is handed the true
+nuisances, so there is no nuisance-estimation error available to blame. That exonerates
+`weibull_aft.py`, `cross_fit.py` and the propensity model at large n and puts the defect in the
+**CATE fit**.
+
+The first suspect is `n_restarts`, because it is a *known* difference from the archive rather
+than a hypothesis: the archive used 5, the ported package defaults to 1, and the measurement
+that justified dropping it (restarts landing within ~0.7% of each other in training loss) was
+taken on MGD at n ≤ 2000 — exactly the regime where the two runs still agree. Restarts also
+demonstrably mattered for the tensor-product model, whose standard error fell 3.2× with 5 of
+them.
+
+Same seeds, same ladder, one variable changed, into its own directory:
+
+```bash
+# ~20 min. N_RESTARTS multiplies the CATE stage only, so AIR costs ~2.2x and
+# AIR-oracle ~4x; RSF-T fits no CATE model and is unaffected.
+#
+# The --output/--error overrides are not optional bookkeeping: the #SBATCH
+# directives in the script are static, so without them this run overwrites the
+# failed gate's logs in sherlock/logs/confirm_*.{out,err}.
+N_RESTARTS=5 RUN_TAG=confirm_r5 sbatch --array=0-19 \
+  --output=sherlock/logs/confirm_r5_%a.out \
+  --error=sherlock/logs/confirm_r5_%a.err \
+  sherlock/submit_confirm.sh
+
+N_RESTARTS=5 RUN_TAG=confirm_r5 sbatch --array=20-29 --mem-per-cpu=32G \
+  --output=sherlock/logs/confirm_r5_%a.out \
+  --error=sherlock/logs/confirm_r5_%a.err \
+  sherlock/submit_confirm.sh
+```
+
+`RUN_TAG` moves the scratch directory *and* the filename prefix together. Do not point a
+restart run at `confirm_*` filenames: the in-task resume logic skips any (n, seed) cell already
+present in the output file, so it would load the `n_restarts=1` answers, find every cell
+present, exit successful having computed nothing, and report the old numbers as the new result.
+
+```bash
+RESULTS_DIR=$SCRATCH/air_cate_confirm_r5 PATTERN='confirm_r5_*.json' \
+MERGED_NAME=confirm_r5_merged.json FIGURES_DIR=examples/figures/confirm_r5 \
+  bash sherlock/collect_results.sh
+```
+
+**Read it against the r1 column above, at n=20000 specifically.** Restarts explain the gap if
+AIR lands near 0.085 and RSF-T/AIR climbs back above 1.0. If AIR stays near 0.156, restarts are
+not the cause and the next suspect is model capacity — `K=2` and encoder `(16,)` are fixed while
+n grows 40×, and a saturating model looks exactly like this. That one needs a small sweep over
+`K` rather than a single rerun, so it is worth ruling restarts out first.
+
+---
+
+## 4c. Restart + initializer results, and the overnight capacity sweep
+
+### What the two diagnostics settled
+
+**Restarts are not the cause.** `n_restarts=5` on the same 10 seeds moved AIR the wrong way at
+the only n that matters: 0.1559 → 0.1670 at n=20000. RSF-T reproduced 0.123899 to six digits
+across both runs, which is the control that proves only the intended variable moved. AIR-oracle
+improved 8.5% but remained 1.22× the archive.
+
+**The initializer explains the oracle arm, and only the oracle arm.** `CATEMixture`'s
+`lambda_raw` was `RandomNormal(stddev=1.0)` in the archive; `fb6c345` changed it to
+`RandomNormal(mean=1.0, stddev=0.5)` while fixing an unrelated `initializer="ones"` bug — so the
+current default was measured against a *constant* initializer, never against the archive's. It
+is not a neutral change, because `lambda = softplus(lambda_raw)` and softplus compresses:
+
+| | λ mean | λ sd | cv | λ p5–p95 |
+|---|---|---|---|---|
+| `N(0, 1.0)` (archive) | 0.804 | 0.515 | **0.641** | [0.18, 1.82] |
+| `N(1.0, 0.5)` (current) | 1.336 | 0.361 | **0.270** | [0.79, 1.97] |
+
+The current default starts the K components with 2.4× less relative spread in their decay rates
+and cannot reach the slow-decay half of the range at all. Paired local A/B, IST-3, 6 seeds,
+identical config otherwise (`--mgd-legacy-lambda-init`):
+
+| method | n | current | archive init | paired t | vs archive result |
+|---|---|---|---|---|---|
+| AIR-oracle | 2000 | 0.1497 | **0.1401** | −2.42 | 1.02× → **0.96×** |
+| AIR-oracle | 5000 | 0.1329 | **0.1240** | −2.54 | 1.16× → **1.08×** |
+| AIR | 2000 | **0.5722** | 0.6112 | +0.33 | 1.89× → 2.01× |
+| AIR | 5000 | **0.3876** | 0.4643 | +3.83 | 1.52× → 1.83× |
+
+Read the sign carefully — the verdict is **split, and consistently so**. The archive's wider
+init is better with oracle nuisances (5/6 seeds at both n) and worse with cross-fitted ones (0/6
+seeds at n=5000, t=+3.83). That is one coherent story rather than two contradictory ones: the
+wider init buys reach across temporal shapes, which helps when the pseudo-outcomes are clean and
+hurts when they are noisy, because the extra reach is spent fitting the noise. **So the
+initializer is not the fix for the gate**, which is a cross-fitted result. Keep the current
+default; `--mgd-legacy-lambda-init` stays as a diagnostic.
+
+The same table shows where the real problem is. Cross-fitted AIR's per-seed iMSE at n=2000 was
+0.244, 0.356, 0.394, 0.416, 0.865, 1.157 — a 2.9× spread with two clear divergences, against an
+oracle arm sitting in 0.140–0.169. The cross-fitted CATE fit is *unstable*, not merely biased,
+and no initializer choice addresses that.
+
+### What runs overnight
+
+Capacity is the last untested suspect, and it is a good one: `text_K=4` and encoder `(16,)` are
+fixed while n grows 40× along the ladder, and a model that saturates looks exactly like the
+plateau we are chasing. `--mgd-k` (new) overrides **both** `K` and `text_K`, because IST-3 reads
+`text_K` and setting only `K` is a silent no-op on this DGP.
+
+Five arms — four capacities at the current initializer, plus K=4 at the archive initializer to
+re-test the split verdict at n=10000 and 20000, which the local run could not reach. 25 seeds
+per cell, full ladder, `n_restarts=1`, AIR and AIR-oracle. 250 tasks, all at the 16G default, so
+there is no 32G request to queue behind (that is what stalled an earlier run — see the transfer
+log).
+
+RSF-T is deliberately **not** rerun. It has already reproduced **0.1239** at n=20000 to six
+digits in two independent runs, so it is a settled benchmark, and skipping it keeps every task in
+this submission at the same memory footprint.
+
+```bash
+mkdir -p sherlock/logs
+
+# One sbatch per arm. "cur:8" means current initializer, K=8.
+#   ${ARM%%:*} strips the longest trailing match of ":*"  -> the init name
+#   ${ARM##*:} strips the longest leading match of "*:"   -> the K value
+# --array=0-49 is 2 methods x 25 seeds; the script maps task/25 to the method,
+# so widening the seed count REQUIRES widening the array to match.
+for ARM in "cur:2" "cur:4" "cur:8" "cur:16" "leg:4"; do
+  INIT="${ARM%%:*}"; K="${ARM##*:}"
+  LEG=0; if [ "$INIT" = "leg" ]; then LEG=1; fi
+  TAG="night_${INIT}_k${K}"
+  LEGACY_INIT=$LEG MGD_K=$K RUN_TAG=$TAG N_SEEDS_TOTAL=25 \
+  METHODS_LIST="AIR,AIR-oracle" \
+    sbatch --array=0-49 \
+      --output=sherlock/logs/${TAG}_%a.out \
+      --error=sherlock/logs/${TAG}_%a.err \
+      sherlock/submit_confirm.sh
+done
+```
+
+Each arm writes to `$SCRATCH/air_cate_night_<init>_k<K>/` with a matching filename prefix.
+`RUN_TAG` moves the directory *and* the prefix together, which is the only safe way to vary a
+setting here: the in-task resume logic skips any (n, seed) cell already present in the output
+file, so two arms sharing a path would make the second one load the first's answers, find every
+cell present, exit successful having computed nothing, and report the old numbers as the new
+result.
+
+Confirm all five landed, then collect in the morning:
+
+```bash
+squeue -u $USER | wc -l                      # 251 while all are queued/running
+ls $SCRATCH/air_cate_night_*/ | grep -c json # 250 when finished
+
+grep -l "Error\|Traceback" sherlock/logs/night_*.err 2>/dev/null   # empty = pass
+
+for ARM in cur_k2 cur_k4 cur_k8 cur_k16 leg_k4; do
+  echo "=== $ARM ==="
+  RESULTS_DIR=$SCRATCH/air_cate_night_$ARM PATTERN="night_${ARM}_*.json" \
+  MERGED_NAME=night_${ARM}_merged.json FIGURES_DIR=examples/figures/night_$ARM \
+    bash sherlock/collect_results.sh
+done
+```
+
+**How to read it.** The number to look at is cross-fitted AIR at n=20000 against RSF-T's 0.1239.
+The gate needs AIR near 0.085; `cur_k4` is the 0.1559 we already have. If a larger K moves it
+toward 0.085, capacity was the constraint and the fix is to scale K with n. If all four
+capacities land near 0.156, capacity is ruled out too, and the remaining explanation is the
+instability visible in the per-seed spread above — which points at the optimizer and the
+pseudo-outcome noise rather than at the model, and calls for a variance diagnostic (per-fold
+pseudo-outcome scale, gradient norms) rather than another sweep.
 
 ---
 

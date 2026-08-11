@@ -32,6 +32,9 @@ class CATEMixture(keras.Model):
             region it has flattened, which patience-based early stopping tends to
             cut short. Normalizing keeps lambda * t in [0, 1.31] instead.
             `CATETensorProduct` normalizes unconditionally.
+        legacy_lambda_init: Draw lambda_raw from N(0, 1) instead of N(1.0, 0.5).
+            Off by default; see the `lambda_raw` comment in `__init__` for why the
+            two differ and which one the archived 100-seed run used.
     """
 
     def __init__(
@@ -39,11 +42,13 @@ class CATEMixture(keras.Model):
         K: int = 4,
         encoder_hidden_sizes: tuple[int, ...] = (64, 32),
         normalize_time: bool = False,
+        legacy_lambda_init: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.K = K
         self.normalize_time = normalize_time
+        self.legacy_lambda_init = legacy_lambda_init
         self.encoder = FeatureEncoder(hidden_sizes=encoder_hidden_sizes)
         self.gate_dense = keras.layers.Dense(K)
 
@@ -58,10 +63,35 @@ class CATEMixture(keras.Model):
         # move. Escaping that state takes ~50-100 epochs, so patience-based
         # early stopping usually halts training first and every tv-CATE curve
         # collapses to 0.
+        #
+        # WHICH random init, though, is a separate question, and the two options
+        # here are not interchangeable. lambdas = softplus(lambda_raw), and softplus
+        # compresses: pushing the mean to +1.0 to keep lambda away from 0 also cuts
+        # the spread of the resulting decay rates.
+        #
+        #                          lambda mean   lambda sd     cv    p5-p95
+        #     N(0, 1.0)  legacy          0.806       0.521  0.647  [0.18, 1.82]
+        #     N(1.0, 0.5) default        1.338       0.362  0.271  [0.79, 1.97]
+        #
+        # The default starts with 2.4x less relative spread and cannot reach the
+        # slow-decay half of the range (lambda < 0.79) at all, so the K components
+        # begin as near-duplicate temporal shapes and more of the fitting burden
+        # falls on the gate and encoder. It is also not better at the job it was
+        # introduced for: P(|lambda_{k,1} - lambda_{k,0}| < 0.1) is 0.156 against
+        # legacy's 0.128.
+        #
+        # The default was chosen in fb6c345 while replacing `initializer="ones"`,
+        # measured against that -- not against the legacy init, which is what the
+        # archived 100-seed run used and which this flag restores.
+        lambda_init = (
+            keras.initializers.RandomNormal(stddev=1.0)
+            if legacy_lambda_init
+            else keras.initializers.RandomNormal(mean=1.0, stddev=0.5)
+        )
         self.lambda_raw = self.add_weight(
             name="lambda_raw",
             shape=(K, 2),
-            initializer=keras.initializers.RandomNormal(mean=1.0, stddev=0.5),
+            initializer=lambda_init,
         )
 
     def call(self, inputs):
