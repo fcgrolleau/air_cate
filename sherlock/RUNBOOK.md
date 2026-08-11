@@ -129,6 +129,40 @@ Two deliberate choices worth knowing:
 Because `.git/` is excluded, the cluster copy carries no commit information. Record by hand
 which commit you sent; see the log at the bottom of this file.
 
+### Verify the transfer landed, before trusting any submission
+
+**`Submitted batch job` proves nothing about the code.** `sbatch` validates the directives it can
+see; it cannot know that the script is an older revision. And the environment overrides these
+scripts are driven by fail *silently* when absent — an old script simply ignores `MGD_K=8` and
+runs its default, so a five-arm experiment becomes five identical reruns, in five correctly-named
+directories, with nothing anywhere to say why. This cost a submit-cancel-resubmit cycle on
+2026-08-11.
+
+So after every rsync, grep the cluster's copy for whatever variable the run depends on. `^`
+anchors to line start, so the many mentions in the header comments do not count:
+
+```bash
+grep -c '^MGD_K=' sherlock/submit_confirm.sh          # want 1
+grep -c '^LEGACY_INIT=' sherlock/submit_confirm.sh    # want 1
+grep -c '^METHODS_LIST=' sherlock/submit_confirm.sh   # want 1
+```
+
+Do not use `#SBATCH --time` as the tell — it changes rarely, so it matches across several
+revisions and reads as reassurance when the script is in fact stale.
+
+Once tasks start, each one echoes its own resolved settings, which is the check that an
+experiment was actually an experiment:
+
+```bash
+grep -h "Confirm task 0:" sherlock/logs/night_*_0.out
+```
+
+Five identical lines there means the arms did not differ and no number in the output is worth
+reading. If a run did go out on a stale script, `scancel` it and then **delete the partials**
+(`rm -rf $SCRATCH/air_cate_<tag>*`) before resubmitting: the in-task resume logic skips any
+(n, seed) cell already present in the output file, so one stale file is silently adopted as the
+new run's answer for that cell.
+
 ---
 
 ## 2. One-time setup on the cluster
