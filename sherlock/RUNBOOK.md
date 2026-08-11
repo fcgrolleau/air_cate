@@ -729,3 +729,5 @@ transfer here.
 |---|---|---|---|---|
 | 2026-04-30 | (unrecorded) | `sherlock-sims` | `~/air_cate` | the archived 100-seed run; exact command was never written down |
 | 2026-08-07 | `9c6e628` + uncommitted script edits | `full-sherlock-sims` | `~/air_cate_full` | pilot `38154411` at 32G never left `PD`; cancelled and resubmitted as `38156448` with `--mem-per-cpu=8G`, which placed within minutes. `submit_pilot.sh` now defaults to 8G, so the flag is no longer needed once `sherlock/` is re-synced. |
+| 2026-08-10 | (uncommitted) | `full-sherlock-sims` | `~/air_cate_full` | the two gate runs: `confirm` at `n_restarts=1` and `confirm_r5` at 5. Both failed the gate — see section 4b. |
+| 2026-08-11 | `ac36c11` | `full-sherlock-sims` | `~/air_cate_full` | the overnight capacity sweep, section 4c. Carries `--mgd-k`, `--mgd-legacy-lambda-init`, the `LEGACY_INIT`/`MGD_K`/`METHODS_LIST` overrides, and the `plot_convergence` legend fix (without which `--plot-only` on any method subset raises `IndexError`). |
