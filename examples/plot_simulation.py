@@ -696,16 +696,18 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
             row_axes[col].set_xscale("log")
             row_axes[col].set_yscale("log")
             row_axes[col].set_xticks(n_values)
-            row_axes[col].set_xticklabels([str(n) for n in n_values], fontsize=8)
-            row_axes[col].tick_params(axis="y", labelsize=8.5)
+            row_axes[col].set_xticklabels([str(n) for n in n_values], fontsize=12)
+            row_axes[col].tick_params(axis="y", labelsize=12)
             row_axes[col].grid(True, alpha=0.12, linewidth=0.4)
 
-        ax_mean[col].set_title(f"{dgp_name} DGP", fontsize=11.5,
+        ax_mean[col].set_title(f"{dgp_name} DGP", fontsize=14,
                                 fontweight="bold", pad=8)
-        ax_var[col].set_xlabel("Sample size", fontsize=10.5)
+        ax_var[col].set_xlabel("Sample size", fontsize=15)
 
-    ax_mean[0].set_ylabel("Average MSE", fontsize=10.5)
-    ax_var[0].set_ylabel("Variance of MSE", fontsize=10.5)
+    # iMSE, not MSE: the quantity is integrated over the time grid, so calling it
+    # MSE in the axis label contradicts every other mention of it in the paper.
+    ax_mean[0].set_ylabel("Average iMSE", fontsize=15)
+    ax_var[0].set_ylabel("Variance of iMSE", fontsize=15)
 
     # Shared legend below all panels.
     #
@@ -728,8 +730,9 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
     handles = [handles[i] for i in order]
     labels = [labels[i] for i in order]
     fig.legend(handles, labels, loc="lower center", ncol=4,
-               fontsize=7.5, frameon=False, bbox_to_anchor=(0.5, -0.02),
-               columnspacing=1.5, handletextpad=0.6)
+               fontsize=14, frameon=False, bbox_to_anchor=(0.5, -0.02),
+               columnspacing=2.5, handletextpad=0.8, handlelength=2.8,
+               labelspacing=0.8)
 
     fig.tight_layout(rect=[0, 0.06, 1, 1], w_pad=2.5, h_pad=1.5)
     os.makedirs(out_dir, exist_ok=True)
