@@ -33,16 +33,28 @@ SEED_START = BLOCK_IDX * 5
 
 One task = one (DGP, method) × 5 seeds × all 6 sample sizes = 30 fits.
 
+Because `BLOCK_IDX` varies fastest, **methods are contiguous within each DGP's 1200 task
+ids**: AIR 0-199, Tensor-prod 200-399, AIR-oracle 400-599, TP-oracle 600-799, RSF-T 800-999,
+RSF-S 1000-1199, then +1200 for Mixture and +2400 for IST-3. That is what makes the memory
+split and the cross-fitted-only control arm expressible as plain ranges.
+
 ### Submission
 
-`--array` is **not** in the script (SLURM caps arrays at 1000/submission). Pass the range:
+`--array` is **not** in the script (SLURM caps arrays at 1000/submission). Pass the range.
+Output paths are keyed to `RUN_TAG`, which moves the scratch directory and the filename prefix
+together — the archived run's `air_cate_results/partial_*.json` layout is no longer the default,
+so a fresh submission cannot land on its partials via the resume logic:
 
 ```bash
-cd ~/air_cate
+cd ~/air_cate_full
 mkdir -p sherlock/logs
-rm -f $SCRATCH/air_cate_results/partial_*.json     # see Lessons learned
-for r in 0-999 1000-1999 2000-2999 3000-3599; do
-    sbatch --array=$r sherlock/submit_array.sh
+rm -f $SCRATCH/air_cate_full999/full999_*.json     # see Lessons learned
+# Six ranges, split so 2400 of 3600 tasks can ask for 16G; RSF needs 32G at n=20000.
+for r in 0-799 1200-1999 2400-3199; do
+    CENSORING_FIX=1 RUN_TAG=full999 sbatch --array=$r --mem-per-cpu=16G sherlock/submit_array.sh
+done
+for r in 800-1199 2000-2399 3200-3599; do
+    CENSORING_FIX=1 RUN_TAG=full999 sbatch --array=$r sherlock/submit_array.sh
 done
 ```
 
@@ -131,7 +143,12 @@ Before the full run, submit only the 18 tasks with `BLOCK_IDX=0` — seeds 0–4
 (DGP, method) pair; 90 (cell, seed) pairs = 540 fits, ≲12 CPU-hours:
 
 ```bash
-sbatch --array=0,200,400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800,3000,3200,3400 \
+# Its own RUN_TAG, and the same CENSORING_FIX as the run it is a pilot for. Without
+# RUN_TAG this writes full999_* files into the full run's directory; if it also omits
+# CENSORING_FIX those cells hold fix-OFF results that the real submission then
+# resume-SKIPs, giving one result set with two specifications and no error.
+CENSORING_FIX=1 RUN_TAG=pilot999 \
+    sbatch --array=0,200,400,600,800,1000,1200,1400,1600,1800,2000,2200,2400,2600,2800,3000,3200,3400 \
     sherlock/submit_array.sh
 ```
 

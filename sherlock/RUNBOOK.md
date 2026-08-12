@@ -61,12 +61,15 @@ wait times."*
 
 So the rule here is: **request 8G for anything that stops below n=5000, and 32G only for runs
 that reach n=20000** (where RSF genuinely OOM'd at 8G). `submit_pilot.sh` defaults to 8G for
-this reason; `submit_array.sh` keeps 32G because each of its tasks spans the whole n ladder and
-must be sized for its largest fit.
+this reason; `submit_array.sh` *defaults* to 32G because each of its tasks spans the whole n
+ladder and must be sized for its largest fit.
 
-Before the 3,600-task run, read `MaxRSS` off the wider pilot (`sacct`, section 4) and lower
-`submit_array.sh` to the smallest safe value. At that scale the difference between a 16G and a
-32G request is hours of queueing.
+At 3,600 tasks the difference between a 16G and a 32G request is hours of queueing, so section
+5's recipe splits the submission and overrides **down** to 16G for the 2,400 non-RSF tasks —
+the AIR and oracle arms ran fine at 16G through n=20000 in the section 4d confirmation run.
+Only the RSF arms take the 32G default. The default is deliberately the safe one: forgetting an
+override costs queue time, whereas defaulting to 16G and forgetting would cost an OOM at hour
+two. Read `MaxRSS` off the wider pilot (`sacct`, section 4) if you want to tighten further.
 
 ```bash
 # Submission limits per partition -- the documented way to see them.
@@ -817,29 +820,89 @@ see identical draws seed by seed. If the paired test does not clear it, the hone
 
 ## 5. The full 999-seed run
 
-**Only after the gates above pass.** 3,600 tasks, budget ≲2,300 CPU-hours.
+**The gate passed.** Section 4d's confirmation run put cross-fitted AIR at iMSE 0.0990 against
+RSF-T's 0.1239 and RSF-S's 0.1214 at n=20000 on IST-3, lower on 10/10 paired seeds
+(p<0.0001), so the full run goes out **with `--censoring-fix` on**.
+
+3,600 tasks, budget ≲2,300 CPU-hours.
+
+### Send the code first, then verify it landed
+
+The run depends on two things that did not exist in the archived run: the
+`--censoring-fix` flag and `submit_array.sh`'s `CENSORING_FIX`/`RUN_TAG` handling. Do the
+section 1 rsync, then — on the cluster — confirm the copy is the new one. A stale
+`submit_array.sh` fails *silently* by ignoring `CENSORING_FIX=1`; a stale `src/` fails loudly
+with `TypeError` on every AIR task.
+
+```bash
+cd ~/air_cate_full
+grep -c '^CENSORING_FIX=' sherlock/submit_array.sh   # want 1
+grep -c '^RUN_TAG=' sherlock/submit_array.sh         # want 1
+
+# Definitive, unlike a grep count: does the installed package accept the parameters?
+python -c 'import inspect; from air_cate import AIREstimator; p = inspect.signature(AIREstimator.__init__).parameters; print("censoring_config" in p, "admin_as_censored" in p)'
+# want: True True
+```
+
+### Submit
 
 ```bash
 cd ~/air_cate_full
 mkdir -p sherlock/logs
 
-# MANDATORY. The in-task resume logic loads whatever the output file already holds
-# and SKIPS those (n, seed) cells -- so stale partials from any earlier run make a
-# fresh submission silently incomplete. This has bitten this project before.
-rm -f $SCRATCH/air_cate_results/partial_*.json
+# The in-task resume logic loads whatever the output file already holds and SKIPS
+# those (n, seed) cells, so stale partials make a fresh submission silently
+# incomplete. RUN_TAG=full999 is a directory no previous run has written, which is
+# the real protection; this is belt-and-braces for a SECOND attempt at full999.
+rm -f $SCRATCH/air_cate_full999/full999_*.json
 
-# SLURM caps an array at 1000 tasks per submission, so 3600 goes in four batches.
-# The `for r in ...; do ... done` loop just issues four sbatch calls; $r expands to
-# each range in turn.
-for r in 0-999 1000-1999 2000-2999 3000-3599; do
-    sbatch --array=$r sherlock/submit_array.sh
+# Six calls, not four. SLURM caps an array at 1000 tasks per submission, and
+# splitting on the RSF blocks lets 2400 of the 3600 tasks ask for 16G rather than
+# 32G -- the main lever on queue time. RSF-T and RSF-S are blocks 4-5 within each
+# DGP's 1200 ids, i.e. the last 400 of each: 800-1199, 2000-2399, 3200-3599.
+# Verified: the three ranges below contain zero RSF tasks, the three above contain
+# only RSF tasks, and all 3600 ids are covered exactly once.
+for r in 0-799 1200-1999 2400-3199; do
+    CENSORING_FIX=1 RUN_TAG=full999 sbatch --array=$r --mem-per-cpu=16G \
+        sherlock/submit_array.sh
+done
+for r in 800-1199 2000-2399 3200-3599; do
+    CENSORING_FIX=1 RUN_TAG=full999 sbatch --array=$r sherlock/submit_array.sh
 done
 ```
 
 Each task = one (DGP, method) × 5 consecutive seeds × all 6 sample sizes = 30 fits. The index
 decoding lives in the script; the mapping is documented in [STATUS.md](STATUS.md#array-mapping).
 
-Then, once `squeue -u $USER` is empty and `sacct` shows 3,600 `COMPLETED`:
+**Go/no-go, once the first tasks start.** SLURM creates a task's `.out` when it *starts*, not
+when it is queued, so wait for the file before grepping it. Every task must echo
+`censoring_fix=1, tag=full999`; if any says `censoring_fix=0` the environment prefix did not
+take and the run is measuring the old specification.
+
+```bash
+until [ -f sherlock/logs/task_0.out ]; do sleep 15; done
+grep -h "^Task " sherlock/logs/task_*.out | grep -c 'censoring_fix=1, tag=full999'
+grep -h "^Task " sherlock/logs/task_*.out | grep -c 'censoring_fix=0'   # want 0
+```
+
+Note the space in `sleep 15` — a typo like `dosleep 15` spins with no delay.
+
+### Wall limit
+
+2h, down from 3h, sized on section 4d's recorded `runtime_seconds`: worst single seed × 5 was
+**0.71h** for AIR, 0.25h for AIR-oracle, ≤0.16h for the forests, all on IST-3 (the most
+expensive DGP). Tensor-prod and TP-oracle were not in that run. If a task is killed at the
+wall, resume makes it cheap: the partial keeps every finished `(n, seed)` cell, so
+resubmitting the same task id continues rather than restarting.
+
+```bash
+# After everything finishes, catch any task that hit the wall rather than converging.
+sacct -j <jobid> --format=JobID,State,Elapsed | grep -c TIMEOUT   # want 0
+```
+
+### Collect
+
+Once `squeue -u $USER` is empty and `sacct` shows 3,600 `COMPLETED`:
 
 ```bash
 # 3,600 files is real work -- grab an interactive compute node instead of merging
@@ -852,14 +915,41 @@ eval "$(mamba shell hook --shell bash)"
 mamba activate air_cate
 cd ~/air_cate_full
 
-# Defaults are the full run, so no environment overrides here.
-bash sherlock/collect_results.sh
+# collect_results.sh's DEFAULTS NO LONGER MATCH submit_array.sh. The script's defaults
+# are still the archived run's air_cate_results/partial_*.json layout; this run writes
+# air_cate_full999/full999_*.json. Pass all four overrides.
+RESULTS_DIR=$SCRATCH/air_cate_full999 PATTERN='full999_*.json' \
+MERGED_NAME=full999_merged.json FIGURES_DIR=examples/figures/full999 \
+  bash sherlock/collect_results.sh
 ```
 
 ```bash
 # Sanity check before pulling: every (DGP, method, n) cell should hold 999 entries.
-ls $SCRATCH/air_cate_results/partial_*.json | wc -l   # target: 3600
+ls $SCRATCH/air_cate_full999/full999_*.json | wc -l   # target: 3601 (3600 + merged)
 ```
+
+### Optional: the paired control arm
+
+The fix is confirmed on IST-3 only. If you want the ablation on all three DGPs, run the
+control — but note it costs **1200 tasks, not another 3600**: only the two cross-fitted
+methods change under the flag (AIR is block 0, Tensor-prod block 1 within each DGP), and the
+oracle and RSF arms never call `cross_fit_nuisances`, so they are shared between the arms.
+
+```bash
+for r in 0-399 1200-1599 2400-2799; do
+    CENSORING_FIX=0 RUN_TAG=full999_cbase sbatch --array=$r --mem-per-cpu=16G \
+        sherlock/submit_array.sh
+done
+
+RESULTS_DIR=$SCRATCH/air_cate_full999_cbase PATTERN='full999_cbase_*.json' \
+MERGED_NAME=full999_cbase_merged.json FIGURES_DIR=examples/figures/full999_cbase \
+  bash sherlock/collect_results.sh
+```
+
+**What to check in it.** At n=20000 the fix should reproduce IST-3's win. The rung to watch is
+**n=500**, where the 10-seed run had the fix *directionally worse* (+0.093, SE 0.072, better on
+only 4/10 seeds) — ten seeds could not separate that from zero, 999 will. If it is real, the
+honest claim is "wins at large n, harmful at small n", not a clean win.
 
 ---
 
@@ -870,8 +960,11 @@ Run this **on your Mac**.
 ```bash
 # Note this overwrites the tracked publication results file. Commit or stash the
 # current one first if you want to be able to go back.
+#
+# The remote path must be the LITERAL /scratch/users/grolleau/... -- $SCRATCH is
+# undefined on your Mac and would expand to an empty string.
 rsync -avz \
-  grolleau@login.sherlock.stanford.edu:/scratch/users/grolleau/air_cate_results/simulation_results_merged.json \
+  grolleau@login.sherlock.stanford.edu:/scratch/users/grolleau/air_cate_full999/full999_merged.json \
   ~/Desktop/github_repos/git_repo_2026/air_cate/examples/figures/simulation_results.json
 
 # Regenerate the LaTeX table. Locally uv works fine -- it is only Sherlock that cannot use it.
