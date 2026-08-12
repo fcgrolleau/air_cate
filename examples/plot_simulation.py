@@ -238,6 +238,30 @@ def make_estimator(cfg, oracle, tensor, rsf, is_text_dgp=False):
     if nuis_hidden:
         common["weibull_config"] = {"hidden_sizes": nuis_hidden}
         common["propensity_config"] = {"hidden_sizes": nuis_hidden}
+    # Off by default. Drops the *censoring* model's hidden layers, so its Weibull
+    # shape and scale are each a softplus of a single linear index in x -- 32
+    # weights on IST-3's p=15, against 3170 for the (64, 32) MLP. The event
+    # models, the propensity and the CATE model are untouched.
+    #
+    # Why this and nothing else. The AIPCW pseudo-outcome divides by S_cens in all
+    # three of its terms, so it is a near-cancellation: a smooth systematic error
+    # in S_cens largely cancels, while an erratic per-subject error does not and
+    # lands undamped in the tail of Y_tilde, where the quadratic R-loss is most
+    # sensitive to it. Restricting the map from x is what removes the erratic part.
+    # Bias in S_cens is cheap; variance is not -- the restricted model is 4x more
+    # biased (-0.129 vs -0.033) and still has LOWER rmse (0.139 vs 0.168), and it
+    # cuts max|Y_tilde| from 136-190 to 5.6-7.7 and r_loss_at_zero from 17-26 to
+    # ~1.5 against an oracle 1.0.
+    #
+    # Two other respecifications were tried and are NOT applied, because the
+    # ablation in examples/diagnose_ist3_nuisance.py measured them at zero:
+    # `admin_as_censored` (0.1102 with, 0.1128 without) and `shared_shape` (0.1133
+    # with, 0.1102 without). Both are still available on `AIREstimator` -- the
+    # identification argument for the first is in `cross_fit_nuisances` and is
+    # sound; it simply does not pay on this DGP. Turning either on WITHOUT this
+    # flexibility restriction is actively harmful (0.3298 vs a 0.1830 baseline).
+    if cfg.get("censoring_fix", False):
+        common["censoring_config"] = {"hidden_sizes": cfg.get("censoring_hidden", ())}
     if tensor:
         common["cate_model_class"] = CATETensorProduct
         common["cate_model_kwargs"] = dict(
@@ -260,8 +284,14 @@ def make_estimator(cfg, oracle, tensor, rsf, is_text_dgp=False):
     return AIREstimator(**common)
 
 
-def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf):
-    """Fit one method on one (n, seed) draw and return detailed results dict."""
+def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf, propensity_oracle=False):
+    """Fit one method on one (n, seed) draw and return detailed results dict.
+
+    Args:
+        propensity_oracle: If True and oracle=False, fit with cross-fitted event/censoring
+            survival but oracle propensity (e_hat = 0.5 for all). Useful for isolating
+            whether propensity estimation is the bottleneck.
+    """
     # Seed python, numpy, AND the Keras global generator. Seeding numpy alone
     # leaves network initialization keyed to Keras's own counter, which advances
     # with every fit already done in this process -- so a cell's init depended on
@@ -313,10 +343,34 @@ def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf):
     est = make_estimator(cfg, oracle, tensor, rsf, is_text_dgp=is_text_dgp)
 
     nuisances = None
+    time_grid, _ = build_time_grid(t_end, cfg["M"])
+
     if oracle:
-        time_grid, _ = build_time_grid(t_end, cfg["M"])
         # Oracle needs original X (DGP formulas use stored pool indices)
         nuisances = build_oracle_nuisances(dgp_class, X_train_raw, Z, time_grid)
+    elif propensity_oracle:
+        # Cross-fitted event/censoring survival, but oracle propensity (0.5).
+        #
+        # Superseded: on IST-3 at n=20000 the estimated propensity is already
+        # accurate (rmse 0.046 against truth, nothing clipped), and splicing the
+        # oracle in moves iMSE from 0.242 to 0.258 -- i.e. very slightly worse,
+        # within seed noise. The censoring survival is where the gap lives; see
+        # examples/diagnose_ist3_nuisance.py. Kept only so the measurement is
+        # reproducible.
+        from air_cate._types import SurvivalData
+        from air_cate.nuisance.cross_fit import cross_fit_nuisances
+        data = SurvivalData(X=X_train, W=W, Z=Z, Delta=Delta)
+        nuisances_cf = cross_fit_nuisances(
+            data, time_grid,
+            n_folds=cfg.get("n_folds", 5),
+            censoring_config=est.censoring_config,
+            admin_as_censored=est.admin_as_censored,
+            t_end=t_end,
+            rng_seed=seed,
+        )
+        nuisances = nuisances_cf._replace(
+            e_hat=np.full(len(X_train), 0.5, dtype=np.float32)
+        )
 
     est.fit(X_train, W, Z, Delta, t_end, nuisances=nuisances, verbose=0)
 
@@ -785,6 +839,16 @@ def main():
                              "optimizer steps. Recovers the rows --cate-val-frac spends, "
                              "at the cost of a second CATE fit. Requires --cate-val-frac "
                              "> 0 (or a config that sets it).")
+    parser.add_argument("--censoring-fix", action="store_true",
+                        help="Fit the censoring nuisance with no hidden layers, so its "
+                             "Weibull shape and scale are each a softplus of a single "
+                             "linear index in x (32 weights on IST-3) instead of a "
+                             "(64, 32) MLP (3170). On IST-3 at n=20000, 4 seeds, this "
+                             "takes cross-fitted AIR from iMSE 0.183 to 0.110 against an "
+                             "oracle-censoring 0.098 and RSF-T's 0.1239, by cutting the "
+                             "pseudo-outcome noise floor ~15x. Affects the censoring model "
+                             "only, so the oracle and RSF arms are unchanged and stay "
+                             "valid as controls.")
     args = parser.parse_args()
 
     # --- Merge mode ---
@@ -874,6 +938,9 @@ def main():
             )
         cfg = dict(cfg)
         cfg["cate_refit_full"] = True
+    if args.censoring_fix:
+        cfg = dict(cfg)
+        cfg["censoring_fix"] = True
 
     # --- DGP / method filters ---
     dgps = DGPS

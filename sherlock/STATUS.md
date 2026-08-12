@@ -288,6 +288,86 @@ stricter of the two: `max` over 300 × 51 predictions is an extreme-value statis
 by the corners of the uniform `X_test` cube, outside the training support, so retaining it
 would have meant a threshold near 0.5 — half of tau's whole range.
 
+### The IST-3 n=20000 gap: it was the censoring nuisance
+
+The gate in `submit_confirm.sh` failed — cross-fitted AIR came in at 0.1559 against RSF-T's
+0.1239 at n=20000, where the archive claimed a 1.45× win. What follows is the design record
+of the diagnosis; the commands and the confirmation run are in
+[RUNBOOK.md §4d](RUNBOOK.md), and the tool is `examples/diagnose_ist3_nuisance.py`.
+
+**Three CATE-stage suspects, all measured, all dead.** The gate's own header inferred that
+the defect lived in the CATE fit, because *AIR-oracle degraded too* (0.0882 vs the archive's
+0.0664). That inference was wrong — not because AIR-oracle's degradation isn't real, but
+because the cross-fitted arms have a second and much larger defect that the oracle arms
+cannot exhibit. Recorded so none of these is retried:
+
+| suspect | measured | verdict |
+|---|---|---|
+| `n_restarts` 1 → 5 | 0.1559 → 0.1670 | worse |
+| lambda initializer (archive's N(0,1)) | helps oracle arms, hurts cross-fitted | split, not the gap |
+| MGD capacity K = 2 / 4 / 8 / 16 | 0.1714 / 0.1660 / 0.1649 / 0.1642 | flat — 8× buys 4% |
+
+The capacity sweep is the one that closes the question: the model is not saturating.
+
+**The nuisance splice localizes it to one component.** Fit nuisances once per seed, then
+retrain the CATE model repeatedly while replacing one component with its oracle. n=20000,
+seed 0, same data and same initialization throughout, so every difference is the splice:
+
+| spliced in | iMSE | `r_loss_at_zero` |
+|---|---|---|
+| nothing | 0.2418 | 22.05 |
+| oracle propensity | 0.2577 | 22.05 |
+| oracle event survival | 0.1985 | 14.55 |
+| **oracle censoring survival** | **0.0966** | **1.007** |
+| everything | 0.0949 | 0.917 |
+
+`r_loss_at_zero` — the R-loss paid by tau ≡ 0, i.e. the signal-free part of the objective —
+is the diagnostic that made this legible; it moves 22 → 1 on the censoring splice alone. The
+propensity is exonerated by measurement (rmse 0.046, nothing clipped, oracle slightly
+*worse*), which retires a suspect that would otherwise have looked plausible.
+
+**The fix is less flexibility, not more.** The AIPCW pseudo-outcome divides by `S_cens` in
+all three terms, so it is a near-cancellation: a smooth systematic error in `S_cens` largely
+cancels, while an erratic per-subject error does not, and lands undamped in the tail of
+`Y_tilde` where the quadratic loss is most sensitive. Dropping the censoring model's hidden
+layers — shape and scale each a softplus of a single linear index in x, **32 weights against
+3170** — takes iMSE from 0.1830 to 0.1094 over 4 seeds (oracle-censoring ceiling 0.0980).
+It is *four times more biased* (−0.129 vs −0.033) and still has *lower* RMSE (0.139 vs
+0.168). **Bias in `S_cens` is cheap; variance is not.** Exposed as `--censoring-fix` /
+`CENSORING_FIX=1`.
+
+`shfix_Sce` is the counter-example that pins the mechanism down: the *best* `S_cens` bias of
+any arm (−0.011) and the *worst* noise floor (`r_loss_at_zero` 88–107), scoring 0.3298 —
+far worse than doing nothing. Accuracy against the true `S_cens` is simply not the objective.
+
+**Two theoretically-motivated respecifications that measured at zero**, kept available but
+off, so the arguments are not re-derived and re-tried:
+
+- `admin_as_censored` — `1 - Delta` treats end-of-follow-up as an *observed* censoring event
+  (14.7% of rows, 27% of all censoring events) and term2 divides by `S_cens(Z)` at
+  `Z = t_end` exactly. Both arguments are sound. Worth 0.0008.
+- `shared_shape` — a per-subject `k(x)` is heteroscedastic Weibull regression, not AFT.
+  Worth −0.003, i.e. slightly harmful.
+
+Turning both on *without* the flexibility restriction is actively harmful (0.3298 vs 0.1830).
+The flag therefore does the **minimal one-knob change**, which also happens to score best of
+the four variants tried.
+
+**Two open caveats, both material to how this gets written up.** First, this is a
+*regularization* choice, not a correctness fix — a single-index censoring scale happens to be
+nearly the right shape for this DGP (its true scale is `exp` of a linear index), and the model
+is still misspecified, since `_get_params` uses softplus rather than exp. "We beat RSF after
+hand-picking the censoring model's capacity" is a weaker claim than "we beat RSF"; whether the
+capacity can be chosen by cross-validated censoring likelihood instead is untested, though the
+fact that the restricted model also wins on RMSE is an encouraging sign. Second, a single local
+seed at n=500 went 0.247 → 0.645, which is why the confirmation run does the **full ladder with
+a paired control** rather than n=20000 alone. The margin over RSF-T at n=20000 is thin (0.1094
+vs 0.1239, 3 of 4 seeds below), so results must be paired per seed.
+
+`AIREstimatorCV` carries `censoring_config` and `admin_as_censored` too, so a future K sweep
+screens under the same censoring spec the final fit uses — otherwise the screen would see a
+different pseudo-outcome noise level than the fit does.
+
 ### Not bit-reproducible
 
 `run_single` seeds python, numpy and Keras per (n, seed) cell, so the data draw and the

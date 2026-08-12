@@ -30,6 +30,12 @@ class AIREstimator:
         encoder_hidden_sizes: Hidden layer sizes for the feature encoder.
         propensity_config: kwargs for PropensityMLP constructor.
         weibull_config: kwargs for WeibullAFT constructor.
+        censoring_config: kwargs for the censoring WeibullAFT models; defaults to
+            `weibull_config`. Pass `{"shared_shape": True}` to fit one censoring
+            shape for the whole sample.
+        admin_as_censored: Treat administrative end-of-follow-up (Z at t_end) as
+            censored, not as an observed censoring event, when fitting the
+            censoring model. Off by default. See `cross_fit_nuisances`.
         nuisance_training_config: Training kwargs for nuisance models.
         cate_epochs: Training epochs for the CATE model.
         cate_lr: Learning rate for the CATE model.
@@ -135,6 +141,8 @@ class AIREstimator:
         encoder_hidden_sizes: tuple[int, ...] = (64, 32),
         propensity_config: dict | None = None,
         weibull_config: dict | None = None,
+        censoring_config: dict | None = None,
+        admin_as_censored: bool = False,
         nuisance_training_config: dict | None = None,
         cate_epochs: int = 200,
         cate_lr: float = 1e-3,
@@ -155,6 +163,8 @@ class AIREstimator:
         self.encoder_hidden_sizes = encoder_hidden_sizes
         self.propensity_config = propensity_config
         self.weibull_config = weibull_config
+        self.censoring_config = censoring_config
+        self.admin_as_censored = admin_as_censored
         self.nuisance_training_config = nuisance_training_config
         self.cate_epochs = cate_epochs
         self.cate_lr = cate_lr
@@ -242,6 +252,9 @@ class AIREstimator:
                 n_folds=self.n_folds,
                 propensity_config=self.propensity_config,
                 weibull_config=self.weibull_config,
+                censoring_config=self.censoring_config,
+                admin_as_censored=self.admin_as_censored,
+                t_end=t_end,
                 training_config=self.nuisance_training_config,
             )
 

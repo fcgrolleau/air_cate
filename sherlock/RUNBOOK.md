@@ -627,12 +627,191 @@ done
 ```
 
 **How to read it.** The number to look at is cross-fitted AIR at n=20000 against RSF-T's 0.1239.
-The gate needs AIR near 0.085; `cur_k4` is the 0.1559 we already have. If a larger K moves it
-toward 0.085, capacity was the constraint and the fix is to scale K with n. If all four
-capacities land near 0.156, capacity is ruled out too, and the remaining explanation is the
-instability visible in the per-seed spread above — which points at the optimizer and the
-pseudo-outcome noise rather than at the model, and calls for a variance diagnostic (per-fold
-pseudo-outcome scale, gradient norms) rather than another sweep.
+Beating 0.1239 is the bar; `cur_k4` is the 0.1559 we already have. **Do not treat the archive's
+0.0854 as the target** — an earlier version of this line did, and it is not safe to: the
+archive's IST-3 fits died of NaN at epoch 60–120, which acted as accidental early stopping, so
+0.0854 may be an artifact of a broken run rather than a level to reproduce. If a larger K moves
+AIR toward 0.1239, capacity was the constraint and the fix is to scale K with n. If all four
+capacities land near 0.156, capacity is ruled out too, and the next place to look is the
+pseudo-outcome noise rather than the model.
+
+**Result: all four capacities land flat** — 0.1714 / 0.1660 / 0.1649 / 0.1642 for K =
+2 / 4 / 8 / 16. So capacity is ruled out, and 8× the components buys 4%. Following the noise
+instead is what found the actual cause; see §4d.
+
+---
+
+## 4d. The censoring nuisance was the gap — and the ~15 minute run that confirms it
+
+### What the capacity sweep settled, and what it did not
+
+**Capacity is ruled out.** Cross-fitted AIR at n=20000 is flat in K: 0.1714 (K=2), 0.1660 (K=4),
+0.1649 (K=8), 0.1642 (K=16). A 8× capacity increase buys 4%. So all three CATE-stage suspects
+listed in `submit_confirm.sh`'s header — restarts, initializer, capacity — are now measured and
+none of them is the gap. Section 4c's "the remaining explanation is instability in the CATE fit"
+was the wrong inference; the nuisance path had simply never been measured component by component.
+
+### Attribution: it is the censoring survival, and almost nothing else
+
+`examples/diagnose_ist3_nuisance.py` fits one set of nuisances per seed, then trains the CATE
+model repeatedly while splicing oracle components in one at a time. Same data, same CATE
+initialization, so every difference is the spliced component. n=20000, seed 0:
+
+| spliced in | iMSE | `r_loss_at_zero` |
+|---|---|---|
+| nothing (all estimated) | 0.2418 | 22.05 |
+| oracle propensity | 0.2577 | 22.05 |
+| oracle event survival | 0.1985 | 14.55 |
+| **oracle censoring survival** | **0.0966** | **1.007** |
+| oracle event + censoring | 0.0906 | 0.917 |
+| everything | 0.0949 | 0.917 |
+
+The censoring survival accounts for essentially the whole gap. The propensity is *exonerated by
+measurement* — rmse 0.046 against truth, nothing clipped, and splicing the oracle in makes things
+very slightly **worse**. The event survival is a distant second and worth ~0.006 once censoring
+is fixed. `r_loss_at_zero` is the R-loss paid by tau == 0, i.e. the signal-free part of the
+objective, and it is the diagnostic that localizes this: 22.05 -> 1.007 on the censoring splice
+alone.
+
+### The mechanism: bias in `S_cens` is cheap, variance is not
+
+The AIPCW pseudo-outcome divides by `S_cens` in **all three** of its terms, so it is a delicate
+cancellation. A smooth systematic error in `S_cens` largely cancels; an erratic per-subject error
+breaks the cancellation and lands undamped in the tail of `Y_tilde`, where the quadratic R-loss
+is most sensitive to it. This is why RMSE and bias against the true `S_cens` are the *wrong*
+metrics to tune — the left tail is what matters.
+
+The fix is therefore not a better censoring model but a **less flexible** one. `--censoring-fix`
+drops the censoring Weibull's hidden layers, so shape and scale are each a softplus of a single
+linear index in x: **32 weights on IST-3's p=15, against 3170** for the `(64, 32)` MLP. Event
+models, propensity and CATE model untouched. n=20000, 4 seeds, paired:
+
+| | baseline | restricted | oracle `S_cens` |
+|---|---|---|---|
+| `S_cens` bias | −0.033 | **−0.129** (4× worse) | 0 |
+| `S_cens` rmse | 0.168 | **0.139** (better) | 0 |
+| frac at clip floor | 0.014 | **0.003** | 0 |
+| max abs `Y_tilde` | 136–190 | **5.6–7.7** | 3.1–4.3 |
+| frac abs `Y_tilde` > 10 | 0.17% | **0** | 0 |
+| `r_loss_at_zero` | 17–26 | **1.52–1.57** | 1.00 |
+| **iMSE** | **0.1830** | **0.1094** | **0.0980** |
+
+Read the first two rows together — that is the whole mechanism. The restricted model is four
+times more biased and still has lower RMSE, because it trades a lot of variance for that bias.
+
+### Two respecifications that do NOT pay, recorded so they are not retried
+
+Both were argued from theory, implemented, measured at zero, and left available but **off**:
+
+| arm | admin fix | shared shape | linear λ | iMSE |
+|---|---|---|---|---|
+| `lin_Sce` | yes | yes | yes | 0.1133 |
+| `linonly_Sce` | — | yes | yes | 0.1128 |
+| `linfree_Sce` | yes | — | yes | 0.1102 |
+| **`linplain_Sce`** (what the flag does) | — | — | yes | **0.1094** |
+| `shfix_Sce` | yes | yes | — | **0.3298** |
+
+- **`admin_as_censored`.** `1 - Delta` treats end-of-follow-up as an *observed* censoring event
+  (14.7% of rows, 27% of all censoring events). A Weibull has no atom to offer, and term2 divides
+  by `S_cens(Z)` with `Z = t_end` exactly. Both arguments are sound. Worth 0.0008.
+- **`shared_shape`.** A per-subject `k(x)` is heteroscedastic Weibull regression, not AFT. Worth
+  −0.003, i.e. very slightly harmful.
+- **Together without the flexibility restriction (`shfix_Sce`): 0.3298, far worse than the 0.1830
+  baseline** — while having the *best* `S_cens` bias of any arm (−0.011). Same lesson again.
+
+The flag is therefore the **minimal one-knob change**, which also happens to score best.
+
+### The honest caveat, which the run below is partly designed to expose
+
+This is a **regularization choice, not a correctness fix**. A single-index censoring scale happens
+to be nearly the right *shape* here — the DGP's true scale is
+`lambda_c(x) = lambda_c_base * exp(-b * z_prog)` with `z_prog` a linear index. It is still
+misspecified (`_get_params` uses softplus, not exp, which is what the −0.129 bias is), so the gain
+is variance reduction, not accuracy.
+
+Two consequences to keep in view:
+
+1. **It may hurt at small n.** A single local seed at n=500 went 0.247 -> 0.645. At n=500 each
+   censoring model sees ~167 rows, so this is not the overfitting regime the fix targets. One
+   seed proves nothing, which is exactly why the run below does the **full ladder with a paired
+   control** rather than n=20000 alone. A method that wins at n=20000 only via a tuning choice
+   that is harmful at n=500 is a weaker result, and we should know it before writing it up.
+2. **"We beat RSF after hand-picking the censoring model's capacity" is weaker than "we beat
+   RSF."** The open question is whether that capacity can be selected data-adaptively. Encouraging
+   sign: the restricted model also wins on RMSE, so a cross-validated censoring likelihood might
+   pick it without oracle knowledge. Untested.
+
+### The run
+
+Full ladder, 10 seeds, three sbatch calls, ~15 minutes wall clock. Arm A is the new spec with
+both forest baselines; **arm B is the paired control** — the same seeds and the same HEAD with
+the flag off. The control is not optional: `9d336d6` changed the CATE fit after section 4b's gate
+ran, so 4b's 0.1559 is no longer a valid comparator for anything.
+
+```bash
+mkdir -p sherlock/logs
+
+# Arm A, 16G: AIR (tasks 0-9) + AIR-oracle (10-19).
+CENSORING_FIX=1 RUN_TAG=cfix METHODS_LIST="AIR,AIR-oracle,RSF-T,RSF-S" \
+  sbatch --array=0-19 \
+    --output=sherlock/logs/cfix_%a.out --error=sherlock/logs/cfix_%a.err \
+    sherlock/submit_confirm.sh
+
+# Arm A, 32G: RSF-T (20-29) + RSF-S (30-39). RSF OOM'd at 8G at n=20000.
+CENSORING_FIX=1 RUN_TAG=cfix METHODS_LIST="AIR,AIR-oracle,RSF-T,RSF-S" \
+  sbatch --array=20-39 --mem-per-cpu=32G \
+    --output=sherlock/logs/cfix_%a.out --error=sherlock/logs/cfix_%a.err \
+    sherlock/submit_confirm.sh
+
+# Arm B, the control: flag OFF, AIR only, same 10 seeds.
+RUN_TAG=cbase METHODS_LIST="AIR" \
+  sbatch --array=0-9 \
+    --output=sherlock/logs/cbase_%a.out --error=sherlock/logs/cbase_%a.err \
+    sherlock/submit_confirm.sh
+```
+
+`METHODS_LIST` must be **identical in both arm-A calls** — the script derives the method from
+`TASK_ID / N_SEEDS_TOTAL`, so a shorter list in the second call would silently reassign tasks
+20-39 to the wrong methods (or exit 1 if the index overruns, which is the good case). The tags
+are `cfix` and `cbase` rather than `cfix`/`cfix_off` on purpose: a `cfix_*.json` glob would also
+match `cfix_off_*.json`, and the resume logic adopting the other arm's cells as its own answer is
+the most expensive mistake available here.
+
+`AIR-oracle`, `RSF-T` and `RSF-S` never call `cross_fit_nuisances`, so they are bit-identical
+under both settings and are run once, in arm A only.
+
+Collect the two arms separately:
+
+```bash
+RESULTS_DIR=$SCRATCH/air_cate_cfix PATTERN='cfix_*.json' \
+MERGED_NAME=cfix_merged.json FIGURES_DIR=examples/figures/cfix \
+  bash sherlock/collect_results.sh
+
+RESULTS_DIR=$SCRATCH/air_cate_cbase PATTERN='cbase_*.json' \
+MERGED_NAME=cbase_merged.json FIGURES_DIR=examples/figures/cbase \
+  bash sherlock/collect_results.sh
+```
+
+### How to read it
+
+Local 4-seed expectations at n=20000, to compare against: AIR-with-fix **0.109**, AIR-control
+**0.183**, oracle-censoring ceiling **0.098**, RSF-T **0.1239** (settled — reproduced to six
+digits in two independent runs).
+
+| check | passes if | fails if |
+|---|---|---|
+| AIR vs RSF-T at n=20000 | AIR below 0.1239, paired per seed | at or above |
+| AIR vs RSF-S at n=20000 | AIR below RSF-S | at or above |
+| fix vs control at n=20000 | `cfix` below `cbase`, paired | no separation |
+| AIR monotone in n | falls across the whole ladder | rises at small n (see caveat 1) |
+| AIR / AIR-oracle at n=20000 | tightens toward ~1.1 | stays near 1.8 |
+
+**Pair per seed and report the paired difference, not two means.** The margin at n=20000 is thin
+— locally 0.1094 against 0.1239, about 0.011, with 3 of 4 seeds below and seed 1 at 0.1263 just
+above. Ten unpaired seeds may well not separate that; ten paired ones should, since AIR and RSF-T
+see identical draws seed by seed. If the paired test does not clear it, the honest conclusion is
+"comparable to RSF-T at n=20000", not a win, and the next lever is the event survival
+(`orc_Sev_Sce` 0.0906 vs `orc_Sce` 0.0966) rather than more seeds.
 
 ---
 

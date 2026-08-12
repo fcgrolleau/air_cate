@@ -5,6 +5,20 @@ import keras
 import numpy as np
 
 
+class _GlobalScalar(keras.layers.Layer):
+    """A single learnable scalar, broadcast over the batch, ignoring its input.
+
+    Used to turn one output head of the Weibull MLP into a parameter shared by
+    every subject. The input is read only for its batch dimension.
+    """
+
+    def build(self, input_shape):
+        self.b = self.add_weight(name="b", shape=(1,), initializer="zeros")
+
+    def call(self, inputs):
+        return keras.ops.zeros_like(inputs[:, :1]) + self.b
+
+
 class WeibullAFT:
     """Weibull AFT survival model parameterized by an MLP.
 
@@ -12,10 +26,26 @@ class WeibullAFT:
 
     The MLP outputs raw (unconstrained) shape and scale parameters which are
     mapped to positive values via softplus.
+
+    Args:
+        hidden_sizes: Hidden layer widths of the MLP.
+        shared_shape: Fit one shape parameter for the whole sample instead of a
+            per-subject k(x). Off by default, which reproduces the original
+            behaviour. Turning it on is what "accelerated failure time" actually
+            means: an AFT model is log T = mu(x) + sigma * W with sigma
+            *constant*, so covariates shift the location of log T and nothing
+            else. Letting k vary with x instead gives a heteroscedastic Weibull
+            regression, whose extra freedom lands exactly where the AIPCW
+            pseudo-outcomes are most fragile -- a subject handed a small lambda
+            and a large k gets S(t) ~ 0 at late t, and 1/S(t) enters the
+            pseudo-outcome directly. Worth turning on for the censoring model
+            whenever the censoring shape is not believed to vary with x; leave it
+            off for an event process with covariate-dependent shape.
     """
 
-    def __init__(self, hidden_sizes: list[int] = (64, 32)):
+    def __init__(self, hidden_sizes: list[int] = (64, 32), shared_shape: bool = False):
         self.hidden_sizes = hidden_sizes
+        self.shared_shape = shared_shape
         self.model_ = None
 
     def _build_model(self, input_dim: int) -> keras.Model:
@@ -23,8 +53,15 @@ class WeibullAFT:
         x = inputs
         for units in self.hidden_sizes:
             x = keras.layers.Dense(units, activation="relu")(x)
-        # Two raw outputs: log-shape and log-scale (mapped via softplus)
-        raw_params = keras.layers.Dense(2)(x)
+        if self.shared_shape:
+            # Scale still depends on x; shape is one parameter for everyone.
+            # Column order must stay (shape, scale) to match `_get_params`.
+            lam_raw = keras.layers.Dense(1)(x)
+            k_raw = _GlobalScalar()(lam_raw)
+            raw_params = keras.layers.Concatenate()([k_raw, lam_raw])
+        else:
+            # Two raw outputs: log-shape and log-scale (mapped via softplus)
+            raw_params = keras.layers.Dense(2)(x)
         return keras.Model(inputs, raw_params)
 
     @staticmethod

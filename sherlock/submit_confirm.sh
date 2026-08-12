@@ -68,6 +68,23 @@
 #     may simply saturate while RSF keeps refining.
 #   - Optimizer steps per epoch grow with n at fixed cate_epochs, so the effective
 #     training budget is not held constant across the ladder.
+#
+# ---------------------------------------------------------------------------
+# ALL THREE SUSPECTS ARE NOW MEASURED, AND NONE OF THEM WAS THE GAP
+# ---------------------------------------------------------------------------
+# n_restarts=5 made it WORSE (0.1559 -> 0.1670). The initializer split (helps the
+# oracle arms, hurts the cross-fitted ones). Capacity is flat: K=2/4/8/16 gives
+# 0.1714/0.1660/0.1649/0.1642, so 8x the components buys 4%.
+#
+# So "the defect lives in the CATE fit" was the wrong inference -- it followed from
+# AIR-oracle degrading too, which is real, but the cross-fitted arms have a SECOND
+# and much larger defect that the oracle arms cannot show. Splicing oracle
+# components in one at a time (examples/diagnose_ist3_nuisance.py) puts essentially
+# the whole cross-fitted gap in the CENSORING survival: at n=20000 seed 0, oracle
+# censoring alone takes iMSE 0.2418 -> 0.0966 and the signal-free noise floor
+# r_loss_at_zero 22.05 -> 1.007, while oracle propensity makes it slightly worse.
+# The fix is LESS censoring-model flexibility, not more: see CENSORING_FIX below
+# and section 4d of RUNBOOK.md.
 # ============================================================================
 #
 # ---------------------------------------------------------------------------
@@ -103,6 +120,36 @@
 #   RESULTS_DIR=$SCRATCH/air_cate_confirm_r5 PATTERN='confirm_r5_*.json' \
 #   MERGED_NAME=confirm_r5_merged.json FIGURES_DIR=examples/figures/confirm_r5 \
 #       bash sherlock/collect_results.sh
+#
+# THE CENSORING-FIX CONFIRMATION -- the run the failed gate above actually calls for,
+# now that the gap has been attributed. ~15 min, three sbatch calls, 50 tasks. Arm A
+# is the new censoring spec with BOTH forest baselines; arm B is the paired control,
+# same seeds and same HEAD with the flag off. Full recipe and how to read it: section
+# 4d of RUNBOOK.md.
+#
+#   # Arm A, 16G: AIR (0-9) + AIR-oracle (10-19)
+#   CENSORING_FIX=1 RUN_TAG=cfix METHODS_LIST="AIR,AIR-oracle,RSF-T,RSF-S" \
+#       sbatch --array=0-19 \
+#       --output=sherlock/logs/cfix_%a.out --error=sherlock/logs/cfix_%a.err \
+#       sherlock/submit_confirm.sh
+#
+#   # Arm A, 32G: RSF-T (20-29) + RSF-S (30-39)
+#   CENSORING_FIX=1 RUN_TAG=cfix METHODS_LIST="AIR,AIR-oracle,RSF-T,RSF-S" \
+#       sbatch --array=20-39 --mem-per-cpu=32G \
+#       --output=sherlock/logs/cfix_%a.out --error=sherlock/logs/cfix_%a.err \
+#       sherlock/submit_confirm.sh
+#
+#   # Arm B, the control: flag OFF, AIR only, same 10 seeds
+#   RUN_TAG=cbase METHODS_LIST="AIR" sbatch --array=0-9 \
+#       --output=sherlock/logs/cbase_%a.out --error=sherlock/logs/cbase_%a.err \
+#       sherlock/submit_confirm.sh
+#
+# METHODS_LIST must be IDENTICAL in both arm-A calls -- the mapping below derives the
+# method from TASK_ID / N_SEEDS_TOTAL, so a shorter list in the second call would
+# reassign tasks 20-39 to the wrong methods. The control arm is NOT optional: commit
+# 9d336d6 changed the CATE fit after the gate above ran, so its 0.1559 is no longer a
+# valid comparator. Tags are cfix/cbase rather than cfix/cfix_off because a
+# 'cfix_*.json' glob would also match 'cfix_off_*.json' at collection time.
 #
 # Splitting by memory is deliberate. Asking 32G on all 30 slots is what left an
 # earlier run stuck in PD (see the transfer log in RUNBOOK.md): a 32G request
@@ -192,6 +239,23 @@ else
     K_FLAG=""
 fi
 
+# Respecify the CENSORING nuisance: drop its hidden layers, so the Weibull shape
+# and scale are each a softplus of a single linear index in x (32 weights) rather
+# than of a (64, 32) MLP (3170 weights). Set to 1 to enable. See section 4d of
+# RUNBOOK.md; local measurement at n=20000, 4 seeds, is iMSE 0.183 -> 0.110
+# against an oracle-censoring ceiling of 0.098 and RSF-T's 0.1239.
+#
+# Affects the cross-fitted arms only. AIR-oracle and TP-oracle build their
+# nuisances from the DGP and never call cross_fit_nuisances; RSF fits no nuisance
+# model at all. So those arms are identical under both settings, which is what
+# makes them valid unchanged controls in an A/B on this flag.
+CENSORING_FIX="${CENSORING_FIX:-0}"
+if [ "$CENSORING_FIX" = "1" ]; then
+    CFIX_FLAG="--censoring-fix"
+else
+    CFIX_FLAG=""
+fi
+
 DGP="IST-3"
 
 # Comma-separated, overridable, because the useful method set changes between
@@ -221,7 +285,7 @@ fi
 
 echo "Confirm task ${TASK_ID}: DGP=${DGP}, Method=${METHOD}, seed ${SEED}," \
      "n_values=${N_VALUES}, n_restarts=${N_RESTARTS}, legacy_init=${LEGACY_INIT}," \
-     "mgd_k=${MGD_K:-default}, tag=${RUN_TAG}"
+     "mgd_k=${MGD_K:-default}, censoring_fix=${CENSORING_FIX}, tag=${RUN_TAG}"
 echo "Node: $(hostname), Start: $(date)"
 
 # Sherlock's glibc 2.17 is too old for modern jaxlib wheels, so this uses conda
@@ -258,8 +322,8 @@ python examples/plot_simulation.py --large \
     --n-values "$N_VALUES" \
     --n-restarts "$N_RESTARTS" \
     --output "$OUTFILE" \
-    $INIT_FLAG $K_FLAG
-    # Both flags are deliberately UNQUOTED and last. Unquoted, an empty value
+    $INIT_FLAG $K_FLAG $CFIX_FLAG
+    # All three flags are deliberately UNQUOTED and last. Unquoted, an empty value
     # vanishes; quoted, it would pass argparse an empty-string argument and the
     # job would die at parse time on every task in the arm that leaves it unset.
     # K_FLAG also relies on word-splitting to become two arguments ("--mgd-k" "8").

@@ -19,6 +19,9 @@ def cross_fit_nuisances(
     weibull_config: dict | None = None,
     training_config: dict | None = None,
     rng_seed: int = 42,
+    censoring_config: dict | None = None,
+    admin_as_censored: bool = False,
+    t_end: float | None = None,
 ) -> NuisanceEstimates:
     """Estimate nuisance functions via Q-fold cross-fitting.
 
@@ -35,12 +38,43 @@ def cross_fit_nuisances(
         weibull_config: kwargs for WeibullAFT constructor.
         training_config: Training kwargs (epochs, batch_size, lr, verbose).
         rng_seed: Random seed for fold splitting.
+        censoring_config: kwargs for the two *censoring* WeibullAFT models.
+            Defaults to `weibull_config`. Split out because the censoring and
+            event processes rarely deserve the same specification -- see
+            `WeibullAFT(shared_shape=...)`.
+        admin_as_censored: Treat administrative end-of-follow-up (Z at t_end) as
+            censored rather than as an observed censoring event when fitting the
+            censoring model. Requires `t_end`. Off by default; see below.
+        t_end: Maximum follow-up time. Only needed for `admin_as_censored`.
+
+    Why `admin_as_censored` matters. The censoring model is fitted with event
+    indicator 1 - Delta, which is 1 both when C < min(D, t_end) -- censoring
+    genuinely observed -- and when min(D, C) >= t_end, where Z = t_end exactly
+    and all that was learned is that follow-up ended. The observable censoring
+    variable is min(C, t_end), so those rows form a point mass at t_end. Two
+    consequences, both bad:
+
+      - A Weibull has no atom to offer, so fitting the spike is paid for with a
+        distorted S(t) on the interior: the shape is pushed up and late-time
+        survival collapses, and 1/S(t) is what enters the AIPCW IPCW term.
+      - The AIPCW derivation needs the survival of C itself. At t = t_end the
+        IPCW numerator 1{Z > t_end} is 0 for everyone, but the censored
+        augmentation term still divides by S*(Z) for every censored row, and Z is
+        exactly t_end on the administrative ones. The survival of min(C, t_end)
+        is 0 there, so those rows get the largest weight the clip allows, while
+        the survival of C -- the quantity the algebra calls for -- is positive.
+
+    Treating Z = t_end as censored for the censoring model targets the law of C
+    on all of [0, t_end], which is what both terms require.
 
     Returns:
         NuisanceEstimates with all cross-fitted predictions in original order.
     """
     prop_cfg = propensity_config or {}
     weib_cfg = weibull_config or {}
+    cens_cfg = weib_cfg if censoring_config is None else censoring_config
+    if admin_as_censored and t_end is None:
+        raise ValueError("admin_as_censored=True requires t_end.")
     # Copy: the setdefault calls below must not mutate the caller's dict, since
     # AIREstimatorCV reuses one config dict across many cross-fitting runs.
     train_cfg = dict(training_config or {})
@@ -54,6 +88,14 @@ def cross_fit_nuisances(
     Z = np.asarray(data.Z, dtype=np.float32)
     Delta = np.asarray(data.Delta, dtype=np.float32)
     t_grid_np = np.asarray(time_grid, dtype=np.float32)
+
+    # Event indicator for the censoring model. Compare Z against t_end with a
+    # tolerance rather than for equality: min(D, C, t_end) returns t_end
+    # bit-exactly today, but a t_end that is not representable in float32 would
+    # otherwise silently drop the whole correction.
+    cens_event_all = 1.0 - Delta
+    if admin_as_censored:
+        cens_event_all = (cens_event_all * (Z < t_end - 1e-6)).astype(np.float32)
 
     n = X.shape[0]
     M_plus_1 = len(t_grid_np)
@@ -77,6 +119,7 @@ def cross_fit_nuisances(
         Z_tr = Z[train_idx]
         Z_val = Z[val_idx]
         Delta_tr = Delta[train_idx]
+        cens_event_tr = cens_event_all[train_idx]
 
         # --- Propensity ---
         prop_model = PropensityMLP(**prop_cfg)
@@ -89,6 +132,7 @@ def cross_fit_nuisances(
             X_arm = X_tr[arm_mask_tr]
             Z_arm = Z_tr[arm_mask_tr]
             Delta_arm = Delta_tr[arm_mask_tr]
+            cens_event_arm = cens_event_tr[arm_mask_tr]
 
             if X_arm.shape[0] < 20:
                 warnings.warn(
@@ -102,9 +146,10 @@ def cross_fit_nuisances(
             event_model = WeibullAFT(**weib_cfg)
             event_model.fit(X_arm, Z_arm, Delta_arm, **train_cfg)
 
-            # Censoring survival: S*_w(t|x), event indicator = 1-Delta
-            cens_model = WeibullAFT(**weib_cfg)
-            cens_model.fit(X_arm, Z_arm, 1.0 - Delta_arm, **train_cfg)
+            # Censoring survival: S*_w(t|x), event indicator = 1-Delta, with the
+            # administrative rows optionally demoted to censored (see docstring).
+            cens_model = WeibullAFT(**cens_cfg)
+            cens_model.fit(X_arm, Z_arm, cens_event_arm, **train_cfg)
 
             # Predict on validation fold (all subjects, not just arm w)
             S_ev_grid = np.asarray(event_model.survival(t_grid_np, X_val))

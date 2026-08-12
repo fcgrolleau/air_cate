@@ -72,6 +72,29 @@ def test_survival_grid_vs_point():
     np.testing.assert_allclose(np.array(S_point), np.array(S_grid), atol=1e-5)
 
 
+def test_shared_shape_is_constant_across_subjects():
+    """With shared_shape=True the fitted k does not vary with x, but lambda does."""
+    from air_cate.nuisance.weibull_aft import WeibullAFT
+
+    rng = np.random.default_rng(0)
+    n = 400
+    X = rng.standard_normal((n, 3)).astype(np.float32)
+    # Exponential times with a covariate-dependent scale: true shape is 1 for all.
+    scale = np.exp(0.5 + 0.4 * X[:, 0])
+    T = (scale * rng.exponential(1.0, n)).astype(np.float32)
+    event = np.ones(n, dtype=np.float32)
+
+    model = WeibullAFT(hidden_sizes=(8,), shared_shape=True)
+    model.fit(X, T, event, epochs=20, verbose=0)
+
+    k, lam = WeibullAFT._get_params(model.model_(X, training=False))
+    k = np.asarray(k)
+    lam = np.asarray(lam)
+
+    assert np.ptp(k) < 1e-5, f"shape varies across subjects: range {np.ptp(k)}"
+    assert np.ptp(lam) > 1e-3, "scale should still depend on x"
+
+
 def test_parameter_recovery():
     """Recover known Weibull parameters from large sample."""
     from air_cate.nuisance.weibull_aft import WeibullAFT
