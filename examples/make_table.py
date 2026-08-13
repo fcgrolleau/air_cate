@@ -58,14 +58,61 @@ def _fmt_val(v, decimals):
     return f"{v:.{decimals}f}"
 
 
-def fmt_imse(mean, se):
+# Approximate an SE only when it is genuinely beyond the table's resolution.
+# Everything above this gets printed as a number, at whatever precision that takes,
+# so the reader never sees a bound in one cell and 0.0001 in the next.
+SE_APPROX_BELOW = 1e-5
+SE_MAX_DECIMALS = 5
+
+
+def _se_decimals(se, decimals):
+    """Decimals for the SE: the mean's precision, widened only if that shows zero.
+
+    An SE is conventionally reported at the same precision as the estimate it
+    belongs to, and that is what keeps a row readable. It breaks only when the SE
+    is finer than the estimate's last digit: 0.0004 beside a mean of 0.145 would
+    print as 0.000, which reads as a zero standard error. In that case, and only
+    then, add decimals -- and stop at the first precision that shows something, so
+    an SE of 9e-5 prints as 0.0001 rather than 0.00009 and stays flush with the
+    rest of the column. Cells that already print a real number are left at the
+    mean's precision instead of sprouting digits.
+
+    The zero test is on the formatted string, not a threshold, so it stays correct
+    if the decimal counts in fmt_imse ever change.
+    """
+    for d in range(decimals, SE_MAX_DECIMALS + 1):
+        if float(_fmt_val(se, d)) != 0:
+            return d
+    return SE_MAX_DECIMALS
+
+
+def fmt_se(se, decimals, bold=False):
+    """SE text, or a bound when it is below the table's resolution entirely.
+
+    bold matters because \\textbf does not reach inside math mode: wrapping
+    $10^{-5}$ in \\textbf leaves it roman while the digits around it turn bold.
+    \\boldsymbol (amsmath) is the math-mode equivalent. The {<} braces make < an
+    ordinary symbol rather than a relation, dropping the thin space TeX would
+    otherwise insert after the opening parenthesis.
+    """
+    if math.isnan(se):
+        return "---"
+    if se < SE_APPROX_BELOW:
+        bound = rf"{{<}}10^{{-{SE_MAX_DECIMALS}}}"
+        return rf"$\boldsymbol{{{bound}}}$" if bold else f"${bound}$"
+    return _fmt_val(se, _se_decimals(se, decimals))
+
+
+def fmt_imse(mean, se, bold=False):
     if math.isnan(mean):
         return "---"
     if mean >= 1:
-        return f"{_fmt_val(mean, 2)} ({_fmt_val(se, 2)})"
-    if mean >= 0.1:
-        return f"{_fmt_val(mean, 3)} ({_fmt_val(se, 3)})"
-    return f"{_fmt_val(mean, 4)} ({_fmt_val(se, 4)})"
+        decimals = 2
+    elif mean >= 0.1:
+        decimals = 3
+    else:
+        decimals = 4
+    return f"{_fmt_val(mean, decimals)} ({fmt_se(se, decimals, bold=bold)})"
 
 
 def fmt_runtime(rt, se_rt):
@@ -145,10 +192,11 @@ def make_table(results, n_values):
             cells = [dgp_label, f"${n_fmt}$"]
             for method in METHODS:
                 mean, se, rt, se_rt = stats[method]
-                imse_str = fmt_imse(mean, se)
+                is_best = method == best_method
+                imse_str = fmt_imse(mean, se, bold=is_best)
                 rt_str = fmt_runtime(rt, se_rt)
                 cell = f"{imse_str}"
-                if method == best_method:
+                if is_best:
                     cell = rf"\textbf{{{cell}}}"
                 cell = rf"\makecell{{{cell} \\ \scriptsize {rt_str}}}"
                 cells.append(cell)
