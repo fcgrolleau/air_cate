@@ -953,6 +953,139 @@ honest claim is "wins at large n, harmful at small n", not a clean win.
 
 ---
 
+## 5b. The trajectory-metrics runs — grf turned on, three metrics beyond iMSE
+
+**What this run is for.** iMSE is a δ-weighted Riemann sum of *pointwise* squared error, so
+it is essentially invariant to M and completely blind to how a curve gets from one grid point
+to the next. A method that estimates each horizon independently — grf's causal survival forest
+refits one forest per horizon; the RSF learners read a step function off one forest — can zigzag
+between neighbouring t and pay nothing for it. Three metrics computed by
+[`src/air_cate/metrics.py`](../src/air_cate/metrics.py) see it, all on the same shared grid every
+method already uses: the derivative MSE **D**, the **H¹** norm, and the **excess reversal count**.
+
+**Two changes from section 5.** grf's CSF is now one of seven methods, and it gets its **own
+shard** — [`submit_csf.sh`](submit_csf.sh) with `BLOCK=1` and a 6h wall, because one CSF seed
+across the ladder costs ~2.1h against 0.71h for an entire 5-seed AIR block. And **200 seeds, not
+999**: the full999 CIs are already very tight, and the new metrics come from the same fits, so
+200 buys the same figures for a fifth of the queue.
+
+`N_SEEDS` must be passed to **every** call in a run, including the CSF one. It sets `N_BLOCKS`
+and therefore the whole task-id → (DGP, method, seed-block) mapping; a call that omits it decodes
+its ids under the 200-block default and writes another arm's filenames without erroring.
+
+### Stage 2 — the ~2 hour shakedown (10 seeds, all 3 DGPs, all 7 methods)
+
+Validates the resharded array, the R module on the compute nodes, and per-cell CSF runtimes for
+sizing stage 3. Its own `RUN_TAG`, so it cannot land on the 200-seed partials and be resume-skipped.
+
+```bash
+mkdir -p sherlock/logs
+
+# One-time, on the LOGIN node: install grf into your user library. The compute nodes do
+# not inherit the login shell's environment, so submit_csf.sh sets R_LIBS_USER itself --
+# but the package has to be there first.
+module load R
+Rscript -e 'install.packages("grf", repos="https://cloud.r-project.org")'
+Rscript -e 'cat(requireNamespace("grf", quietly = TRUE))'   # want: TRUE
+
+# Six-method shard: N_SEEDS=10, BLOCK=5 -> 2 blocks -> 3 x 6 x 2 = 36 tasks.
+# 32G throughout: only 12 of the 36 are RSF, so the memory split is not worth the typing.
+CENSORING_FIX=1 RUN_TAG=metrics10 N_SEEDS=10 sbatch --array=0-35 \
+    sherlock/submit_array.sh
+
+# CSF shard: 3 x 10 = 30 tasks, one seed each.
+CENSORING_FIX=1 RUN_TAG=metrics10 N_SEEDS=10 sbatch --array=0-29 \
+    sherlock/submit_csf.sh
+
+# Both shards write the same RESULTS_DIR under the same RUN_TAG prefix, so ONE collect
+# merges them -- collect_results.sh globs by prefix and is method-agnostic.
+RESULTS_DIR=$SCRATCH/air_cate_metrics10 PATTERN='metrics10_*.json' \
+MERGED_NAME=metrics10_merged.json FIGURES_DIR=examples/figures/metrics10 \
+  bash sherlock/collect_results.sh
+```
+
+**Four things to confirm before stage 3.**
+
+```bash
+# 1. No failures, and specifically no "needs R with the grf package" -- that is the
+#    module/R_LIBS_USER path being wrong on the compute nodes, which the login-node
+#    check above cannot catch.
+grep -l "Error\|Traceback\|grf package" sherlock/logs/csf_*.err 2>/dev/null
+
+# 2. CSF's wall time against the 6h request. The Elapsed column on the .batch rows.
+sacct -j <csf_jobid> --format=JobID,State,Elapsed,MaxRSS
+
+# 3. Peak RSS under the 16G request -- 16G is asserted for CSF, not measured.
+#    If MaxRSS is anywhere near it, raise --mem-per-cpu for stage 3.
+
+# 4. grf's own diagnostics still ~0 on all three DGPs. IST-3 has never been run under
+#    CSF, and a horizon grf silently fails to fit becomes a nan cell, not an error.
+python -c "
+import json; d = json.load(open('$SCRATCH/air_cate_metrics10/metrics10_merged.json'))
+print(json.dumps({k: v for k, v in d.items() if 'fail' in k or 'range' in k}, indent=2)[:2000])"
+```
+
+### Stage 3 — the 200-seed run (720 + 600 tasks)
+
+Both shards are under SLURM's 1000-per-submission cap. The six-method shard is split only for
+the memory override: at 40 blocks per (DGP, method), RSF-T and RSF-S are blocks 4–5 within each
+DGP's 240 ids, i.e. the last 80 of each.
+
+```bash
+# 16G: AIR, Tensor-prod, and both oracles -- 480 of the 720 tasks.
+for r in 0-159 240-399 480-639; do
+    CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=$r \
+        --mem-per-cpu=16G sherlock/submit_array.sh
+done
+
+# 32G: RSF-T and RSF-S, which OOM'd at 8G at n=20000.
+for r in 160-239 400-479 640-719; do
+    CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=$r \
+        sherlock/submit_array.sh
+done
+
+# CSF: 600 tasks, one seed each, 6h wall.
+CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=0-599 \
+    sherlock/submit_csf.sh
+```
+
+Collect on an interactive node, not the login node — 1321 files is real work:
+
+```bash
+sh_dev
+source $GROUP_HOME/$USER/miniforge3/bin/activate
+eval "$(mamba shell hook --shell bash)"
+mamba activate air_cate
+cd ~/air_cate_full
+
+ls $SCRATCH/air_cate_metrics200/metrics200_*.json | wc -l   # target: 1320, pre-merge
+
+RESULTS_DIR=$SCRATCH/air_cate_metrics200 PATTERN='metrics200_*.json' \
+MERGED_NAME=metrics200_merged.json FIGURES_DIR=examples/figures/metrics200 \
+  bash sherlock/collect_results.sh
+```
+
+`collect_results.sh` renders **all four** figures — `simulation_convergence.pdf` plus
+`_dmse`, `_h1`, `_excess`. iMSE keeps the bare filename so the paper's `\includegraphics`
+still resolves.
+
+**What to check in the four figures.**
+
+- **iMSE must reproduce the 999-seed means inside their CIs.** 200 seeds is a subsample, not a
+  new specification. If it does not, something in the reshard is wrong, not the science.
+- **D and Excess must separate CSF and the RSF baselines from AIR** by well more than the
+  200-seed CI. Excess for AIR should sit near 0 and *may be negative*; for CSF it should
+  approach the i.i.d. ceiling `(2/3)(M−1) ≈ 19.3` minus the truth's own count.
+- **D is grid-dependent by nature and must be reported as such.** Under independent
+  per-horizon noise of variance `v` it grows like `2vM²/t_end`, so whoever picks M picks the
+  number. The run fixes M=30 and the caption says so. The defensible claim is structural, not
+  competitive: *refining the grid makes a pointwise-horizon estimator's trajectory strictly
+  worse while leaving its iMSE untouched.*
+- **Excess does not penalize shrinkage.** `τ̂ ≡ 0` scores a perfect 0, which is why its mean
+  panel cannot use a log axis and why it is only interpretable beside iMSE.
+
+---
+
 ## 6. Bring the results home
 
 Run this **on your Mac**.

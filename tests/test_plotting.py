@@ -107,7 +107,7 @@ def test_palette_is_the_shared_dict_not_a_copy():
     from air_cate.plotting import _JAMA
 
     assert PALETTE is _JAMA
-    assert set(PALETTE) == {"teal", "orange", "blue", "red", "green"}
+    assert set(PALETTE) == {"teal", "orange", "blue", "red", "green", "purple"}
 
 
 # ---------------------------------------------------------------------------

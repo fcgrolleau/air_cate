@@ -1,4 +1,4 @@
-"""Convergence simulation: iMSE vs sample size for 6 methods × 3 DGPs.
+"""Convergence simulation: four trajectory metrics vs sample size, 7 methods × 3 DGPs.
 
 Methods:
   1. AIR          — constrained Gamma mixture + estimated nuisance
@@ -7,6 +7,17 @@ Methods:
   4. TP-oracle    — polynomial basis + oracle nuisance
   5. RSF-T        — Random Survival Forest T-learner
   6. RSF-S        — Random Survival Forest S-learner
+  7. CSF          — grf causal survival forest, one refit per horizon
+
+Metrics (see air_cate.metrics; every method is evaluated on the SAME uniform time
+grid, and CSF's per-horizon refits land on exactly that grid):
+  iMSE    — integrated pointwise squared error, as reported since the first run
+  D       — derivative MSE, the first metric here that sees roughness
+  H1      — mean H^1 Sobolev norm of the error
+  Excess  — excess count of direction reversals against the truth
+
+One figure per metric, each with the mean-vs-n and variance-vs-n panel pair. iMSE
+keeps the filename `simulation_convergence.*`; the rest are suffixed.
 
 Usage:
   uv run python examples/plot_simulation.py           # quick (~5 min)
@@ -57,7 +68,9 @@ from air_cate import AIREstimator
 
 import keras
 from air_cate.baselines import SurvivalForestTLearner, SurvivalForestSLearner
+from air_cate.baselines_csf import CausalSurvivalForest, grf_available
 from air_cate.cate_model.tensor_product import CATETensorProduct
+from air_cate.metrics import METRIC_KEYS, curve_metrics
 from air_cate.nuisance.oracle import build_oracle_nuisances
 from air_cate.utils import build_time_grid
 from conftest import WeibullDGP, WeibullMixtureDGP
@@ -112,6 +125,11 @@ QUICK_CONFIG = dict(
     poly_degree=2,
     rsf_n_estimators=100,
     rsf_min_samples_leaf=10,
+    # grf causal survival forest defaults. num.trees is grf's own default; 1 thread
+    # keeps the recorded runtimes comparable to the single-core numbers the table
+    # reports (override with --csf-threads for a faster local run).
+    csf_num_trees=2000,
+    csf_num_threads=1,
     # Text DGP overrides
     text_encoder_hidden=(16,),
     text_K=4,
@@ -141,6 +159,10 @@ LARGE_CONFIG = dict(
     poly_degree=2,
     rsf_n_estimators=50,
     rsf_min_samples_leaf=15,
+    # See QUICK_CONFIG. Left at grf's defaults deliberately, so the baseline is the
+    # method as a practitioner would reach for it.
+    csf_num_trees=2000,
+    csf_num_threads=1,
     rsf_max_depth=15,
     # Text DGP overrides
     text_encoder_hidden=(16,),
@@ -156,6 +178,11 @@ METHODS = [
     ("TP-oracle",  dict(oracle=True,  tensor=True,  rsf=None)),
     ("RSF-T",      dict(oracle=False, tensor=False, rsf="T")),
     ("RSF-S",      dict(oracle=False, tensor=False, rsf="S")),
+    # The `rsf` slot doubles as the external-learner discriminator, so adding grf's
+    # causal survival forest needs no new key threaded through run_all -> run_single
+    # -> make_estimator. It also means CSF inherits the text-DGP policy below, where
+    # a truthy `rsf` restricts the learner to the structured covariates.
+    ("CSF",        dict(oracle=False, tensor=False, rsf="CSF")),
 ]
 
 DGPS = [
@@ -171,6 +198,7 @@ _JAMA = {
     "blue":   "#00a1d5",
     "red":    "#b24745",
     "green":  "#79af97",
+    "purple": "#6a6599",
 }
 
 METHOD_LABELS = {
@@ -180,6 +208,7 @@ METHOD_LABELS = {
     "TP-oracle":   "AIR w/ TP (oracle nuis.)",
     "RSF-T":       "Survival Forest T-learner",
     "RSF-S":       "Survival Forest S-learner",
+    "CSF":         "Causal Survival Forest (grf)",
 }
 
 METHOD_STYLES = {
@@ -189,6 +218,43 @@ METHOD_STYLES = {
     "TP-oracle":   dict(color=_JAMA["orange"], marker="s", ls="--", lw=1.4, ms=4.5, zorder=3),
     "RSF-T":       dict(color=_JAMA["red"],    marker="^", ls="-",  lw=2.2, ms=6, zorder=4),
     "RSF-S":       dict(color=_JAMA["green"],  marker="D", ls="-",  lw=2.2, ms=6, zorder=4),
+    "CSF":         dict(color=_JAMA["purple"], marker="v", ls="-",  lw=2.2, ms=6, zorder=4),
+}
+
+# Which metrics get a figure, and how each one is drawn. `key` indexes the per-seed
+# result dicts written by run_single; `stem` names the output file. iMSE deliberately
+# keeps the bare `simulation_convergence` stem, because that is the filename the paper
+# includes.
+#
+# `log_y` is per metric rather than global: Excess is a *difference* of counts and goes
+# negative for an oversmoothed method, which a log axis cannot show at all. Its
+# reference line is y=0 (the truth's own reversal count) instead of the tv-ATE line,
+# which is what `ref` selects.
+METRIC_SPECS = {
+    "imse": dict(
+        key="imse", stem="simulation_convergence",
+        mean_label="Average iMSE", var_label="Variance of iMSE",
+        log_y=True, ref="pop_avg",
+    ),
+    "dmse": dict(
+        key="dmse", stem="simulation_convergence_dmse",
+        mean_label=r"Average $\int_0^{t_{\mathrm{end}}}"
+                   r"(\partial_t\hat\tau - \partial_t\tau)^2\,dt$",
+        var_label=r"Variance of $\int(\partial_t\hat\tau - \partial_t\tau)^2\,dt$",
+        log_y=True, ref="pop_avg",
+    ),
+    "h1": dict(
+        key="h1", stem="simulation_convergence_h1",
+        mean_label=r"Average $\|\hat\tau - \tau\|_{H^1}$",
+        var_label=r"Variance of $\|\hat\tau - \tau\|_{H^1}$",
+        log_y=True, ref="pop_avg",
+    ),
+    "excess": dict(
+        key="excess", stem="simulation_convergence_excess",
+        mean_label="Average excess reversal count",
+        var_label="Variance of excess reversal count",
+        log_y=False, ref="zero",
+    ),
 }
 
 
@@ -206,6 +272,17 @@ def make_estimator(cfg, oracle, tensor, rsf, is_text_dgp=False):
             max_depth=cfg.get("rsf_max_depth"),
             min_samples_leaf=cfg["rsf_min_samples_leaf"],
             n_jobs=cfg.get("rsf_n_jobs", 2),
+        )
+
+    if rsf == "CSF":
+        # One grf forest per horizon: the causal survival forest targets a scalar
+        # effect at a single time, so the tv-CATE curve costs M fits. Hyperparameters
+        # stay at grf's defaults.
+        return CausalSurvivalForest(
+            M=cfg["M"],
+            num_trees=cfg.get("csf_num_trees", 2000),
+            num_threads=cfg.get("csf_num_threads", 1),
+            rscript=cfg.get("csf_rscript", "Rscript"),
         )
 
     nuis_hidden = cfg.get("nuisance_hidden")
@@ -379,14 +456,15 @@ def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf, propensity_
     tau_true = dgp_class.true_tau(t_grid, X_test)  # uses stored pool indices
     delta = est.delta_
 
-    mse_per_timepoint = np.mean((tau_hat - tau_true) ** 2, axis=0)
-    imse = float(np.sum(delta * mse_per_timepoint))
+    # iMSE and mse_per_timepoint keep their exact previous definitions, so every
+    # result file already on disk stays comparable cell for cell; the derivative,
+    # H^1 and extrema metrics come from the same call. See air_cate.metrics.
+    metrics = curve_metrics(tau_hat, tau_true, delta)
     runtime = time.time() - t_start
 
     out = {
         "seed": seed,
-        "imse": imse,
-        "mse_per_timepoint": [float(v) for v in mse_per_timepoint],
+        **metrics,
         "time_grid": [float(v) for v in t_grid],
         "runtime_seconds": round(runtime, 1),
     }
@@ -399,6 +477,19 @@ def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf, propensity_
     restart_losses = getattr(est, "restart_losses_", None)
     if restart_losses:
         out["restart_losses"] = [float(v) for v in restart_losses]
+
+    # CSF-only diagnostics, guarded the same way. Both are properties of the method
+    # rather than of its accuracy, so they belong in the record: n_failed_horizons
+    # counts grid points grf refused (horizon past the last observed failure time),
+    # which the flat-tail fallback then papers over, and frac_out_of_range measures
+    # how far an orthogonalized estimate strays outside [-1, 1] -- the structural
+    # validity AIR has by construction and this baseline does not.
+    n_failed = getattr(est, "n_failed_horizons_", None)
+    if n_failed is not None:
+        out["n_failed_horizons"] = int(n_failed)
+    frac_oor = getattr(est, "frac_out_of_range_", None)
+    if frac_oor is not None:
+        out["frac_out_of_range"] = float(frac_oor)
 
     return out
 
@@ -480,8 +571,13 @@ def run_all(cfg, resume=False, results_path=None, dgps=None, methods=None):
                             rsf=method_opts["rsf"],
                         )
                     except Exception as exc:
+                        # Every metric key gets a nan, not just imse: the plotting
+                        # code reads whichever metric it was asked for, and a missing
+                        # key would raise only after the whole batch had been paid
+                        # for. METRIC_KEYS is the single source of that list.
                         result = {
-                            "seed": seed, "imse": float("nan"),
+                            "seed": seed,
+                            **{k: float("nan") for k in METRIC_KEYS},
                             "mse_per_timepoint": [], "time_grid": [],
                             "runtime_seconds": 0.0,
                         }
@@ -520,6 +616,11 @@ def save_results(results, n_values, cfg, results_path=None):
     }
     # Store encoder_hidden as list (tuples aren't JSON serializable)
     payload["cfg"]["encoder_hidden"] = list(cfg.get("encoder_hidden", ()))
+    # A --output under a directory that does not exist yet is otherwise only
+    # discovered here, after every fit has already been paid for.
+    out_dir = os.path.dirname(results_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(results_path, "w") as f:
         json.dump(payload, f, indent=2)
     print(f"Results saved to {results_path}")
@@ -570,27 +671,37 @@ def merge_partial_results(main_path, partial_paths):
 # Plotting
 # ---------------------------------------------------------------------------
 
-def _pop_avg_imse(dgp_class, X_test, M):
-    """iMSE of the population-average CATE (no heterogeneity baseline).
+def _pop_avg_metric(dgp_class, X_test, M, metric="imse"):
+    """The named metric for the population-average CATE (no heterogeneity baseline).
 
-    tau_bar(t) = mean_i tau_true(t, X_i),  then
-    iMSE = mean_i sum_m delta * (tau_bar(t_m) - tau_true(t_m, X_i))^2.
+    tau_bar(t) = mean_i tau_true(t, X_i) is broadcast as if it were an estimate and
+    run through the same `curve_metrics` as any method, so every metric gets its
+    reference line from one code path rather than a per-metric formula.
     """
     t_end = getattr(dgp_class, "t_end", 5.0)
     time_grid, delta = build_time_grid(t_end, M)
     t_grid = np.asarray(time_grid)
-    tau_true = dgp_class.true_tau(t_grid, X_test)        # (n_test, M+1)
-    tau_bar = tau_true.mean(axis=0, keepdims=True)        # (1, M+1)
-    imse = np.mean(np.sum(delta * (tau_bar - tau_true) ** 2, axis=1))
-    return float(imse)
+    tau_true = dgp_class.true_tau(t_grid, X_test)              # (n_test, M+1)
+    tau_bar = np.broadcast_to(
+        tau_true.mean(axis=0, keepdims=True), tau_true.shape
+    )                                                          # (n_test, M+1)
+    return curve_metrics(tau_bar, tau_true, delta)[metric]
 
 
-def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
-    """Multi-panel convergence plot: mean iMSE (top) and variance (bottom) per DGP.
+def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None,
+                     metric="imse"):
+    """Multi-panel convergence plot: metric mean (top) and variance (bottom) per DGP.
 
-    figures_dir defaults to FIGURES_DIR, which holds the tracked publication
-    figures -- pass somewhere else for smoke runs so they are not overwritten.
+    `metric` names an entry in METRIC_SPECS. figures_dir defaults to FIGURES_DIR,
+    which holds the tracked publication figures -- pass somewhere else for smoke runs
+    so they are not overwritten.
     """
+    if metric not in METRIC_SPECS:
+        raise ValueError(
+            f"unknown metric {metric!r}; valid: {sorted(METRIC_SPECS)}"
+        )
+    spec = METRIC_SPECS[metric]
+    metric_key = spec["key"]
     out_dir = figures_dir or FIGURES_DIR
     plt.rcParams.update({
         "font.family": "serif",
@@ -602,24 +713,37 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
         "ytick.major.width": 0.6,
     })
 
-    n_dgps = len(DGPS)
+    # One column per DGP PRESENT IN THE RESULTS, in the canonical DGPS order -- not one
+    # per entry of DGPS. A smoke run over two DGPs used to get a blank third column.
+    dgps_present = [(n, c) for n, c in DGPS if n in results]
+    if not dgps_present:
+        raise ValueError(
+            f"no DGP in the results matches DGPS; results hold {sorted(results)}, "
+            f"expected some of {[n for n, _ in DGPS]}"
+        )
+
+    n_dgps = len(dgps_present)
     fig, axes = plt.subplots(2, n_dgps, figsize=(6.5 * n_dgps, 9),
                              sharex="col")
     if n_dgps == 1:
         axes = axes[:, None]  # ensure 2D
-    ax_mean = axes[0]   # top row: mean iMSE
-    ax_var = axes[1]     # bottom row: variance of iMSE
+    ax_mean = axes[0]   # top row: metric mean
+    ax_var = axes[1]     # bottom row: metric variance
 
-    for col, (dgp_name, dgp_class) in enumerate(DGPS):
-        if dgp_name not in results:
-            continue
+    for col, (dgp_name, dgp_class) in enumerate(dgps_present):
         dgp_results = results[dgp_name]
         X_test = X_tests[dgp_name] if isinstance(X_tests, dict) else X_tests
 
-        # --- Population-average reference line (top row only) ---
-        pa_imse = _pop_avg_imse(dgp_class, X_test, cfg["M"])
-        ax_mean[col].axhline(pa_imse, color="#888888", ls="--", linewidth=1.2,
-                              zorder=1, label="True tv-ATE")
+        # --- Reference line (top row only) ---
+        if spec["ref"] == "pop_avg":
+            pa_value = _pop_avg_metric(dgp_class, X_test, cfg["M"], metric_key)
+            ax_mean[col].axhline(pa_value, color="#888888", ls="--", linewidth=1.2,
+                                 zorder=1, label="True tv-ATE")
+        else:
+            # Excess is a difference against the truth's own reversal count, so the
+            # meaningful reference is exact agreement, not a competing estimator.
+            ax_mean[col].axhline(0.0, color="#888888", ls="--", linewidth=1.2,
+                                 zorder=1, label="Truth's reversal count")
 
         # --- Method curves ---
         for method_name, _ in METHODS:
@@ -629,26 +753,30 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
             st = METHOD_STYLES[method_name]
             label = METHOD_LABELS[method_name]
 
-            # Get n_values that exist in results for this method (skip all-NaN)
-            def _imses(n):
-                return [v["imse"] for v in vals[n]]
+            # Get n_values that exist in results for this method (skip all-NaN).
+            #
+            # .get, not [...]: result files written before these metrics existed
+            # (full999_merged.json) carry only `imse`, and merging new results into a
+            # copy of one must degrade to an empty curve rather than a KeyError.
+            def _metric_vals(n):
+                return [v.get(metric_key, float("nan")) for v in vals[n]]
 
             ns = [n for n in n_values if n in vals
                   and len(vals[n]) > 0
-                  and np.any(np.isfinite(_imses(n)))]
+                  and np.any(np.isfinite(_metric_vals(n)))]
             if not ns:
                 continue
 
-            # --- Top row: mean iMSE with 95% CI (t-distribution) ---
+            # --- Top row: metric mean with 95% CI (t-distribution) ---
             def _finite(arr):
                 a = np.asarray(arr, dtype=float)
                 return a[np.isfinite(a)]
 
-            means = np.array([np.mean(_finite(_imses(n))) for n in ns])
-            ses = np.array([np.std(_finite(_imses(n)), ddof=1)
-                            / np.sqrt(len(_finite(_imses(n))))
+            means = np.array([np.mean(_finite(_metric_vals(n))) for n in ns])
+            ses = np.array([np.std(_finite(_metric_vals(n)), ddof=1)
+                            / np.sqrt(len(_finite(_metric_vals(n))))
                             for n in ns])
-            t_crit = np.array([t_dist.ppf(0.975, max(len(_finite(_imses(n))) - 1, 1))
+            t_crit = np.array([t_dist.ppf(0.975, max(len(_finite(_metric_vals(n))) - 1, 1))
                                for n in ns])
             hw = t_crit * ses
 
@@ -665,16 +793,16 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
                 color=st["color"], alpha=0.12, zorder=st["zorder"] - 1,
             )
 
-            # --- Bottom row: variance of iMSE with 95% CI (chi-squared) ---
-            variances = np.array([np.var(_finite(_imses(n)), ddof=1) for n in ns])
+            # --- Bottom row: variance of the metric with 95% CI (chi-squared) ---
+            variances = np.array([np.var(_finite(_metric_vals(n)), ddof=1) for n in ns])
             var_lo = np.array([
-                (len(_finite(_imses(n))) - 1) * np.var(_finite(_imses(n)), ddof=1)
-                / chi2_dist.ppf(0.975, max(len(_finite(_imses(n))) - 1, 1))
+                (len(_finite(_metric_vals(n))) - 1) * np.var(_finite(_metric_vals(n)), ddof=1)
+                / chi2_dist.ppf(0.975, max(len(_finite(_metric_vals(n))) - 1, 1))
                 for n in ns
             ])
             var_hi = np.array([
-                (len(_finite(_imses(n))) - 1) * np.var(_finite(_imses(n)), ddof=1)
-                / chi2_dist.ppf(0.025, max(len(_finite(_imses(n))) - 1, 1))
+                (len(_finite(_metric_vals(n))) - 1) * np.var(_finite(_metric_vals(n)), ddof=1)
+                / chi2_dist.ppf(0.025, max(len(_finite(_metric_vals(n))) - 1, 1))
                 for n in ns
             ])
 
@@ -694,20 +822,26 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
         # --- Axes formatting ---
         for row_axes in (ax_mean, ax_var):
             row_axes[col].set_xscale("log")
-            row_axes[col].set_yscale("log")
             row_axes[col].set_xticks(n_values)
             row_axes[col].set_xticklabels([str(n) for n in n_values], fontsize=12)
             row_axes[col].tick_params(axis="y", labelsize=12)
             row_axes[col].grid(True, alpha=0.12, linewidth=0.4)
 
+        # The variance is a positive quantity for every metric, so its row stays log
+        # even when the mean row cannot be (Excess goes negative).
+        if spec["log_y"]:
+            ax_mean[col].set_yscale("log")
+        ax_var[col].set_yscale("log")
+
         ax_mean[col].set_title(f"{dgp_name} DGP", fontsize=14,
                                 fontweight="bold", pad=8)
         ax_var[col].set_xlabel("Sample size", fontsize=15)
 
-    # iMSE, not MSE: the quantity is integrated over the time grid, so calling it
-    # MSE in the axis label contradicts every other mention of it in the paper.
-    ax_mean[0].set_ylabel("Average iMSE", fontsize=15)
-    ax_var[0].set_ylabel("Variance of iMSE", fontsize=15)
+    # Labels come from METRIC_SPECS. iMSE's says "iMSE", not "MSE": the quantity is
+    # integrated over the time grid, and calling it MSE would contradict every other
+    # mention of it in the paper.
+    ax_mean[0].set_ylabel(spec["mean_label"], fontsize=15)
+    ax_var[0].set_ylabel(spec["var_label"], fontsize=15)
 
     # Shared legend below all panels.
     #
@@ -717,11 +851,12 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
     # IndexError -- after the fits are done and the summary is printed, so the
     # expensive work is already complete when the plot dies.
     handles, labels = ax_mean[0].get_legend_handles_labels()
-    # True tv-ATE first, then the solid (cross-fitted) methods, then the dashed
+    # The reference line first, then the solid (cross-fitted) methods, then the dashed
     # oracle ones, so the legend reads in the same visual grouping as the panels.
-    preferred = ["True tv-ATE"] + [
+    preferred = ["True tv-ATE", "Truth's reversal count"] + [
         METHOD_LABELS[m]
-        for m in ("AIR", "Tensor-prod", "RSF-T", "RSF-S", "AIR-oracle", "TP-oracle")
+        for m in ("AIR", "Tensor-prod", "RSF-T", "RSF-S", "CSF",
+                  "AIR-oracle", "TP-oracle")
     ]
     rank = {label: i for i, label in enumerate(preferred)}
     # Unknown labels sort last in their existing order rather than being dropped:
@@ -737,10 +872,21 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None):
     fig.tight_layout(rect=[0, 0.06, 1, 1], w_pad=2.5, h_pad=1.5)
     os.makedirs(out_dir, exist_ok=True)
     for ext in ("png", "pdf"):
-        path = os.path.join(out_dir, f"simulation_convergence.{ext}")
+        path = os.path.join(out_dir, f"{spec['stem']}.{ext}")
         fig.savefig(path, dpi=200, bbox_inches="tight")
         print(f"Saved: {path}")
     plt.close(fig)
+
+
+def plot_all_metrics(results, n_values, cfg, X_tests, figures_dir=None, metrics=None):
+    """Render one convergence figure per metric.
+
+    The population-average reference line refits nothing, so looping here costs only
+    the plotting itself -- there is no reason to make the caller choose a metric.
+    """
+    for metric in (metrics or list(METRIC_SPECS)):
+        plot_convergence(results, n_values, cfg, X_tests,
+                         figures_dir=figures_dir, metric=metric)
 
 
 def print_summary(results, n_values):
@@ -779,7 +925,8 @@ def main():
                         help="Run N extra seeds starting from --seed-start, "
                              "saving to a separate file (does not overwrite main results)")
     parser.add_argument("--dgp", type=str, default=None,
-                        help="Filter to a single DGP by name (e.g. 'IST-3 Text')")
+                        help="Comma-separated DGP names to run (e.g. 'Weibull,Mixture'). "
+                             "Names contain no commas, so this is unambiguous.")
     parser.add_argument("--methods", type=str, default=None,
                         help="Comma-separated method names to run (e.g. 'AIR,RSF-T')")
     parser.add_argument("--n-values", type=str, default=None,
@@ -852,7 +999,32 @@ def main():
                              "pseudo-outcome noise floor ~15x. Affects the censoring model "
                              "only, so the oracle and RSF arms are unchanged and stay "
                              "valid as controls.")
+    parser.add_argument("--metric", type=str, default=None,
+                        help="Comma-separated metrics to plot (default: all of "
+                             f"{','.join(METRIC_SPECS)}). Every metric is computed and "
+                             "stored on every run regardless; this only selects figures.")
+    parser.add_argument("--csf-rscript", type=str, default=None,
+                        help="Path to the Rscript binary for the CSF baseline. Needed "
+                             "wherever R is provided by a module rather than being on "
+                             "the conda env's PATH (e.g. Sherlock).")
+    parser.add_argument("--csf-threads", type=int, default=None,
+                        help="Threads for grf's causal survival forest (default 1). "
+                             "The CSF baseline refits one forest per horizon, so a "
+                             "replication is ~M grf fits and raising this speeds a "
+                             "local run up considerably. Runtimes recorded with more "
+                             "than one thread are NOT comparable to the single-core "
+                             "numbers in the results table.")
     args = parser.parse_args()
+
+    # Validated before anything expensive: a typo here would otherwise surface only
+    # after the fits, when the figures are written.
+    if args.metric:
+        plot_metrics = [m.strip() for m in args.metric.split(",") if m.strip()]
+        unknown = [m for m in plot_metrics if m not in METRIC_SPECS]
+        if unknown:
+            parser.error(f"Unknown metric(s) {unknown}. Valid: {list(METRIC_SPECS)}")
+    else:
+        plot_metrics = None
 
     # --- Merge mode ---
     if args.merge:
@@ -864,13 +1036,18 @@ def main():
     if args.plot_only:
         print("Loading saved results...")
         results, n_values, cfg = load_results(args.output or RESULTS_PATH)
-        # Recreate per-DGP test sets
+        # Recreate per-DGP test sets, for the DGPs the file actually holds. Building
+        # all of DGPS unconditionally made re-plotting a two-DGP smoke run impossible
+        # on any machine without the IST-3 embedding artifact, which is gitignored.
         X_tests = {}
         for dgp_name, dgp_class in DGPS:
+            if dgp_name not in results:
+                continue
             X_tests[dgp_name] = _make_test_set(dgp_class, cfg["n_test"])
         print_summary(results, n_values)
         print("\nGenerating plots...")
-        plot_convergence(results, n_values, cfg, X_tests, figures_dir=args.figures_dir)
+        plot_all_metrics(results, n_values, cfg, X_tests,
+                         figures_dir=args.figures_dir, metrics=plot_metrics)
         print(f"All figures saved to {args.figures_dir or FIGURES_DIR}/")
         return
 
@@ -944,14 +1121,27 @@ def main():
     if args.censoring_fix:
         cfg = dict(cfg)
         cfg["censoring_fix"] = True
+    if args.csf_threads is not None:
+        if args.csf_threads < 1:
+            parser.error(f"--csf-threads must be >= 1, got {args.csf_threads}")
+        cfg = dict(cfg)
+        cfg["csf_num_threads"] = args.csf_threads
+    if args.csf_rscript:
+        cfg = dict(cfg)
+        cfg["csf_rscript"] = args.csf_rscript
 
     # --- DGP / method filters ---
     dgps = DGPS
     if args.dgp:
-        dgps = [(n, c) for n, c in DGPS if n == args.dgp]
-        if not dgps:
-            valid = [n for n, _ in DGPS]
-            parser.error(f"Unknown DGP '{args.dgp}'. Valid: {valid}")
+        # Comma-separated, matching --methods. Unknown names are named individually
+        # rather than reported as "no matches", which is the difference between a
+        # one-character typo and a wrong flag.
+        dgp_names = [d.strip() for d in args.dgp.split(",") if d.strip()]
+        valid = [n for n, _ in DGPS]
+        unknown = [d for d in dgp_names if d not in valid]
+        if unknown:
+            parser.error(f"Unknown DGP(s) {unknown}. Valid: {valid}")
+        dgps = [(n, c) for n, c in DGPS if n in dgp_names]
 
     methods = METHODS
     if args.methods:
@@ -960,6 +1150,20 @@ def main():
         if not methods:
             valid = [n for n, _ in METHODS]
             parser.error(f"No matching methods. Valid: {valid}")
+
+    # Fail fast on a missing grf. CSF is unconditionally in METHODS, so without this
+    # check a run on a machine with no grf install fills every CSF cell with nan and
+    # only says so in the summary -- after the whole batch has been paid for.
+    if any(name == "CSF" for name, _ in methods):
+        rscript = cfg.get("csf_rscript", "Rscript")
+        if not grf_available(rscript=rscript):
+            raise SystemExit(
+                f"The CSF baseline needs {rscript!r} on PATH with the grf package "
+                "installed, and one of the two is missing.\n"
+                "Install it with:  Rscript -e 'install.packages(\"grf\")'\n"
+                "Point at a specific R with --csf-rscript /path/to/Rscript, or drop "
+                "CSF with e.g. --methods AIR,Tensor-prod,AIR-oracle,TP-oracle,RSF-T,RSF-S"
+            )
 
     # --- Extra-seeds mode ---
     if args.extra_seeds is not None:
@@ -975,7 +1179,7 @@ def main():
     results_path = args.output or extra_path or RESULTS_PATH
 
     print("=" * 70)
-    print("Convergence Simulation: iMSE vs Sample Size")
+    print("Convergence Simulation: trajectory metrics vs Sample Size")
     print(f"  n_values = {cfg['n_values']}")
     seed_start = cfg.get("seed_start", 0)
     print(f"  seeds    = {seed_start}..{seed_start + cfg['n_seeds'] - 1} ({cfg['n_seeds']} seeds)")
@@ -996,7 +1200,8 @@ def main():
 
     if not extra_path and not args.output:
         print("\nGenerating plots...")
-        plot_convergence(results, n_values, cfg, X_tests, figures_dir=args.figures_dir)
+        plot_all_metrics(results, n_values, cfg, X_tests,
+                         figures_dir=args.figures_dir, metrics=plot_metrics)
         print(f"All figures saved to {args.figures_dir or FIGURES_DIR}/")
 
 

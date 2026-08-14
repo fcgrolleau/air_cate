@@ -23,6 +23,7 @@ _JAMA = {
     "blue":   "#00a1d5",
     "red":    "#b24745",
     "green":  "#79af97",
+    "purple": "#6a6599",
 }
 
 #: Public alias for the palette, so example scripts import it instead of

@@ -13,7 +13,7 @@ OUTPUT_PATH = os.path.join(
 )
 
 DGPS = ["Weibull", "Mixture", "IST-3"]
-METHODS = ["AIR-oracle", "TP-oracle", "AIR", "Tensor-prod", "RSF-T", "RSF-S"]
+METHODS = ["AIR-oracle", "TP-oracle", "AIR", "Tensor-prod", "RSF-T", "RSF-S", "CSF"]
 COL_HEADERS = [
     "MGD",
     "TP",
@@ -21,11 +21,14 @@ COL_HEADERS = [
     "TP",
     "T-learner",
     "S-learner",
+    "grf",
 ]
+# Spans must sum to len(METHODS); col_spec below derives its width from that too.
 GROUP_HEADERS = [
     (r"AIR (oracle nuis.)", 2),
     (r"Cross-fitted AIR", 2),
     (r"RSF baselines", 2),
+    (r"Causal surv. forest", 1),
 ]
 
 
@@ -192,6 +195,12 @@ def make_table(results, n_values):
             cells = [dgp_label, f"${n_fmt}$"]
             for method in METHODS:
                 mean, se, rt, se_rt = stats[method]
+                # A cell with no replications has no runtime either. compute_stats
+                # returns 0.0 for it, which would print as "0s (0s)" and read as an
+                # instantaneous fit rather than a method that was not run at this n.
+                if math.isnan(mean):
+                    cells.append("---")
+                    continue
                 is_best = method == best_method
                 imse_str = fmt_imse(mean, se, bold=is_best)
                 rt_str = fmt_runtime(rt, se_rt)

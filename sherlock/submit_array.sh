@@ -27,6 +27,28 @@
 # Overrides must be an ENVIRONMENT PREFIX, never --export: SLURM splits --export on
 # commas with no escape, so any comma-bearing value is silently truncated.
 #
+# THE 200-SEED TRAJECTORY-METRICS RUN (RUNBOOK section 5b). 999 seeds is overkill --
+# the full999 CIs are already very tight -- and the new metrics (derivative MSE, H1,
+# excess reversals) come from the same fits, so 200 seeds buys the same figures for a
+# fifth of the queue. N_SEEDS=200, BLOCK=5 -> 40 blocks -> 3 x 6 x 40 = 720 tasks, and
+# CSF's 600 tasks go through submit_csf.sh with the SAME RUN_TAG so one collect merges
+# both shards. Memory ranges are re-derived for 40 blocks, not copied from above:
+#
+#   for r in 0-159 240-399 480-639; do            # AIR, Tensor-prod, both oracles
+#       CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=$r \
+#           --mem-per-cpu=16G sherlock/submit_array.sh
+#   done
+#   for r in 160-239 400-479 640-719; do          # RSF-T, RSF-S -- these need 32G
+#       CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=$r \
+#           sherlock/submit_array.sh
+#   done
+#   CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=0-599 \
+#       sherlock/submit_csf.sh
+#
+# N_SEEDS must be passed to EVERY call in the run, including the CSF one. It changes
+# N_BLOCKS, hence the whole index mapping: omitting it on one call makes those tasks
+# decode their ids under the 200-block layout and write another arm's filenames.
+#
 # Pilot (seeds 0-4 for all 18 DGP x method pairs = the 18 tasks with BLOCK_IDX 0).
 # GIVE IT ITS OWN TAG. Without RUN_TAG it writes full999_* files into the full run's
 # directory, and if it also omits CENSORING_FIX those cells hold fix-OFF results that
@@ -48,8 +70,12 @@
 #   done
 
 # --- Array index mapping ---
-# 3600 tasks = 3 DGPs x 6 methods x 200 seed-blocks of 5 seeds (999 seeds total).
+# 3 DGPs x 6 methods x ceil(N_SEEDS / BLOCK) seed-blocks. At the default 999 seeds and
+# BLOCK=5 that is 200 blocks and 3600 tasks; at N_SEEDS=200 it is 40 blocks and 720.
 # task_id -> (dgp_idx, method_idx, block_idx); block_idx varies fastest.
+#
+# EVERY range below is stated for the 3600-task layout. Change N_SEEDS and the ranges
+# move with N_BLOCKS -- the 200-seed recipe above has its own, re-derived.
 #
 # Each task runs one (DGP, method) over 5 consecutive seeds x all 6 sample sizes.
 #
@@ -84,10 +110,18 @@
 # ids of each DGP: 800-1199, 2000-2399, 3200-3599.
 
 DGPS=("Weibull" "Mixture" "IST-3")
+# Six methods, deliberately not seven. CSF (grf's causal survival forest) has its own
+# script, sherlock/submit_csf.sh: it refits one forest per horizon, so a single seed
+# across the ladder costs ~2.1h against 0.71h for a whole 5-seed AIR block. That wants
+# BLOCK=1 and a much longer wall -- a different task shape, not another index here.
 METHODS=("AIR" "Tensor-prod" "AIR-oracle" "TP-oracle" "RSF-T" "RSF-S")
-N_SEEDS=999
-BLOCK=5
-N_BLOCKS=200   # ceil(999 / 5)
+
+# Overridable so the 200-seed run does not need a second copy of this script, with
+# the 999-seed headline recipe as the default so it stays byte-reproducible.
+N_SEEDS="${N_SEEDS:-999}"
+BLOCK="${BLOCK:-5}"
+N_BLOCKS=$(((N_SEEDS + BLOCK - 1) / BLOCK))   # ceil
+N_TASKS=$((${#DGPS[@]} * ${#METHODS[@]} * N_BLOCKS))
 
 # Respecify the CENSORING nuisance: drop its hidden layers, so the Weibull shape and
 # scale are each a softplus of a single linear index in x (32 weights on IST-3)
@@ -125,21 +159,21 @@ RUN_TAG="${RUN_TAG:-full999}"
 
 TASK_ID=${SLURM_ARRAY_TASK_ID}
 BLOCK_IDX=$((TASK_ID % N_BLOCKS))
-METHOD_IDX=$(((TASK_ID / N_BLOCKS) % 6))
-DGP_IDX=$((TASK_ID / (N_BLOCKS * 6)))
+METHOD_IDX=$(((TASK_ID / N_BLOCKS) % ${#METHODS[@]}))
+DGP_IDX=$((TASK_ID / (N_BLOCKS * ${#METHODS[@]})))
 
 DGP="${DGPS[$DGP_IDX]}"
 METHOD="${METHODS[$METHOD_IDX]}"
 
-# Fail loudly on an --array wider than 3600. Without this, task 3600+ gets an empty
-# DGP, passes --dgp "" to the harness, and fails in a way that looks like a code bug
-# rather than a typo in a range. Six ranges get typed by hand now, so this earns
-# its keep.
+# Fail loudly on an --array wider than the mapping. Without this, an out-of-range task
+# gets an empty DGP, passes --dgp "" to the harness, and fails in a way that looks like
+# a code bug rather than a typo in a range. Six ranges get typed by hand now, so this
+# earns its keep -- and the bound moves with N_SEEDS, so it must be computed.
 if [ -z "$DGP" ] || [ -z "$METHOD" ]; then
     echo "ERROR: task ${TASK_ID} maps to dgp index ${DGP_IDX} / method index" \
-         "${METHOD_IDX}, which is out of range. Valid ids are 0-3599" \
-         "(${#DGPS[@]} DGPs x ${#METHODS[@]} methods x ${N_BLOCKS} blocks)." \
-         "Fix your --array range."
+         "${METHOD_IDX}, which is out of range. Valid ids are 0-$((N_TASKS - 1))" \
+         "(${#DGPS[@]} DGPs x ${#METHODS[@]} methods x ${N_BLOCKS} blocks" \
+         "at N_SEEDS=${N_SEEDS}, BLOCK=${BLOCK}). Fix your --array range."
     exit 1
 fi
 

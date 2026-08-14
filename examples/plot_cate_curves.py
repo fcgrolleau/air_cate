@@ -1,6 +1,6 @@
 """Plot predicted time-varying tv-CATE curves for test observations.
 
-Fits 4 non-oracle methods on one training draw (Weibull DGP) and overlays their
+Fits 5 non-oracle methods on one training draw (Weibull DGP) and overlays their
 predicted tau(t|x) against the true tv-CATE.
 
 Two outputs:
@@ -12,20 +12,30 @@ Two outputs:
 Survival Forest predictions are step functions (cadlag / piecewise constant), so
 they are drawn with steps-post rather than linear interpolation.
 
-Reproducibility. Predictions depend on four independent random streams and all
-four are pinned by --seed: `keras.utils.set_random_seed` covers Keras/JAX weight
+This is the figure where the pointwise-horizon limitation is visible rather than
+merely asserted. The causal survival forest is refit from scratch at every one of
+the M grid points, with nothing tying neighbouring horizons together, so its
+curve wanders between adjacent t while the AIR curves -- continuous in t by
+construction -- do not. Requires R with the grf package; `grf_available` is
+checked before any fitting starts rather than after the other four methods have
+already been paid for.
+
+Reproducibility. Predictions depend on five independent random streams and all
+five are pinned by --seed: `keras.utils.set_random_seed` covers Keras/JAX weight
 initialisation (and the Python/NumPy global RNGs), `rng_seed=` covers the CATE
-minibatch order, `random_state=` covers the survival forests, and the DGP takes
-its own `rng_seed`. Nuisance cross-fitting splits are already deterministic
-(rng_seed=42 inside cross_fit). The configuration that produced a cache is stored
-inside the .npz, and --plot-only refuses a cache some other configuration wrote:
-a stale cache does not error, it silently plots the wrong curves.
+minibatch order, `random_state=` covers the survival forests, `seed=` covers
+grf's C++ generator, and the DGP takes its own `rng_seed`. Nuisance cross-fitting
+splits are already deterministic (rng_seed=42 inside cross_fit). The
+configuration that produced a cache is stored inside the .npz, and --plot-only
+refuses a cache some other configuration wrote: a stale cache does not error, it
+silently plots the wrong curves.
 
 Usage:
   uv run --extra plots python examples/plot_cate_curves.py --seed 0
   uv run --extra plots python examples/plot_cate_curves.py --seed 0 --plot-only --obs 81
 
-  # Presentation-size figure, in two steps. Step 1 fits (~4 min) and caches;
+  # Presentation-size figure, in two steps. Step 1 fits (~9 min: about 4 for the
+  # four in-process methods and 5 for the M single-horizon grf forests) and caches;
   # --no-single keeps it from overwriting the paper-size cate_curves.{png,pdf}.
   # Step 2 restyles from the cache in seconds, so the subject and the styling can
   # be re-picked without refitting.
@@ -51,6 +61,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
 
 from air_cate import AIREstimator  # sets KERAS_BACKEND=jax; import before keras
 from air_cate.baselines import SurvivalForestTLearner, SurvivalForestSLearner
+from air_cate.baselines_csf import CausalSurvivalForest, grf_available
 from air_cate.cate_model.tensor_product import CATETensorProduct
 from air_cate.plotting import PALETTE, apply_style
 from conftest import WeibullDGP
@@ -68,19 +79,38 @@ os.makedirs(FIGURES_DIR, exist_ok=True)
 # Survival Forest predictions are piecewise constant: connect the grid points as
 # a cadlag step function ("steps-post") instead of interpolating linearly. The
 # staircase stays connected (vertical risers are drawn), so no visible gaps.
+#
+# The causal survival forest gets "default" rather than "steps-post": it is not a
+# step function but M independently fitted point estimates, one forest per
+# horizon, so linear interpolation between them is the honest reading. Drawing it
+# as a staircase would suggest a piecewise-constant structure the estimator never
+# claims, and would visually smooth over the horizon-to-horizon variation that is
+# the whole point of showing it here. Labels match METHOD_LABELS in
+# plot_simulation.py so the two figures name the same method identically.
 METHODS = [
-    ("Cross-fitted AIR w/ MGD",    PALETTE["teal"],   "-",  2.2, "default"),
-    ("Cross-fitted AIR w/ TP",     PALETTE["orange"], "-",  2.2, "default"),
-    ("Survival Forest T-learner",  PALETTE["red"],    "-",  2.2, "steps-post"),
-    ("Survival Forest S-learner",  PALETTE["green"],  "-",  2.2, "steps-post"),
+    ("Cross-fitted AIR w/ MGD",      PALETTE["teal"],   "-",  2.2, "default"),
+    ("Cross-fitted AIR w/ TP",       PALETTE["orange"], "-",  2.2, "default"),
+    ("Survival Forest T-learner",    PALETTE["red"],    "-",  2.2, "steps-post"),
+    ("Survival Forest S-learner",    PALETTE["green"],  "-",  2.2, "steps-post"),
+    ("Causal Survival Forest (grf)", PALETTE["purple"], "-",  2.2, "default"),
 ]
 
-# Legend text for the single-subject figure only. METHODS labels are also used
-# for the contact-sheet titles and the console ranking table, both of which
-# shorten a label via label.split()[-1] -- renaming there would yield "method)".
+# Legend text for the single-subject figure only.
 FIGURE_LABEL_OVERRIDES = {
     "Cross-fitted AIR w/ MGD": "Cross-fitted AIR w/ MGD (our method)",
 }
+
+# Abbreviations for the contact-sheet panel titles and the console ranking table,
+# where a full label does not fit. The default takes the last word of the label,
+# which is what those call sites did inline; only labels whose last word is
+# uninformative ("(grf)") need an entry here.
+SHORT_LABELS = {
+    "Causal Survival Forest (grf)": "CSF",
+}
+
+
+def short_label(label):
+    return SHORT_LABELS.get(label, label.split()[-1])
 
 # One short flag for the presentation-size figure, so it is reproduced by name
 # rather than by retyping eight numbers. An explicit flag still wins.
@@ -108,6 +138,12 @@ COMMON_AIR = dict(
 MGD_KWARGS = dict(K=3, encoder_hidden_sizes=(32, 16))
 TP_KWARGS = dict(n_time_basis=8, poly_degree=2)
 FOREST_KWARGS = dict(n_estimators=200, min_samples_leaf=10)
+# grf defaults, matching the simulation harness. num_threads is pinned to 1 rather
+# than left at grf's hardware-concurrency default: this script's contract is that a
+# --seed reproduces a curve exactly, and single-threaded training is the
+# configuration where that is unambiguous. It costs about five minutes at M=50,
+# since every horizon is a separate forest.
+CSF_KWARGS = dict(num_trees=2000, num_threads=1)
 
 
 def run_config(seed, test_seed):
@@ -129,6 +165,7 @@ def run_config(seed, test_seed):
                 "encoder_hidden_sizes": list(MGD_KWARGS["encoder_hidden_sizes"])},
         "tp": TP_KWARGS,
         "forest": FOREST_KWARGS,
+        "csf": CSF_KWARGS,
     }
 
 
@@ -141,12 +178,24 @@ def cache_path(seed):
 # ---------------------------------------------------------------------------
 
 def fit_all_methods(seed, test_seed):
-    """Fit 4 methods on the Weibull DGP, return predictions for all test subjects.
+    """Fit 5 methods on the Weibull DGP, return predictions for all test subjects.
 
     Seeding is exhaustive -- see the module docstring. `set_random_seed` also
     reseeds the Python and NumPy global RNGs, but the CATE minibatch order draws
-    from its own generator, so `rng_seed=` has to be passed explicitly.
+    from its own generator, so `rng_seed=` has to be passed explicitly. The causal
+    survival forest takes `seed=` explicitly too, rather than inheriting the global
+    NumPy RNG the way it does under the simulation harness.
     """
+    # Checked before anything is fitted. The causal survival forest is fitted last
+    # and needs an external R process, so a missing grf would otherwise only be
+    # discovered after the four in-process methods had already been paid for.
+    if not grf_available():
+        raise SystemExit(
+            "The causal survival forest baseline needs R with the grf package, and "
+            "it is not available.\n"
+            "  Install it with:  Rscript -e 'install.packages(\"grf\")'"
+        )
+
     keras.utils.set_random_seed(seed)
     X_train, W, Z, Delta, t_end = WeibullDGP.generate(n=N_TRAIN, rng_seed=seed)
 
@@ -160,14 +209,27 @@ def fit_all_methods(seed, test_seed):
                      cate_model_kwargs=dict(TP_KWARGS)),
         SurvivalForestTLearner(M=M, random_state=seed, **FOREST_KWARGS),
         SurvivalForestSLearner(M=M, random_state=seed, **FOREST_KWARGS),
+        CausalSurvivalForest(M=M, seed=seed, **CSF_KWARGS),
     ]
 
     tau_hats_all = []  # list of (N_TEST, M+1) arrays
     for est in estimators:
-        print(f"  Fitting {est.__class__.__name__} ...", end=" ", flush=True)
+        is_csf = isinstance(est, CausalSurvivalForest)
+        note = f" ({M} forests, one per horizon)" if is_csf else ""
+        print(f"  Fitting {est.__class__.__name__}{note} ...", end=" ", flush=True)
         est.fit(X_train, W, Z, Delta, t_end, verbose=0)
         tau_hats_all.append(np.asarray(est.predict_tau(X_test)))
         print("done")
+        if is_csf:
+            # A horizon grf refuses (one past the last observed failure time) is
+            # held forward from the previous one, which flattens the tail of the
+            # drawn curve. Report it rather than letting the plot imply an estimate
+            # was made there. The out-of-range fraction is the structural validity
+            # AIR has by construction and this baseline does not.
+            print(f"    horizons grf could not fit: "
+                  f"{est.n_failed_horizons_}/{M};  "
+                  f"|tau_hat| > 1 at "
+                  f"{100 * est.frac_out_of_range_:.2f}% of grid points")
 
     t_grid = np.asarray(estimators[0].time_grid_)
     delta = float(estimators[0].delta_)
@@ -250,7 +312,7 @@ def report_fit_health(tau_true, tau_hats_all):
     for (label, *_), tau_hat in zip(METHODS, tau_hats_all):
         r = med_range(tau_hat)
         flag = "  <-- COLLAPSED to ~0" if r < 0.1 * true_range else ""
-        print(f"  {label:<28} {r:.4f}{flag}")
+        print(f"  {label:<30} {r:.4f}{flag}")
 
 
 def rank_observations(imse, tau_true, top=15):
@@ -264,7 +326,7 @@ def rank_observations(imse, tau_true, top=15):
     print(f"\nAIR w/ MGD has the lowest iMSE for {n_win}/{len(tau_range)} subjects.")
     print(f"Top {top} candidates (AIR wins, largest true tv-CATE range):")
     print(f"  {'obs':>5}  {'range':>7}  " +
-          "  ".join(f"{lab.split()[-1][:7]:>7}" for lab, *_ in METHODS))
+          "  ".join(f"{short_label(lab)[:7]:>7}" for lab, *_ in METHODS))
     for idx in order[:top]:
         if not np.isfinite(score[idx]):
             break
@@ -309,6 +371,11 @@ def plot_all_observations(t_grid, tau_true, tau_hats_all, imse, seed,
     per_page = n_cols * n_rows
     n_pages = int(np.ceil(n_test / per_page))
     handles, labels = _legend_handles()
+    # The labels are long enough that more than three per row overruns the page
+    # width, so the legend wraps. The bottom margin tight_layout reserves has to
+    # grow with the row count, or the last row of panels sits on top of it.
+    legend_ncol = 3
+    n_legend_rows = -(-len(labels) // legend_ncol)
 
     path = os.path.join(FIGURES_DIR, f"cate_curves_all_seed{seed}.pdf")
     with PdfPages(path) as pdf:
@@ -328,7 +395,7 @@ def plot_all_observations(t_grid, tau_true, tau_hats_all, imse, seed,
                             [th[idx] for th in tau_hats_all], lw_scale=0.65)
                 winner = int(np.argmin(imse[:, idx]))
                 ax.set_title(
-                    f"obs {idx}  (best: {labels[winner + 1].split()[-1]}, "
+                    f"obs {idx}  (best: {short_label(labels[winner + 1])}, "
                     f"AIR iMSE {imse[0, idx]:.3f})",
                     fontsize=7.5, pad=3)
                 ax.tick_params(labelsize=6.5)
@@ -342,10 +409,11 @@ def plot_all_observations(t_grid, tau_true, tau_hats_all, imse, seed,
                 f"{start}-{min(start + per_page, n_test) - 1} "
                 f"of {n_test}   [page {page + 1}/{n_pages}]",
                 fontsize=11, fontweight="bold", y=0.995)
-            fig.legend(handles, labels, loc="lower center", ncol=5,
+            fig.legend(handles, labels, loc="lower center", ncol=legend_ncol,
                        fontsize=8, frameon=False, bbox_to_anchor=(0.5, 0.002),
                        columnspacing=1.5, handletextpad=0.6)
-            fig.tight_layout(rect=[0, 0.035, 1, 0.975])
+            fig.tight_layout(
+                rect=[0, 0.014 + 0.022 * n_legend_rows, 1, 0.975])
             pdf.savefig(fig)
             plt.close(fig)
 
@@ -378,9 +446,17 @@ def plot_curves(t_grid, tau_true_i, tau_hats_i, obs_idx, seed,
 
     handles, labels = ax.get_legend_handles_labels()
     labels = [FIGURE_LABEL_OVERRIDES.get(lab, lab) for lab in labels]
+    # loc="lower center" anchors the legend's *bottom* edge, so a legend that wraps
+    # to a second row grows upward into the axes and over the x label. Push the
+    # anchor down by the extra rows' height so the clearance above the legend stays
+    # the legend_pad that was asked for. Roughly 1.6 line-heights per row, 72pt to
+    # the inch.
+    n_legend_rows = -(-len(labels) // legend_ncol)
+    row_height = 1.6 * 8 * font_scale / (72 * figsize[1])
+    pad = legend_pad + (n_legend_rows - 1) * row_height
     fig.legend(handles, labels, loc="lower center", ncol=legend_ncol,
                fontsize=8 * font_scale, frameon=False,
-               bbox_to_anchor=(0.5, -legend_pad),
+               bbox_to_anchor=(0.5, -pad),
                columnspacing=1.5, handletextpad=0.6)
 
     fig.tight_layout(rect=[0, rect_bottom, 1, 1])
