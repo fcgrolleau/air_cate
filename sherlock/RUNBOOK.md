@@ -973,10 +973,15 @@ across the ladder costs ~2.1h against 0.71h for an entire 5-seed AIR block. And 
 and therefore the whole task-id → (DGP, method, seed-block) mapping; a call that omits it decodes
 its ids under the 200-block default and writes another arm's filenames without erroring.
 
-### Stage 2 — the ~2 hour shakedown (10 seeds, all 3 DGPs, all 7 methods)
+### Stage 2 — the ~2 hour shakedown (10 seeds, ladder ≤ 10000, all 3 DGPs, all 7 methods)
 
 Validates the resharded array, the R module on the compute nodes, and per-cell CSF runtimes for
 sizing stage 3. Its own `RUN_TAG`, so it cannot land on the 200-seed partials and be resume-skipped.
+
+`N_VALUES` caps the ladder at 10000 for this stage. The top rung costs more than the whole rest
+of the ladder combined on CSF (~82 min against ~42 min for n=500..10000 together), and it
+validates nothing the 10000 rung does not — the point here is that the pipeline runs end to end
+on the cluster, not that it scales. Stage 3 leaves `N_VALUES` unset and gets all six rungs.
 
 ```bash
 mkdir -p sherlock/logs
@@ -988,14 +993,23 @@ module load R
 Rscript -e 'install.packages("grf", repos="https://cloud.r-project.org")'
 Rscript -e 'cat(requireNamespace("grf", quietly = TRUE))'   # want: TRUE
 
+# The section-1 staleness check, for the variable THIS stage depends on. Run on the
+# CLUSTER copy, from ~/air_cate_full, after the rsync. N_VALUES is new in this revision,
+# so a stale script does not error on it -- it ignores it and runs all six rungs, making
+# the shakedown cost what stage 3 costs and hiding the fact in a correctly-named
+# directory. This is exactly the failure that cost a submit-cancel-resubmit on
+# 2026-08-11.
+grep -c '^N_VALUES=' sherlock/submit_array.sh    # want 1
+grep -c '^N_VALUES=' sherlock/submit_csf.sh      # want 1
+
 # Six-method shard: N_SEEDS=10, BLOCK=5 -> 2 blocks -> 3 x 6 x 2 = 36 tasks.
 # 32G throughout: only 12 of the 36 are RSF, so the memory split is not worth the typing.
-CENSORING_FIX=1 RUN_TAG=metrics10 N_SEEDS=10 sbatch --array=0-35 \
-    sherlock/submit_array.sh
+CENSORING_FIX=1 RUN_TAG=metrics10 N_SEEDS=10 N_VALUES=500,1000,2000,5000,10000 \
+    sbatch --array=0-35 sherlock/submit_array.sh
 
 # CSF shard: 3 x 10 = 30 tasks, one seed each.
-CENSORING_FIX=1 RUN_TAG=metrics10 N_SEEDS=10 sbatch --array=0-29 \
-    sherlock/submit_csf.sh
+CENSORING_FIX=1 RUN_TAG=metrics10 N_SEEDS=10 N_VALUES=500,1000,2000,5000,10000 \
+    sbatch --array=0-29 sherlock/submit_csf.sh
 
 # Both shards write the same RESULTS_DIR under the same RUN_TAG prefix, so ONE collect
 # merges them -- collect_results.sh globs by prefix and is method-agnostic.

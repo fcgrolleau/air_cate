@@ -74,6 +74,17 @@ else
     CFIX_FLAG=""
 fi
 
+# Sample-size ladder; see the same block in submit_array.sh. It matters more here than
+# there: a CSF replication is M+1 grf fits, and the n=20000 rung alone measured ~82 min
+# against ~42 min for the whole rest of the ladder combined. Capping at 10000 roughly
+# halves this shard, which is what makes the stage-2 shakedown cheap.
+N_VALUES="${N_VALUES:-}"
+if [ -n "$N_VALUES" ]; then
+    NVAL_FLAG="--n-values $N_VALUES"
+else
+    NVAL_FLAG=""
+fi
+
 # RUN_TAG moves the scratch directory AND the filename prefix together. The in-task
 # resume logic SKIPS any (n, seed) cell already present in OUTFILE, so a run writing
 # another arm's filenames would load that arm's answers, find every cell present, and
@@ -101,7 +112,8 @@ fi
 
 echo "Task ${TASK_ID}: DGP=${DGP}, Method=CSF, block=${BLOCK_IDX}," \
      "seeds ${SEED_START}..$((SEED_START + N_THIS - 1)) (${N_THIS} seeds)," \
-     "censoring_fix=${CENSORING_FIX}, tag=${RUN_TAG}"
+     "censoring_fix=${CENSORING_FIX}, n_values=${N_VALUES:-full ladder}," \
+     "tag=${RUN_TAG}"
 echo "Node: $(hostname), Start: $(date)"
 
 # --- Activate conda environment ---
@@ -158,9 +170,10 @@ python examples/plot_simulation.py --large \
     --seed-start "$SEED_START" \
     --extra-seeds "$N_THIS" \
     --output "$OUTFILE" \
-    $CFIX_FLAG
-    # CFIX_FLAG is deliberately UNQUOTED and last. Unquoted, an empty value vanishes;
-    # quoted, it would hand argparse an empty-string argument.
+    $NVAL_FLAG $CFIX_FLAG
+    # Both flags are deliberately UNQUOTED and last. Unquoted, an empty value vanishes;
+    # quoted, it would hand argparse an empty-string argument. NVAL_FLAG relies on the
+    # same splitting to become two words; commas are not in IFS, so the list survives.
 
 STATUS=$?
 echo "Done: $(date), Exit code: ${STATUS}"

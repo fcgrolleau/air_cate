@@ -144,6 +144,24 @@ else
     CFIX_FLAG=""
 fi
 
+# Sample-size ladder. Unset (the default) means the harness's own LARGE_CONFIG ladder,
+# six rungs to n=20000, which is what every headline run uses -- so leaving this alone
+# reproduces those runs exactly. Set it to cap the ladder for a shakedown:
+# N_VALUES=500,1000,2000,5000,10000 drops the top rung, which is over half the cost of
+# the whole ladder and proves nothing about the pipeline that 10000 does not.
+#
+# NOT part of RUN_TAG, unlike CENSORING_FIX, and that asymmetry is deliberate but sharp:
+# resume skips by (n, seed), so a capped run and a full run under the SAME tag compose
+# correctly -- the full one fills in the missing top rung rather than being skipped. Two
+# runs with DIFFERENT ladders and different specifications, however, would silently
+# merge. Vary this alone, or vary the tag too.
+N_VALUES="${N_VALUES:-}"
+if [ -n "$N_VALUES" ]; then
+    NVAL_FLAG="--n-values $N_VALUES"
+else
+    NVAL_FLAG=""
+fi
+
 # RUN_TAG moves the scratch directory AND the filename prefix together, which is the
 # only safe way to vary a setting. The in-task resume logic SKIPS any (n, seed) cell
 # already present in OUTFILE, so a censoring-fix run writing the old run's filenames
@@ -186,7 +204,8 @@ fi
 
 echo "Task ${TASK_ID}: DGP=${DGP}, Method=${METHOD}, block=${BLOCK_IDX}," \
      "seeds ${SEED_START}..$((SEED_START + N_THIS - 1)) (${N_THIS} seeds)," \
-     "censoring_fix=${CENSORING_FIX}, tag=${RUN_TAG}"
+     "censoring_fix=${CENSORING_FIX}, n_values=${N_VALUES:-full ladder}," \
+     "tag=${RUN_TAG}"
 echo "Node: $(hostname), Start: $(date)"
 
 # --- Activate conda environment ---
@@ -220,10 +239,12 @@ python examples/plot_simulation.py --large \
     --seed-start "$SEED_START" \
     --extra-seeds "$N_THIS" \
     --output "$OUTFILE" \
-    $CFIX_FLAG
-    # CFIX_FLAG is deliberately UNQUOTED and last. Unquoted, an empty value vanishes;
+    $NVAL_FLAG $CFIX_FLAG
+    # Both flags are deliberately UNQUOTED and last. Unquoted, an empty value vanishes;
     # quoted, it would hand argparse an empty-string argument and every task in the
-    # arm that leaves the flag unset would die at parse time.
+    # arm that leaves the flag unset would die at parse time. NVAL_FLAG relies on the
+    # same splitting to become two words ("--n-values" and the list); commas are not in
+    # IFS, so the list itself survives as one argument.
 
 STATUS=$?
 echo "Done: $(date), Exit code: ${STATUS}"
