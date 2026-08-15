@@ -42,6 +42,12 @@ Usage:
   uv run --extra plots python examples/plot_cate_curves.py --seed 2 --no-single
   uv run --extra plots python examples/plot_cate_curves.py --seed 2 --plot-only \
       --obs 52 --preset presentation --out-stem cate_curves_seed2_obs52
+
+  # Same figure for a non-technical audience: --preset explainer is
+  # "presentation" plus the favors-intervention / favors-control arrows beside
+  # the zero line and plain-language axis labels (y ticks in percentage points).
+  uv run --extra plots python examples/plot_cate_curves.py --seed 2 --plot-only \
+      --obs 24 --preset explainer --out-stem cate_curves_seed2_obs24_explainer
 """
 
 import argparse
@@ -55,6 +61,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
+from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
@@ -100,6 +107,32 @@ FIGURE_LABEL_OVERRIDES = {
     "Cross-fitted AIR w/ MGD": "Cross-fitted AIR w/ MGD (our method)",
 }
 
+# Plain-language relabelling for a non-technical audience (--plain-labels). Only
+# the quantities are renamed, never the methods: the method names have to keep
+# matching the paper and plot_simulation.py, whereas "tv-CATE" and
+# "$\hat{\tau}(t \mid x)$" carry no meaning for a reader who has not read the
+# paper. Under --plain-labels the y axis is also rescaled to percentage points,
+# which is how a difference of two survival probabilities is normally read.
+PLAIN_LABEL_OVERRIDES = {
+    "True tv-CATE": "True effect",
+    # "TP" spelled out, and the grf package name dropped: both are
+    # implementation detail to a reader outside the project. The methods
+    # themselves are still named as the paper names them.
+    "Cross-fitted AIR w/ TP": "Cross-fitted AIR w/ Tensor-Product",
+    "Causal Survival Forest (grf)": "Causal Survival Forest",
+}
+PLAIN_XLABEL = "Time since treatment"
+# Wrapped across two lines: at presentation font sizes the one-line form is
+# taller than the axes it labels.
+PLAIN_YLABEL = "Difference in survival probability\n(i.e., tv-CATE)"
+
+# Text beside the two arrows flanking the zero line. tau = S_1 - S_0, so tau > 0
+# means the treated arm has the higher survival probability -- up is the
+# intervention, down is the control. Do not flip these without flipping the sign
+# convention in WeibullDGP.true_tau.
+FAVORS_UP_LABEL = "Favors intervention"
+FAVORS_DOWN_LABEL = "Favors control"
+
 # Abbreviations for the contact-sheet panel titles and the console ranking table,
 # where a full label does not fit. The default takes the last word of the label,
 # which is what those call sites did inline; only labels whose last word is
@@ -118,6 +151,19 @@ PRESETS = {
     "presentation": dict(
         single_only=True, no_title=True, font_scale=2.0, lw_scale=1.3,
         legend_ncol=2, figsize="10,6.4", legend_pad=0.085, rect_bottom=0.10,
+    ),
+    # "presentation" plus the two readability changes for a non-technical
+    # audience: the favors-intervention / favors-control arrows on the right and
+    # plain-language axis labels. Kept as its own preset so the paper and
+    # presentation figures are byte-for-byte unaffected. rect_bottom drops to
+    # 0.02 because the legend is drawn below the canvas and bbox_inches="tight"
+    # grows it anyway -- the 0.10 "presentation" reserves is dead white space
+    # between the x label and the legend, and the panel is easier to read with
+    # that height given back to the axes.
+    "explainer": dict(
+        single_only=True, no_title=True, font_scale=2.0, lw_scale=1.3,
+        legend_ncol=2, figsize="10,6.4", legend_pad=0.085, rect_bottom=0.02,
+        favors_arrows=True, plain_labels=True, ylim="-0.20,0.26",
     ),
 }
 
@@ -340,8 +386,14 @@ def rank_observations(imse, tau_true, top=15):
 # Plots
 # ---------------------------------------------------------------------------
 
-def _draw_panel(ax, t_grid, tau_true_i, tau_hats_i, lw_scale=1.0):
-    """Draw one subject's curves onto an existing axes."""
+def _draw_panel(ax, t_grid, tau_true_i, tau_hats_i, lw_scale=1.0,
+                emphasize_zero=False):
+    """Draw one subject's curves onto an existing axes.
+
+    emphasize_zero darkens the tau = 0 line. It is on whenever the favors
+    arrows are drawn: those arrows point away from that line, so a 0.4pt
+    hairline is too faint to read as the thing they are anchored to.
+    """
     ax.plot(t_grid, tau_true_i, color="#888888", ls="--", lw=1.4 * lw_scale,
             label="True tv-CATE", zorder=6)
 
@@ -349,8 +401,102 @@ def _draw_panel(ax, t_grid, tau_true_i, tau_hats_i, lw_scale=1.0):
         ax.plot(t_grid, tau_hat_i, color=color, ls=ls, lw=lw * lw_scale,
                 drawstyle=ds, label=label, zorder=4)
 
-    ax.axhline(0, color="black", lw=0.4, zorder=0)
+    if emphasize_zero:
+        ax.axhline(0, color="#555555", lw=0.9 * lw_scale, zorder=1)
+    else:
+        ax.axhline(0, color="black", lw=0.4, zorder=0)
     ax.grid(True, alpha=0.12, linewidth=0.4)
+
+
+def _draw_favors_arrows(ax, up_label=FAVORS_UP_LABEL,
+                        down_label=FAVORS_DOWN_LABEL, font_scale=1.0,
+                        lw_scale=1.0, color="#333333"):
+    """Draw two vertical arrows just outside the right spine, split at tau = 0.
+
+    One points up from the zero line ("favors intervention"), one down ("favors
+    control"), each with a rotated label alongside. This is what tells a reader
+    who does not know what tau is which direction of the y axis is the good one.
+
+    The two arrows are the same length, and that length is the length of the
+    longer of the two labels, so each arrow reads as the bracket of its own text
+    rather than as a span of the axes. That cannot be hard-coded: the label
+    length in axes units depends on the font size, the figure size and the final
+    axes box, so the labels are drawn first, measured against a real renderer,
+    and the arrows sized from the measurement. Equal length forces the *longer*
+    label to set both, which is why the shorter one sits centred in its arrow
+    with a little slack at each end.
+
+    Everything vertical is therefore in axes fractions rather than data units --
+    the arrow length comes from a pixel measurement, and only the *split point*
+    is a data coordinate, converted once from tau = 0 to its axes fraction.
+
+    Call this AFTER fig.tight_layout(): the measurement is against the axes box,
+    and tight_layout moves it. The arrows and labels sit outside the axes, so
+    they are drawn unclipped; callers save with bbox_inches="tight", which grows
+    the canvas to fit them.
+    """
+    fig = ax.figure
+    y_lo, y_hi = ax.get_ylim()
+    x_arrow, x_label = 1.03, 1.085
+    # tau = 0 as a fraction of the axes height -- where the two arrows part.
+    y_zero = (0.0 - y_lo) / (y_hi - y_lo)
+    # Break at the zero line, as a fraction of the axes height. Without it the
+    # two tails touch and the pair reads as one double-headed line spanning the
+    # axes, which says nothing about zero being the dividing point.
+    gap = 0.02
+
+    texts = {}
+    for sign, label in ((1.0, up_label), (-1.0, down_label)):
+        texts[sign] = ax.text(
+            x_label, y_zero, label, transform=ax.transAxes,
+            rotation=90, ha="center", va="center",
+            # A touch below the tick labels: the arrow length is this text's
+            # length, so the font size sets how much of the axes each arrow
+            # claims, and at the tick-label size the pair needs a y axis running
+            # to -23% on a subject whose curves stop at -8%.
+            fontsize=7.5 * font_scale, color=color, clip_on=False, zorder=8,
+        )
+
+    # Rotated 90 degrees, so a label's on-screen *height* is its text length.
+    # Measured in pixels and divided by the axes height in pixels, which makes
+    # the result independent of the dpi the measurement happens at -- savefig
+    # re-renders at its own dpi, and both terms scale with it.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    axes_h = ax.get_window_extent(renderer).height
+    length = max(t.get_window_extent(renderer).height for t in texts.values())
+    length /= axes_h
+
+    for sign, text in texts.items():
+        tail = y_zero + sign * gap
+        tip = y_zero + sign * (gap + length)
+        ax.annotate(
+            "", xy=(x_arrow, tip), xytext=(x_arrow, tail),
+            xycoords=ax.transAxes, textcoords=ax.transAxes,
+            annotation_clip=False, zorder=8,
+            arrowprops=dict(arrowstyle="-|>", color=color,
+                            lw=1.4 * lw_scale, shrinkA=0, shrinkB=0,
+                            mutation_scale=9 * font_scale),
+        )
+        # Centred on its own arrow, so arrow and label share a midpoint.
+        text.set_position((x_label, 0.5 * (tail + tip)))
+
+    # The arrows are sized by the text, so it is the y limits that have to make
+    # room for them, not the other way round. Say so rather than shipping a
+    # clipped arrow, and say what limit would fit. `need` is the fraction of the
+    # axes height one arrow claims, plus a little clearance; inverting
+    # y_zero = -y_lo / (y_hi - y_lo) at that fraction gives the limit to ask for.
+    need = gap + length + 0.01
+    if y_zero < need:
+        print(f"  note: the 'favors' arrows do not fit below zero at "
+              f"--ylim {y_lo:.3f},{y_hi:.3f} -- each one needs "
+              f"{100 * need:.0f}% of the axes height.\n"
+              f"        try --ylim {-need * y_hi / (1 - need):.3f},{y_hi:.3f}")
+    elif 1.0 - y_zero < need:
+        print(f"  note: the 'favors' arrows do not fit above zero at "
+              f"--ylim {y_lo:.3f},{y_hi:.3f} -- each one needs "
+              f"{100 * need:.0f}% of the axes height.\n"
+              f"        try --ylim {y_lo:.3f},{-need * y_lo / (1 - need):.3f}")
 
 
 def _legend_handles():
@@ -423,7 +569,8 @@ def plot_all_observations(t_grid, tau_true, tau_hats_all, imse, seed,
 def plot_curves(t_grid, tau_true_i, tau_hats_i, obs_idx, seed,
                 out_stem="cate_curves", show_title=True, font_scale=1.0,
                 lw_scale=1.0, legend_ncol=3, figsize=(7, 4.5),
-                legend_pad=0.06, rect_bottom=0.10):
+                legend_pad=0.06, rect_bottom=0.10, favors_arrows=False,
+                plain_labels=False, ylim=None):
     """Full-size single-observation figure.
 
     The defaults reproduce the paper-size cate_curves.{png,pdf}. Pass
@@ -431,14 +578,42 @@ def plot_curves(t_grid, tau_true_i, tau_hats_i, obs_idx, seed,
     columns) for a presentation-size variant -- `--preset presentation` is
     exactly that combination. Spine and tick widths scale with the fonts via
     apply_style(width_scale=...), so a hairline axis never sits under 20pt labels.
+
+    favors_arrows and plain_labels are the two non-technical-audience options;
+    `--preset explainer` is "presentation" plus both. They are cosmetic -- the
+    plotted curves are identical either way, and plain_labels rescales only the
+    y *tick labels*, by formatter, never the data.
+
+    ylim, when given, is an explicit (lo, hi) in tau units. The arrows read
+    whatever the limits end up being, but autoscaling sizes each half from the
+    curves alone, so a subject whose effect is almost entirely positive gets a
+    down arrow too short to letter. Setting the limits is how the two halves are
+    given deliberate proportions.
     """
     apply_style(width_scale=font_scale)
 
     fig, ax = plt.subplots(1, 1, figsize=figsize)
-    _draw_panel(ax, t_grid, tau_true_i, tau_hats_i, lw_scale=lw_scale)
+    _draw_panel(ax, t_grid, tau_true_i, tau_hats_i, lw_scale=lw_scale,
+                emphasize_zero=favors_arrows)
 
-    ax.set_xlabel("Time $t$", fontsize=10.5 * font_scale)
-    ax.set_ylabel(r"$\hat{\tau}(t \mid x)$", fontsize=11 * font_scale)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    if plain_labels:
+        ax.set_xlabel(PLAIN_XLABEL, fontsize=10.5 * font_scale)
+        ax.set_ylabel(PLAIN_YLABEL, fontsize=10.5 * font_scale)
+        # tau is a difference of two survival probabilities, so 0.25 is 25%.
+        # Zero is left bare: "0%" invites reading the axis as a ratio.
+        ax.yaxis.set_major_formatter(FuncFormatter(
+            lambda v, _: "0" if abs(v) < 1e-9 else f"{100 * v:.0f}%"))
+        # Fixed 5-point steps rather than the automatic locator. The favors
+        # arrows need a y range roughly twice the data's, and over that wider
+        # range the locator backs off to 10-point steps, which reads coarser
+        # than the effects being shown.
+        ax.yaxis.set_major_locator(MultipleLocator(0.05))
+    else:
+        ax.set_xlabel("Time $t$", fontsize=10.5 * font_scale)
+        ax.set_ylabel(r"$\hat{\tau}(t \mid x)$", fontsize=11 * font_scale)
     if show_title:
         ax.set_title(f"Weibull DGP (seed {seed}) -- test observation {obs_idx}",
                      fontsize=11.5, fontweight="bold", pad=8)
@@ -446,6 +621,8 @@ def plot_curves(t_grid, tau_true_i, tau_hats_i, obs_idx, seed,
 
     handles, labels = ax.get_legend_handles_labels()
     labels = [FIGURE_LABEL_OVERRIDES.get(lab, lab) for lab in labels]
+    if plain_labels:
+        labels = [PLAIN_LABEL_OVERRIDES.get(lab, lab) for lab in labels]
     # loc="lower center" anchors the legend's *bottom* edge, so a legend that wraps
     # to a second row grows upward into the axes and over the x label. Push the
     # anchor down by the extra rows' height so the clearance above the legend stays
@@ -460,6 +637,12 @@ def plot_curves(t_grid, tau_true_i, tau_hats_i, obs_idx, seed,
                columnspacing=1.5, handletextpad=0.6)
 
     fig.tight_layout(rect=[0, rect_bottom, 1, 1])
+
+    # After tight_layout, which moves the axes box the arrow lengths are
+    # measured against.
+    if favors_arrows:
+        _draw_favors_arrows(ax, font_scale=font_scale, lw_scale=lw_scale)
+
     for ext in ("png", "pdf"):
         path = os.path.join(FIGURES_DIR, f"{out_stem}.{ext}")
         fig.savefig(path, dpi=200, bbox_inches="tight")
@@ -515,12 +698,29 @@ def build_parser():
     parser.add_argument("--lw-scale", type=float, default=1.0,
                         help="multiply curve line widths on the single-subject "
                              "figure (default: 1.0)")
+    parser.add_argument("--favors-arrows", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="draw arrows on the right of the single-subject "
+                             "figure, up from the zero line for "
+                             f"'{FAVORS_UP_LABEL}' and down for "
+                             f"'{FAVORS_DOWN_LABEL}' (default: off; on under "
+                             "--preset explainer)")
+    parser.add_argument("--plain-labels", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="plain-language axis labels and y ticks in "
+                             "percentage points instead of tau notation "
+                             "(default: off; on under --preset explainer)")
     parser.add_argument("--legend-ncol", type=int, default=3,
                         help="legend columns on the single-subject figure "
                              "(default: 3)")
     parser.add_argument("--figsize", default="7,4.5", metavar="W,H",
                         help="single-subject figure size in inches "
                              "(default: 7,4.5)")
+    parser.add_argument("--ylim", default=None, metavar="LO,HI",
+                        help="explicit y limits in tau units, e.g. -0.12,0.26 "
+                             "(default: autoscaled). Worth setting alongside "
+                             "--favors-arrows, which sizes each arrow from "
+                             "these limits")
     parser.add_argument("--legend-pad", type=float, default=0.06,
                         help="gap between axes and legend, in figure fractions "
                              "(default: 0.06)")
@@ -536,14 +736,24 @@ def build_parser():
     return parser
 
 
+def _parse_pair(value, flag, example):
+    """Parse a "a,b" argument into a float pair, or None if value is None."""
+    if value is None:
+        return None
+    try:
+        a, b = (float(v) for v in value.split(","))
+    except ValueError:
+        raise SystemExit(f"{flag} must be two numbers, e.g. {example}")
+    return (a, b)
+
+
 def main():
     args = build_parser().parse_args()
 
-    try:
-        w, h = (float(v) for v in args.figsize.split(","))
-    except ValueError:
-        raise SystemExit("--figsize must be two numbers, e.g. 10,6.4")
-    figsize = (w, h)
+    figsize = _parse_pair(args.figsize, "--figsize", "10,6.4")
+    ylim = _parse_pair(args.ylim, "--ylim", "-0.12,0.26")
+    if ylim is not None and ylim[0] >= ylim[1]:
+        raise SystemExit("--ylim must be LO,HI with LO < HI")
 
     print(f"--- Weibull DGP (seed {args.seed}, test seed {args.test_seed}) ---")
     if args.plot_only:
@@ -576,6 +786,8 @@ def main():
                 font_scale=args.font_scale, lw_scale=args.lw_scale,
                 legend_ncol=args.legend_ncol, figsize=figsize,
                 legend_pad=args.legend_pad,
+                favors_arrows=args.favors_arrows,
+                plain_labels=args.plain_labels, ylim=ylim,
                 rect_bottom=(max(0.10, args.legend_pad + 0.02)
                              if args.rect_bottom is None else args.rect_bottom))
 
