@@ -56,6 +56,7 @@ from scipy.stats import t as t_dist
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -230,23 +231,45 @@ METHOD_STYLES = {
 # negative for an oversmoothed method, which a log axis cannot show at all. Its
 # reference line is y=0 (the truth's own reversal count) instead of the tv-ATE line,
 # which is what `ref` selects.
+# An axis label names the PER-REPLICATION scalar and nothing more. Each panel then
+# takes the mean (top row) or the variance (bottom row) of that scalar ACROSS
+# REPLICATIONS, which the figure caption states once instead of every label carrying
+# it -- the convention the paper's prose already uses ("the mean iMSE over N
+# replications", simulation_study.tex).
+#
+# Whether a label needs the word "mean" therefore depends on whether the metric's own
+# name already contains one, and only two of the four do:
+#
+#   iMSE     the M *is* the average over the n_test test subjects -- that is how the
+#            paper defines it (main.tex:501, the 1/n_test sum is inside iMSE(tau_hat)).
+#            "Average iMSE" said it twice.
+#   D, H1    an integral over t and an H^1 norm are per-SUBJECT quantities; neither
+#            name contains an average, so both carry "Mean" explicitly.
+#   Excess   a per-subject reversal count, likewise -- "Average" here plays the same
+#            role "Mean" plays above.
+#
+# Every metric averages over a test set that is FIXED across methods, sample sizes and
+# replications (_make_test_set is called once per DGP, outside the seed loop), so these
+# are fixed-design averages, not fresh draws from P_X, and the variance panels are
+# training-sample variability with no test-draw noise mixed in.
 METRIC_SPECS = {
     "imse": dict(
         key="imse", stem="simulation_convergence",
-        mean_label="Average iMSE", var_label="Variance of iMSE",
+        mean_label="iMSE", var_label="Variance of iMSE",
         log_y=True, ref="pop_avg",
     ),
     "dmse": dict(
         key="dmse", stem="simulation_convergence_dmse",
-        mean_label=r"Average $\int_0^{t_{\mathrm{end}}}"
-                   r"(\partial_t\hat\tau - \partial_t\tau)^2\,dt$",
-        var_label=r"Variance of $\int(\partial_t\hat\tau - \partial_t\tau)^2\,dt$",
+        mean_label=r"Mean $\int_0^{t_{\mathrm{end}}}"
+                   r"(\partial_t\hat\tau - \partial_t\tau)^2\,\mathrm{d}t$",
+        var_label=r"Variance of mean $\int_0^{t_{\mathrm{end}}}"
+                  r"(\partial_t\hat\tau - \partial_t\tau)^2\,\mathrm{d}t$",
         log_y=True, ref="pop_avg",
     ),
     "h1": dict(
         key="h1", stem="simulation_convergence_h1",
-        mean_label=r"Average $\|\hat\tau - \tau\|_{H^1}$",
-        var_label=r"Variance of $\|\hat\tau - \tau\|_{H^1}$",
+        mean_label=r"Mean $\|\hat\tau - \tau\|_{H^1}$",
+        var_label=r"Variance of mean $\|\hat\tau - \tau\|_{H^1}$",
         log_y=True, ref="pop_avg",
     ),
     "excess": dict(
@@ -254,6 +277,16 @@ METRIC_SPECS = {
         mean_label="Average excess reversal count",
         var_label="Variance of excess reversal count",
         log_y=False, ref="zero",
+        # The only metric that goes negative, and autoscale handles it badly: it ends
+        # the axis just under the lowest curve, and the default locator anchors ticks
+        # wherever it likes, so with curves spanning -0.6 to 15 the lowest tick lands
+        # on 0. Every method that beats the truth's own reversal count -- AIR, at about
+        # -0.5, which is the GOOD direction -- then sits in an unlabelled sliver with
+        # nothing to read it against. Drop the floor to -2 and tick every 2 so the
+        # negative region is labelled. min(), so a DGP running below -2 is not clipped;
+        # the step is set explicitly because moving the limit alone does not move the
+        # locator's anchor, and -2 would still go unlabelled.
+        mean_ymin_at_most=-2.0, mean_ytick_step=2.0,
     ),
 }
 
@@ -833,13 +866,25 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None,
             ax_mean[col].set_yscale("log")
         ax_var[col].set_yscale("log")
 
+        # Optional floor and tick step for the mean row, used only by the one metric
+        # whose panel autoscales badly (see the Excess entry in METRIC_SPECS). Runs
+        # here, after every curve is drawn, because it reads the autoscaled limit.
+        floor = spec.get("mean_ymin_at_most")
+        if floor is not None:
+            lo, hi = ax_mean[col].get_ylim()
+            ax_mean[col].set_ylim(min(lo, floor), hi)
+        step = spec.get("mean_ytick_step")
+        if step is not None:
+            ax_mean[col].yaxis.set_major_locator(MultipleLocator(step))
+
         ax_mean[col].set_title(f"{dgp_name} DGP", fontsize=14,
                                 fontweight="bold", pad=8)
         ax_var[col].set_xlabel("Sample size", fontsize=15)
 
-    # Labels come from METRIC_SPECS. iMSE's says "iMSE", not "MSE": the quantity is
-    # integrated over the time grid, and calling it MSE would contradict every other
-    # mention of it in the paper.
+    # Labels come from METRIC_SPECS, where the naming convention is argued. Only the
+    # leftmost column carries one: the panels in a row are the same quantity on
+    # different DGPs, and repeating the label three times would cost the width the
+    # curves need.
     ax_mean[0].set_ylabel(spec["mean_label"], fontsize=15)
     ax_var[0].set_ylabel(spec["var_label"], fontsize=15)
 

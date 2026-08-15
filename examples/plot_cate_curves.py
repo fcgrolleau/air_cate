@@ -107,14 +107,13 @@ FIGURE_LABEL_OVERRIDES = {
     "Cross-fitted AIR w/ MGD": "Cross-fitted AIR w/ MGD (our method)",
 }
 
-# Plain-language relabelling for a non-technical audience (--plain-labels). Only
-# the quantities are renamed, never the methods: the method names have to keep
-# matching the paper and plot_simulation.py, whereas "tv-CATE" and
-# "$\hat{\tau}(t \mid x)$" carry no meaning for a reader who has not read the
-# paper. Under --plain-labels the y axis is also rescaled to percentage points,
-# which is how a difference of two survival probabilities is normally read.
+# Plain-language relabelling for a non-technical audience (--plain-labels). The
+# axis labels say what the quantity *is*, because "$\hat{\tau}(t \mid x)$" says
+# nothing to a reader who has not read the paper, and the y axis is rescaled to
+# percentage points, which is how a difference of two survival probabilities is
+# normally read. The legend overrides below only drop implementation detail; the
+# method names keep matching the paper and plot_simulation.py.
 PLAIN_LABEL_OVERRIDES = {
-    "True tv-CATE": "True effect",
     # "TP" spelled out, and the grf package name dropped: both are
     # implementation detail to a reader outside the project. The methods
     # themselves are still named as the paper names them.
@@ -122,9 +121,7 @@ PLAIN_LABEL_OVERRIDES = {
     "Causal Survival Forest (grf)": "Causal Survival Forest",
 }
 PLAIN_XLABEL = "Time since treatment"
-# Wrapped across two lines: at presentation font sizes the one-line form is
-# taller than the axes it labels.
-PLAIN_YLABEL = "Difference in survival probability\n(i.e., tv-CATE)"
+PLAIN_YLABEL = "Difference in survival probability"
 
 # Text beside the two arrows flanking the zero line. tau = S_1 - S_0, so tau > 0
 # means the treated arm has the higher survival probability -- up is the
@@ -163,7 +160,7 @@ PRESETS = {
     "explainer": dict(
         single_only=True, no_title=True, font_scale=2.0, lw_scale=1.3,
         legend_ncol=2, figsize="10,6.4", legend_pad=0.085, rect_bottom=0.02,
-        favors_arrows=True, plain_labels=True, ylim="-0.20,0.26",
+        favors_arrows=True, plain_labels=True, ylim="-0.15,0.26",
     ),
 }
 
@@ -437,24 +434,26 @@ def _draw_favors_arrows(ax, up_label=FAVORS_UP_LABEL,
     """
     fig = ax.figure
     y_lo, y_hi = ax.get_ylim()
-    x_arrow, x_label = 1.03, 1.085
+    x_arrow, x_label = 1.03, 1.058
     # tau = 0 as a fraction of the axes height -- where the two arrows part.
     y_zero = (0.0 - y_lo) / (y_hi - y_lo)
     # Break at the zero line, as a fraction of the axes height. Without it the
     # two tails touch and the pair reads as one double-headed line spanning the
     # axes, which says nothing about zero being the dividing point.
-    gap = 0.02
+    gap = 0.015
 
     texts = {}
     for sign, label in ((1.0, up_label), (-1.0, down_label)):
         texts[sign] = ax.text(
             x_label, y_zero, label, transform=ax.transAxes,
             rotation=90, ha="center", va="center",
-            # A touch below the tick labels: the arrow length is this text's
-            # length, so the font size sets how much of the axes each arrow
-            # claims, and at the tick-label size the pair needs a y axis running
-            # to -23% on a subject whose curves stop at -8%.
-            fontsize=7.5 * font_scale, color=color, clip_on=False, zorder=8,
+            # Well below the tick-label size, because the arrow length *is* this
+            # text's length: the font size is what sets how much of the axes
+            # each arrow claims, and hence how far below zero the y axis has to
+            # run to hold the downward one. At the tick-label size the pair
+            # needs the axis down to -23% on a subject whose curves stop at -8%,
+            # which is mostly empty panel; this size fits inside -15%.
+            fontsize=6.5 * font_scale, color=color, clip_on=False, zorder=8,
         )
 
     # Rotated 90 degrees, so a label's on-screen *height* is its text length.
