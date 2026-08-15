@@ -1039,31 +1039,87 @@ import json; d = json.load(open('$SCRATCH/air_cate_metrics10/metrics10_merged.js
 print(json.dumps({k: v for k, v in d.items() if 'fail' in k or 'range' in k}, indent=2)[:2000])"
 ```
 
-### Stage 3 — the 200-seed run (720 + 600 tasks)
+### Stage 3 — the 50-seed run, full ladder (180 + 150 tasks)
 
-Both shards are under SLURM's 1000-per-submission cap. The six-method shard is split only for
-the memory override: at 40 blocks per (DGP, method), RSF-T and RSF-S are blocks 4–5 within each
-DGP's 240 ids, i.e. the last 80 of each.
+**Submit the six-method shard first.** It is ~1/23rd of the cost of the CSF shard, it carries six
+of the seven methods, and it validates the 50-seed index mapping before 150 long CSF tasks commit
+to it.
+
+At 10 blocks per (DGP, method) each DGP owns 60 consecutive ids and
+`METHOD_IDX = (TASK_ID / 10) % 6`, so RSF-T and RSF-S are the **last 20** ids of each DGP's 60.
 
 ```bash
-# 16G: AIR, Tensor-prod, and both oracles -- 480 of the 720 tasks.
-for r in 0-159 240-399 480-639; do
-    CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=$r \
+mkdir -p sherlock/logs
+
+# Both shards reuse sherlock/logs/{task,csf}_%a.out. Archive the stage-2 logs BEFORE
+# submitting, or a stale task_0.out reads as this run's -- it cost an hour on 2026-08-14.
+mkdir -p sherlock/logs/archive_metrics10
+mv sherlock/logs/task_*.out sherlock/logs/task_*.err \
+   sherlock/logs/csf_*.out sherlock/logs/csf_*.err \
+   sherlock/logs/archive_metrics10/ 2>/dev/null
+
+# The section-1 staleness check on the CLUSTER copy, for the variables THIS stage needs.
+grep -c '^N_VALUES=' sherlock/submit_array.sh          # want 1
+grep -c '^N_VALUES=' sherlock/submit_csf.sh            # want 1
+grep -c 'time=14:00:00' sherlock/submit_csf.sh         # want 1 -- the raised CSF wall
+
+# 16G: AIR, Tensor-prod, and both oracles -- 120 of the 180 tasks.
+for r in 0-39 60-99 120-159; do
+    CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 sbatch --array=$r \
         --mem-per-cpu=16G sherlock/submit_array.sh
 done
 
 # 32G: RSF-T and RSF-S, which OOM'd at 8G at n=20000.
-for r in 160-239 400-479 640-719; do
-    CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=$r \
+for r in 40-59 100-119 160-179; do
+    CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 sbatch --array=$r \
         sherlock/submit_array.sh
 done
-
-# CSF: 600 tasks, one seed each, 6h wall.
-CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=0-599 \
-    sherlock/submit_csf.sh
 ```
 
-Collect on an interactive node, not the login node — 1321 files is real work:
+**Then the CSF shard, in two passes.** 150 tasks is under the 1000-per-submission cap, so each
+pass is one `--array=0-149`. `DGP_IDX = TASK_ID / 50`, so Weibull is `0-49`, Mixture `50-99`,
+IST-3 `100-149`. Both passes carry the same `RUN_TAG` and resume skips by `(n, seed)`, so pass 2
+fills in the top rung rather than redoing pass 1 — which is what keeps 150 short tasks out of a
+14h reservation they do not need.
+
+**The passes must be SEQUENTIAL, and nothing in the filename enforces it.** `OUTFILE` is
+`${RUN_TAG}_${DGP}_CSF_b${BLOCK_IDX}.json` — `N_VALUES` is not in it, so task *k* of both passes
+writes the same file. Run concurrently, each loads it at startup, writes its own rungs, and the
+later writer clobbers the other pass's. Gate pass 2 on pass 1 with `--dependency=afterany:`
+(released once pass 1 finishes in *any* state; `afterok` would demand all 150 tasks exit 0 and
+deadlock on one hiccup), or submit it by hand after pass 1 drains. Un-gated is the one wrong move.
+
+```bash
+# Pass 1 -- five rungs to n=10000. Measured at 10 seeds: 2.5h / 2.6h / 1.3h per seed
+# (Weibull / Mixture / IST-3), so the 14h default is overridden DOWN to 5h. 16G is
+# measured sufficient here: stage 2 peaked at MaxRSS 11.6-12.4G on this same ladder.
+CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 \
+    N_VALUES=500,1000,2000,5000,10000 \
+    sbatch --array=0-149 --time=05:00:00 sherlock/submit_csf.sh
+
+# Pass 2 -- the n=20000 rung alone, at the script's default 14h. Extrapolated 5.5-7h
+# (Weibull, Mixture), 2.5-3.2h (IST-3). 32G, NOT the 16G default: stage 2's 12.1G peak at
+# n=10000 was 76% of a 16G request, and grf is roughly linear in n, so this rung projects
+# to ~20-24G and would OOM hours into a 14h task.
+CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 N_VALUES=20000 \
+    sbatch --dependency=afterany:<pass1_jobid> --array=0-149 \
+    --mem-per-cpu=32G sherlock/submit_csf.sh
+```
+
+`sacct` hides jobs that started before today unless `-S` widens the window, which is why the
+stage-2 lookup above needed a date. To re-measure after changing `num_trees`, `n_test` or `M`
+(`MaxRSS` lives only on the `.batch` step rows, so they cannot be filtered out):
+
+```bash
+sacct -S <yyyy-mm-dd> -j <csf_jobid> --format=JobID,Elapsed,MaxRSS --units=G \
+  | grep -E 'JobID|\.batch'
+```
+
+**Do not extend this run by raising `N_SEEDS` later.** `N_BLOCKS` is derived from it, so 100
+seeds renumbers every task and writes a second, incompatible set of `b<idx>` filenames into the
+same directory. To add seeds, use a new tag and merge the two directories at collect time.
+
+Collect on an interactive node, not the login node:
 
 ```bash
 sh_dev
@@ -1072,12 +1128,20 @@ eval "$(mamba shell hook --shell bash)"
 mamba activate air_cate
 cd ~/air_cate_full
 
-ls $SCRATCH/air_cate_metrics200/metrics200_*.json | wc -l   # target: 1320, pre-merge
+ls $SCRATCH/air_cate_metrics50/metrics50_*.json | wc -l   # target: 330, pre-merge
 
-RESULTS_DIR=$SCRATCH/air_cate_metrics200 PATTERN='metrics200_*.json' \
-MERGED_NAME=metrics200_merged.json FIGURES_DIR=examples/figures/metrics200 \
+RESULTS_DIR=$SCRATCH/air_cate_metrics50 PATTERN='metrics50_*.json' \
+MERGED_NAME=metrics50_merged.json FIGURES_DIR=examples/figures/metrics50 \
   bash sherlock/collect_results.sh
 ```
+
+**The n=20000 cell is the one to read first.** CSF has never been run there, and stage 2 plus the
+999-seed run predict a crossover on iMSE: AIR's measured 999-seed iMSE at n=20000 is 0.0995
+(IST-3), 0.00488 (Mixture), 0.00977 (Weibull), while CSF would have to improve on its n=10000
+value by 16%, 47% and 2% respectively to tie. Its last observed doubling gave 2.8%, 29.3% and
+27.6%. So AIR is predicted to take iMSE on IST-3 and Mixture and to lose it on Weibull — where
+AIR-oracle at 0.00905 is barely better than cross-fitted AIR, meaning the residual gap is the
+model class, not nuisance estimation.
 
 `collect_results.sh` renders **all four** figures — `simulation_convergence.pdf` plus
 `_dmse`, `_h1`, `_excess`. iMSE keeps the bare filename so the paper's `\includegraphics`

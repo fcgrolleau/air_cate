@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=air_cate_csf
 #SBATCH --partition=normal
-#SBATCH --time=06:00:00
+#SBATCH --time=14:00:00
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=16G
 #SBATCH --output=sherlock/logs/csf_%a.out
@@ -11,50 +11,103 @@
 # the pointwise-horizon comparator the new metrics exist to characterize.
 #
 # WHY A SEPARATE SCRIPT rather than a 7th method in submit_array.sh. CSF refits one
-# forest per horizon, so a replication is M+1 grf fits. Measured single-core locally:
-# ~11 / 31 / 82 min at n = 5000 / 10000 / 20000, i.e. ~2.1h for ONE seed across the
-# full 6-point ladder -- against 0.71h for an entire 5-seed AIR block. So this shard
-# wants BLOCK=1 and a 6h wall. That is a different task shape, and folding it into the
-# other script's index arithmetic would either give every method the 6h wall (costing
-# scheduling priority on 3600 tasks) or give CSF a ragged block size inside a mapping
-# that assumes a uniform one.
+# forest per horizon, so a replication is M+1 grf fits. Measured on Sherlock at 10 seeds,
+# single-core, max over seeds: 76 / 186 / 490 / 1986 / 6279 s at n = 500 / 1000 / 2000 /
+# 5000 / 10000, i.e. ~8h for ONE seed across the full 6-point ladder -- against 0.71h for
+# an entire 5-seed AIR block, a factor of ~56. So this shard wants BLOCK=1 and a 14h
+# wall. That is a different task shape, and folding it into the other script's index
+# arithmetic would either give every method the 14h wall (costing scheduling priority on
+# 180 tasks) or give CSF a ragged block size inside a mapping that assumes a uniform one.
 #
-# THE 200-SEED RUN (RUNBOOK section 5b). Same RUN_TAG as the six-method shard, so
-# collect_results.sh merges both in one pass -- it globs by prefix and is
-# method-agnostic:
+# THE 50-SEED RUN (RUNBOOK section 5b). Same RUN_TAG as the six-method shard, so
+# collect_results.sh merges both in one pass -- it globs by prefix and is method-agnostic.
+# 3 x 50 = 150 tasks, comfortably under SLURM's 1000-per-submission cap, so each pass is
+# ONE submission of 0-149. DGP_IDX = TASK_ID / N_BLOCKS makes one DGP exactly one 50-task
+# range: Weibull 0-49, Mixture 50-99, IST-3 100-149.
+#
+# Submitted in TWO PASSES, cheap rungs first. Both write the same tag, and resume skips
+# by (n, seed), so pass 2 fills in the top rung rather than redoing anything:
 #
 #   mkdir -p sherlock/logs
-#   CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=0-599 \
-#       sherlock/submit_csf.sh
+#   # Pass 1 -- the five rungs to n=10000. Measured on Sherlock at 10 seeds: 2.5h
+#   # (Weibull), 2.6h (Mixture), 1.3h (IST-3) for one seed across those five. So the
+#   # wall is overridden DOWN to 5h, ~1.9x the worst, which keeps 150 short tasks out
+#   # of a 14h reservation they do not need.
+#   CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 \
+#       N_VALUES=500,1000,2000,5000,10000 \
+#       sbatch --array=0-149 --time=05:00:00 sherlock/submit_csf.sh
+#
+#   # Pass 2 -- the n=20000 rung alone, at this script's default 14h wall. Extrapolating
+#   # the measured 3.2x-per-doubling cost puts this rung at 5.5-7h (Weibull, Mixture)
+#   # and 2.5-3.2h (IST-3). 32G, not the default 16G: see "Memory" below.
+#   #
+#   # --dependency is NOT optional. Task k of both passes computes the SAME OUTFILE --
+#   # RUN_TAG, DGP and BLOCK_IDX are all identical, and only N_VALUES differs, which is
+#   # not in the filename. Run concurrently, each task loads the file at startup, writes
+#   # its own rungs, and the later writer clobbers the other pass's. `afterany` releases
+#   # pass 2 once pass 1 has finished in ANY state; `afterok` would demand all 150 pass-1
+#   # tasks exit 0 and deadlock the whole pass on one hiccup. Submitting pass 2 by hand
+#   # after pass 1 drains is equally safe -- what is unsafe is submitting it un-gated.
+#   CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 N_VALUES=20000 \
+#       sbatch --dependency=afterany:<pass1_jobid> --array=0-149 \
+#       --mem-per-cpu=32G sherlock/submit_csf.sh
+#
+# WHY TWO PASSES rather than one 14h submission of the whole ladder. The n=20000 rung is
+# over half this shard's cost, so a single pass makes all 150 tasks reserve 14h to
+# accommodate a rung that only the last few hours of each task spend. Splitting lets 150
+# tasks queue at 5h and only the expensive rung pay the long-wall priority penalty. It
+# also gives the top rung its own submission, which is where --mem-per-cpu would be
+# raised if it turns out 16G does not survive n=20000 (see "Memory" below).
 #
 # N_SEEDS is not optional. It sets N_BLOCKS and hence the whole index mapping; a call
 # that omits it decodes its task ids under a different layout and writes the wrong
-# filenames without erroring.
+# filenames without erroring -- and this script's default is 200, which is NOT this run.
 #
-# Stage-2 shakedown first (10 seeds, 3 x 10 = 30 tasks). Its own tag, so it cannot
-# land on the 200-seed partials and be resume-skipped:
-#
-#   CENSORING_FIX=1 RUN_TAG=metrics10 N_SEEDS=10 sbatch --array=0-29 \
-#       sherlock/submit_csf.sh
+# To EXTEND to more seeds later, do not raise N_SEEDS: that renumbers every task and
+# writes a second, incompatible set of b<idx> filenames into the same directory. Submit
+# under a new tag, or accept the renumbering and re-run the whole shard.
 #
 # Overrides must be an ENVIRONMENT PREFIX, never --export: SLURM splits --export on
 # commas with no escape, so any comma-bearing value is silently truncated.
+#
+# Stage-2 shakedown, for reference (10 seeds, ladder capped, 3 x 10 = 30 tasks). Its own
+# tag, so it cannot land on the 50-seed partials and be resume-skipped:
+#
+#   CENSORING_FIX=1 RUN_TAG=metrics10 N_SEEDS=10 N_VALUES=500,1000,2000,5000,10000 \
+#       sbatch --array=0-29 --time=06:00:00 sherlock/submit_csf.sh
 
 # --- Array index mapping ---
 # 3 DGPs x N_SEEDS blocks of 1 seed. task_id -> (dgp_idx, block_idx = seed), with the
-# seed varying fastest. At N_SEEDS=200 that is 600 tasks; at 10 it is 30.
+# seed varying fastest. At N_SEEDS=50 that is 150 tasks, one 50-task range per DGP;
+# at 10 it is 30.
 #
-# Wall limit: 6h, ~2.9x the measured 2.1h worst case, which is a wider margin than the
-# 2.8x on the other shard for a thinner reason -- the 2.1h is a LOCAL single-core
-# measurement on the Weibull DGP, and IST-3 (p=15, embeddings) has never been timed
-# under CSF. Tightening is cheap to be wrong about either way: resume means a
-# wall-clock kill keeps every (n, seed) cell already finished, so resubmitting the same
-# task id continues rather than restarts. Stage 2 measures IST-3 and this comes down.
+# Wall limit: 14h, RAISED from 6h on stage-2 measurement. The original 6h was 2.9x a
+# LOCAL single-core projection of 2.1h for the full ladder; the cluster turned out to be
+# ~3x slower than that projection (n=10000 measured 6279s against a ~31min local
+# estimate), and the per-doubling cost is 3.2-4.0x, so the full six-rung ladder
+# extrapolates to 8.0h (Weibull), 8.4h (Mixture), 3.9h (IST-3). 6h would have timed out
+# two thirds of the shard. 14h is ~1.7x the worst extrapolation.
 #
-# Memory: 16G, unlike the other shard's 32G default. grf holds one forest at a time and
-# the RSF arms are what needed 32G at n=20000. Confirm against
-# `sacct -j <id> --format=JobID,MaxRSS,Elapsed` after stage 2 before trusting it for
-# 600 tasks.
+# The two-pass recipe above overrides this DOWN to 5h for the five cheap rungs, which is
+# the same idiom as the other shard's memory split: the DEFAULT is the safe value, so
+# forgetting an override costs queue priority rather than losing 8h of work at hour 6.
+#
+# Tightening is cheap to be wrong about in one direction only: resume means a wall-clock
+# kill keeps every (n, seed) cell already finished, so resubmitting the same task id
+# continues rather than restarts -- but a task killed INSIDE the n=20000 rung loses that
+# rung entirely, which at 150 tasks is recoverable by hand but still a wasted day.
+#
+# Memory: 16G, which is MEASURED SUFFICIENT for the ladder capped at n=10000 and
+# MEASURED INSUFFICIENT for n=20000. Stage 2 (job 39073799, five rungs to 10000) peaked at
+# MaxRSS 11.6-12.4G across tasks -- 76% of the 16G request. grf's footprint is roughly
+# linear in n at fixed num_trees, so the n=20000 rung projects to ~20-24G and would OOM
+# partway through a 14h task. Hence pass 2 overrides UP to 32G while pass 1 keeps 16G.
+#
+# To re-measure after any change to num_trees, n_test or M (MaxRSS is reported only on
+# the .batch step rows, so they cannot be filtered out -- and sacct hides jobs that
+# started before today unless -S widens the window):
+#   sacct -S <yyyy-mm-dd> -j <csf_jobid> --format=JobID,Elapsed,MaxRSS --units=G \
+#       | grep -E 'JobID|\.batch'
 
 DGPS=("Weibull" "Mixture" "IST-3")
 
@@ -89,7 +142,7 @@ fi
 # resume logic SKIPS any (n, seed) cell already present in OUTFILE, so a run writing
 # another arm's filenames would load that arm's answers, find every cell present, and
 # exit successful having computed nothing.
-RUN_TAG="${RUN_TAG:-metrics200}"
+RUN_TAG="${RUN_TAG:-metrics50}"
 
 TASK_ID=${SLURM_ARRAY_TASK_ID}
 BLOCK_IDX=$((TASK_ID % N_BLOCKS))

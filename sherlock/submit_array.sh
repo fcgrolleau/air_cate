@@ -27,23 +27,33 @@
 # Overrides must be an ENVIRONMENT PREFIX, never --export: SLURM splits --export on
 # commas with no escape, so any comma-bearing value is silently truncated.
 #
-# THE 200-SEED TRAJECTORY-METRICS RUN (RUNBOOK section 5b). 999 seeds is overkill --
-# the full999 CIs are already very tight -- and the new metrics (derivative MSE, H1,
-# excess reversals) come from the same fits, so 200 seeds buys the same figures for a
-# fifth of the queue. N_SEEDS=200, BLOCK=5 -> 40 blocks -> 3 x 6 x 40 = 720 tasks, and
-# CSF's 600 tasks go through submit_csf.sh with the SAME RUN_TAG so one collect merges
-# both shards. Memory ranges are re-derived for 40 blocks, not copied from above:
+# THE 50-SEED TRAJECTORY-METRICS RUN (RUNBOOK section 5b). 999 seeds is overkill -- the
+# full999 CIs are already very tight -- and the new metrics (derivative MSE, H1, excess
+# reversals) come from the same fits, so 50 seeds buys the same figures for a twentieth of
+# the queue. N_SEEDS=50, BLOCK=5 -> 10 blocks -> 3 x 6 x 10 = 180 tasks. CSF's 150 tasks
+# go through submit_csf.sh with the SAME RUN_TAG so one collect merges both shards.
 #
-#   for r in 0-159 240-399 480-639; do            # AIR, Tensor-prod, both oracles
-#       CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=$r \
+# Ranges are RE-DERIVED for 10 blocks, not copied from the 999-seed recipe above. Each DGP
+# owns 60 consecutive ids and METHOD_IDX = (TASK_ID / 10) % 6, so RSF-T and RSF-S are
+# methods 4-5 = the LAST 20 ids of each DGP's 60:
+#
+#   for r in 0-39 60-99 120-159; do               # AIR, Tensor-prod, both oracles
+#       CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 sbatch --array=$r \
 #           --mem-per-cpu=16G sherlock/submit_array.sh
 #   done
-#   for r in 160-239 400-479 640-719; do          # RSF-T, RSF-S -- these need 32G
-#       CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=$r \
+#   for r in 40-59 100-119 160-179; do            # RSF-T, RSF-S -- these need 32G
+#       CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 sbatch --array=$r \
 #           sherlock/submit_array.sh
 #   done
-#   CENSORING_FIX=1 RUN_TAG=metrics200 N_SEEDS=200 sbatch --array=0-599 \
-#       sherlock/submit_csf.sh
+#
+# At 180 tasks the whole shard would also fit in ONE `--array=0-179` submission at the
+# 32G default. The split is kept anyway because it costs two lines and 120 of the 180
+# tasks queue at 16G, and because the ranges are then the same shape as every other
+# recipe in this file.
+#
+# The wall limit is NOT raised for this run: BLOCK is still 5, so a task is still 5 seeds
+# over the full ladder -- the same task shape the 999-seed run completed inside 2h, worst
+# measured 0.71h. Changing the seed count changes the number of tasks, not their length.
 #
 # N_SEEDS must be passed to EVERY call in the run, including the CSF one. It changes
 # N_BLOCKS, hence the whole index mapping: omitting it on one call makes those tasks
