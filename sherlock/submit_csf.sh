@@ -39,7 +39,9 @@
 #
 #   # Pass 2 -- the n=20000 rung alone, at this script's default 14h wall. Extrapolating
 #   # the measured 3.2x-per-doubling cost puts this rung at 5.5-7h (Weibull, Mixture)
-#   # and 2.5-3.2h (IST-3). 32G, not the default 16G: see "Memory" below.
+#   # and 2.5-3.2h (IST-3). 64G, not the default 16G: see "Memory" below -- and note that
+#   # a failed pass 2 leaves NaN cells that resume COUNTS AS DONE, so they must be purged
+#   # from the CSF files before resubmitting (RUNBOOK section 5b).
 #   #
 #   # --dependency is NOT optional. Task k of both passes computes the SAME OUTFILE --
 #   # RUN_TAG, DGP and BLOCK_IDX are all identical, and only N_VALUES differs, which is
@@ -50,7 +52,7 @@
 #   # after pass 1 drains is equally safe -- what is unsafe is submitting it un-gated.
 #   CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 N_VALUES=20000 \
 #       sbatch --dependency=afterany:<pass1_jobid> --array=0-149 \
-#       --mem-per-cpu=32G sherlock/submit_csf.sh
+#       --mem-per-cpu=64G sherlock/submit_csf.sh
 #
 # WHY TWO PASSES rather than one 14h submission of the whole ladder. The n=20000 rung is
 # over half this shard's cost, so a single pass makes all 150 tasks reserve 14h to
@@ -99,9 +101,27 @@
 #
 # Memory: 16G, which is MEASURED SUFFICIENT for the ladder capped at n=10000 and
 # MEASURED INSUFFICIENT for n=20000. Stage 2 (job 39073799, five rungs to 10000) peaked at
-# MaxRSS 11.6-12.4G across tasks -- 76% of the 16G request. grf's footprint is roughly
-# linear in n at fixed num_trees, so the n=20000 rung projects to ~20-24G and would OOM
-# partway through a 14h task. Hence pass 2 overrides UP to 32G while pass 1 keeps 16G.
+# MaxRSS 11.6-12.4G across tasks -- 76% of the 16G request. Pass 2 therefore overrides UP
+# while pass 1 keeps 16G.
+#
+# The scaling is QUADRATIC in n, not linear -- a 32G pass 2 (job 39190716) was OOM-killed
+# on all 150 tasks after 624s, i.e. inside the FIRST of its 50 forests. baselines_csf.R
+# calls causal_survival_forest without `failure.times`, so grf defaults to every unique
+# event time for its internal survival and censoring curves; that grid grows with n, and
+# grf itself warns about it ("consider supplying a coarser grid with the `failure.times`
+# argument") once events exceed 10% of the sample. Footprint therefore goes as n x
+# |failure.times| ~ n^2: 12G at n=10000 projects to ~46-50G at n=20000, hence 64G.
+#
+# Supplying failure.times = the shared M-grid would make this linear and much faster, and
+# would also remove a confound -- as written, CSF's internal time resolution silently
+# grows with n across the convergence ladder. It is not done here because it changes the
+# baseline's specification and would invalidate the five completed rungs; note it in the
+# paper instead.
+#
+# Because the peak is reached in the first forest, a 64G probe is cheap to verify: submit
+# --array=0-0, wait ~15 min, and read the live peak with
+#   sstat -j <jobid> --format=JobID,MaxRSS --units=G
+# (sstat reports a running step; sacct's MaxRSS only appears once the step has ended).
 #
 # To re-measure after any change to num_trees, n_test or M (MaxRSS is reported only on
 # the .batch step rows, so they cannot be filtered out -- and sacct hides jobs that

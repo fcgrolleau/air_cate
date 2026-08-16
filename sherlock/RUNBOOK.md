@@ -1098,13 +1098,71 @@ CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 \
     sbatch --array=0-149 --time=05:00:00 sherlock/submit_csf.sh
 
 # Pass 2 -- the n=20000 rung alone, at the script's default 14h. Extrapolated 5.5-7h
-# (Weibull, Mixture), 2.5-3.2h (IST-3). 32G, NOT the 16G default: stage 2's 12.1G peak at
-# n=10000 was 76% of a 16G request, and grf is roughly linear in n, so this rung projects
-# to ~20-24G and would OOM hours into a 14h task.
+# (Weibull, Mixture), 2.5-3.2h (IST-3). 64G, NOT the 16G default, and not the 32G that
+# job 39190716 was OOM-killed at on all 150 tasks: grf's footprint is QUADRATIC in n
+# (see below), so stage 2's 12.1G at n=10000 projects to ~46-50G here.
 CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 N_VALUES=20000 \
     sbatch --dependency=afterany:<pass1_jobid> --array=0-149 \
-    --mem-per-cpu=32G sherlock/submit_csf.sh
+    --mem-per-cpu=64G sherlock/submit_csf.sh
 ```
+
+**Why CSF's memory is quadratic in n, and why a failed pass 2 must be purged before
+resubmitting.** [baselines_csf.R](../src/air_cate/baselines_csf.R) calls
+`causal_survival_forest` without `failure.times`, so grf builds its internal survival and
+censoring curves on *every unique event time*. That grid grows with n, making the footprint
+go as n x |failure.times| ~ n^2 — grf warns about it directly once events exceed 10% of the
+sample ("consider supplying a coarser grid with the `failure.times` argument"). Supplying the
+shared M-grid would make it linear and much faster, and would remove a real confound (CSF's
+internal resolution otherwise grows with n along the convergence ladder), but it changes the
+baseline's specification and invalidates the five completed rungs — so it is a paper remark,
+not a rerun.
+
+The peak is reached inside the **first** of the 50 forests, which makes a probe cheap: submit
+`--array=0-0`, wait ~15 min, then `sstat -j <jobid> --format=JobID,MaxRSS --units=G` (`sstat`
+reads a *running* step; `sacct`'s `MaxRSS` only appears once a step has ended, and job
+39190716 left no `.batch` rows at all). If it clears, submit `--array=1-149` — the files are
+disjoint and task 0 finishes on its own.
+
+An OOM inside grf is caught by the harness, which writes a NaN cell and exits 0, so SLURM
+reports `OUT_OF_MEMORY` while the JSON gains a `"20000"` key full of NaNs. **Resume skips a
+cell on count alone** (`len(prior_vals) >= len(seeds)`, [plot_simulation.py:587](../examples/plot_simulation.py#L587)),
+so a higher-memory resubmit onto those files reports `cached` and computes nothing. Purge
+first, dropping a cell only when every value in it is NaN:
+
+```bash
+python - <<'EOF'
+import glob, json, math, os
+files = sorted(glob.glob("/scratch/users/grolleau/air_cate_metrics50/metrics50_*_CSF_b*.json"))
+purged = kept = 0
+for f in files:
+    d = json.load(open(f))
+    changed = False
+    for dgp, bym in d["results"].items():
+        for m, byn in bym.items():
+            vals = byn.get("20000")
+            if vals is None:
+                continue
+            finite = [v for v in vals
+                      if not (v.get("imse") is None
+                              or (isinstance(v["imse"], float) and math.isnan(v["imse"])))]
+            if finite:
+                kept += 1
+                print("KEPT (has finite values):", f, dgp, m)
+            else:
+                del byn["20000"]
+                changed = True
+                purged += 1
+    if changed:
+        tmp = f + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(d, fh, indent=2)
+        os.replace(tmp, f)
+print("purged cells:", purged, "  kept cells:", kept, "  files:", len(files))
+EOF
+```
+
+Do **not** reach for `--no-resume` instead: with `N_VALUES=20000` it rebuilds each file
+containing only that rung and destroys pass 1's five good rungs.
 
 `sacct` hides jobs that started before today unless `-S` widens the window, which is why the
 stage-2 lookup above needed a date. To re-measure after changing `num_trees`, `n_test` or `M`

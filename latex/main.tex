@@ -1,10 +1,10 @@
 \documentclass{article}
-\usepackage[numbers]{natbib}
-\bibliographystyle{unsrtnat}
+\usepackage{natbib}
+\bibliographystyle{plainnat}
 
-\usepackage{soul} % strikethrough -- remove later
 \usepackage{hyperref}       % hyperlinks
 \usepackage{amsfonts}       % blackboard math symbols
+\usepackage{xcolor}         % colored text
 \usepackage{amsmath}
 \usepackage{amsthm}
 \usepackage{mathrsfs}
@@ -12,8 +12,9 @@
 \usepackage{bbm}
 \usepackage{algorithm}
 \usepackage[noend]{algpseudocode} 
-\usepackage{xcolor} % REMOVE THIS LATER
-\usepackage{graphicx} % for scalebox remove later if possible
+\usepackage{graphicx}
+\usepackage{makecell}
+\usepackage{enumitem}
 
 \algrenewcommand\algorithmicrequire{\textbf{Input:}}
 \algrenewcommand\algorithmicensure{\textbf{Output:}}
@@ -45,6 +46,16 @@
 \newcommand{\nd}{\mathrm{d}}
 \newcommand{\Rp}{\mathbb{R}_+}
 \newcommand{\Rpstar}{\mathbb{R}_+^\ast}
+\newcommand{\YPO}{Y_{\mathrm{PO}}}
+\newcommand{\bD}{\mathrm{D}}
+
+\newcommand{\mbf}{\mathbf}
+\newcommand{\mbb}{\mathbb}
+\newcommand{\mcl}{\mathcal}
+
+\newcommand{\hattau}{\hat{\tau}}
+\newcommand{\hate}{\hat{e}}
+\newcommand{\hatS}{\hat{S}}
 
 \title{Learning Time-Varying Conditional Average Treatment Effects from Right-Censored Data}
 
@@ -69,165 +80,69 @@
 \maketitle
 
 \begin{abstract}
-Orthogonal methods for estimating heterogeneous treatment effects from right-censored survival data have generally targeted a single, analyst-chosen time horizon, producing a pointwise summary rather than the full effect trajectory.
-When the treatment effect changes sign over time, such a summary can reverse the treatment recommendation.
-We propose an estimator for the time-varying conditional average treatment effect, defined as the patient-level curve that traces the survival-probability difference between treated and untreated trajectories over the full follow-up.
-Extending the R-learner framework, we construct an augmented inverse-probability-of-censoring-weighted pseudo-outcome, integrate the resulting squared loss over time, and prove that its unique population minimizer is the target estimand.
-We establish Neyman orthogonality with respect to all nuisance functions, so that nuisance-estimation errors affect the treatment-effect loss only at second order.
-We parametrize the effect curve as a covariate-gated mixture of survival-function differences that satisfies the structural constraints of any valid treatment-effect curve, is universally approximating, and is fully differentiable, so that the entire model, including upstream feature encoders for unstructured inputs such as medical images or clinical text, can be trained end-to-end.
-Simulations calibrated to a stroke trial and an observational coronary-revascularization cohort demonstrate recovery of heterogeneous, time-varying treatment-effect patterns that fixed-horizon methods cannot detect.
+When deciding between coronary artery bypass grafting and percutaneous intervention---or, more broadly, between any two treatments with time-to-event outcomes---clinicians need to know how the treatment effect unfolds over time for each patient, not merely at a single, analyst-chosen time horizon.
+We propose the AIR (\textit{Augmented time-Integrated R-loss}) estimator for the time-varying conditional average treatment effect (tv-CATE), the patient-level curve tracing the survival-probability difference over the full follow-up.
+AIR extends the R-learner to right-censored data via an augmented inverse-probability-of-censoring-weighted pseudo-outcome; we prove that the tv-CATE is the unique minimizer of the integrated loss and establish Neyman orthogonality and quasi-oracle guarantees.
+The effect curve is parametrized as a covariate-gated mixture of Gamma survival-function differences, a representation that is structurally valid, universally approximating, and fully differentiable, enabling end-to-end training with encoders for unstructured inputs such as clinical text.
+Simulations demonstrate faster convergence relative to unconstrained baselines.
+We apply AIR to an observational cohort of patients with complex coronary artery disease from the Stanford Health Care, recovering heterogeneous treatment-effect patterns from unstructured angiography reports, and validate the estimated treatment rule via cross-validated calibration-for-benefit and sequentially validated targeting operator characteristic curves.
 \end{abstract}
-
-\newpage
 
 \section{Introduction}
 
-Precision medicine asks a patient-level counterfactual question: how
-would this individual's survival differ under treatment versus control
-as time unfolds?
-The natural answer is the time-varying conditional average treatment
-effect (tv-CATE), the patient-specific curve that traces the
-survival-probability difference between treated and untreated
-trajectories over the entire follow-up period.
+Many clinical decisions involve choosing between treatments whose relative benefits depend on both the patient and the time horizon.
+In complex coronary artery disease (complex CAD), for instance, a patient must decide between cardiac surgery (CABG) and percutaneous coronary intervention (PCI); randomized trials report similar average outcomes, yet subgroup analyses reveal substantial heterogeneity \citep{takahashi2020redevelopment}.
+For some patients surgery carries higher short-term risk but yields a durable long-term advantage, while for others the less invasive option is preferable throughout.
+A single scalar summary---a hazard ratio, or a survival difference at a fixed horizon---cannot distinguish these patterns: two patients whose effect curves have different shapes, or even different signs over time, may produce the same five-year estimate.
+Reporting at the wrong horizon can therefore reverse a treatment recommendation entirely.
+The difficulty is compounded by the fact that patients themselves value different horizons: a frail patient may prioritize two-year survival, while an otherwise healthy patient weighs a ten-year outlook.
+No single analyst-chosen time point can accommodate this diversity.
+The quantity that resolves both limitations is the \emph{tv-CATE}: the patient-specific curve tracing the difference in survival probabilities between treatment arms over the entire follow-up.
 
-Consider two patients with complex coronary artery disease deciding
-between cardiac surgery (CABG) and percutaneous coronary intervention
-(PCI).
-Population-level trials often show no clear average advantage, yet
-subgroup analyses suggest marked heterogeneity
-\citep{takahashi2020redevelopment}.
-For one patient, surgery may raise short-term risk while providing
-durable long-term benefit; for another, the less invasive option
-dominates at every time point.
-A hazard ratio or a survival difference at five years cannot distinguish
-these two patterns: the first patient's effect curve changes sign over
-time, moving from negative in the short term to positive in the long
-term, while the
-second's remains positive throughout, yet both may yield the same scalar
-summary at a particular horizon.
-When the effect changes sign over time, a summary at the wrong horizon
-gets the treatment recommendation backwards.
-Moreover, even when the effect is monotone, different patients weight
-different time horizons (a frail patient may care most about two-year
-survival), so no single analyst-specified horizon can respect both
-sources of heterogeneity simultaneously.
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figures/cate_curves.pdf}
+  \caption{Estimated tv-CATE curves for a single test observation (true curve in grey dashes). The solid blue line is our proposed Mixture of Gamma Differences (MGD) parametrization, which enforces by construction the constraints that any valid treatment-effect curve must satisfy---zero at baseline, bounded between $-1$ and $+1$, continuous, and vanishing at large times---while remaining a universal approximator (Theorem~\ref{thm:univ_approx}). By contrast, survival forest estimates are discontinuous step functions and the unconstrained tensor-product (TP) basis does not enforce $\tau(0 \mid x) = 0$. These constraint violations are not merely aesthetic: a model that must learn structural properties from data rather than encoding them \emph{a priori} has higher effective complexity, which translates into slower convergence (Section~\ref{sec:experiments}).}
+  \label{fig:cate_curves}
+\end{figure}
 
-\subsection*{Limitations of existing approaches}
+In this paper we develop practical methods for estimating the full effect trajectory from observational data and illustrate their implementation end-to-end on a real clinical cohort, including internal validation strategies suited to the modest sample sizes typical of comparative-effectiveness studies.
+Validating estimated heterogeneity is inherently difficult: the fundamental problem of causal inference precludes observing individual-level treatment effects, clinical cohorts are often too small for a simple train/test split, and standard cross-validation statistics are correlated across folds, invalidating naive aggregation of $p$-values and confidence intervals \citep{grf_rate_cv_vignette,bengio2004no}.
+We illustrate how these obstacles can be addressed in practice through our application to an observational cohort of patients with complex CAD, where we estimate patient-level time-varying treatment-effect trajectories comparing percutaneous coronary intervention to bypass surgery and internally validate the resulting prioritization rule.
 
-A growing literature addresses heterogeneous treatment effects for
-survival outcomes, encompassing meta-learner adaptations, tree-based
-estimators, and neural models that accommodate non-proportional hazards
-and censoring
-\citep{cui2023estimating,sverdrup2025efficient,xu2024estimating,
-curth2021survite,xu2023treatment,bo2024estimating,
-foster2023orthogonal,frauen2025orthogonal,datta2020new}.
+\subsection{Related work}\label{subsec:related}
+
+A growing literature addresses heterogeneous treatment effects for survival outcomes, encompassing meta-learner adaptations \citep{curth2021survite,xu2023treatment}, tree-based estimators \citep{cui2023estimating,sverdrup2025efficient,bo2024estimating}, and orthogonal or model-agnostic approaches that accommodate censoring \citep{xu2024estimating,frauen2025orthogonal}.
 Two gaps remain.
 
 \paragraph{Pointwise horizon targets.}
-Orthogonal methods for right-censored data, including the causal
-survival forest of \citet{cui2023estimating}, its log-rank extension
-by \citet{sverdrup2025efficient}, the censoring unbiased transformations
-of \citet{xu2024estimating}, and the model-agnostic orthogonal
-survival learners of \citet{frauen2025orthogonal}, estimate the
-treatment effect at individual time points rather than jointly
-recovering the full effect trajectory.
-Each such estimate is a scalar that cannot reveal whether a benefit at
-one horizon becomes a harm at another.
-More classical approaches, including proportional-hazards models and
-fixed-horizon restricted mean survival time differences
-\citep{cox1984,royston2013restricted}, share this limitation.
-Practitioners who wish to explore multiple horizons must refit or
-re-evaluate the estimator repeatedly, with no guarantee that the
-resulting family of pointwise estimates forms a valid treatment-effect
-curve.
+Orthogonal methods for right-censored data---the causal survival forest \citep{cui2023estimating}, efficient survival forests with log-rank splitting \citep{sverdrup2025efficient}, censoring unbiased transformations \citep{xu2024estimating}, and model-agnostic orthogonal survival learners \citep{frauen2025orthogonal}---estimate the treatment effect at individual time points rather than jointly recovering the full effect trajectory.
+Each such estimate is a scalar that cannot reveal whether a benefit at one horizon becomes a harm at another.
+More classical approaches, including Cox proportional-hazards models \citep{cox1984} and fixed-horizon restricted mean survival time differences \citep{royston2013restricted}, share this limitation.
 
 \paragraph{Structural validity.}
-Among the methods above, the causal survival forest and its log-rank
-extension rely on random forests, whose splitting rules are not
-differentiable with respect to the input representation.
-When treatment-effect information resides in unstructured data such as medical
-images or clinical text, one would like to train a feature encoder
-jointly with the treatment-effect model; non-differentiable learners
-preclude this, forcing the analyst to supply fixed, pre-extracted
-embeddings and forfeiting the ability to fine-tune representations for
-the causal objective.
-Model-agnostic formulations
-\citep{xu2024estimating,frauen2025orthogonal} resolve
-this limitation for fixed-horizon targets by allowing neural-network
-second-stage learners.
-However, none of these approaches, whether tree-based or
-neural, produces a treatment-effect \emph{curve} that is guaranteed to
-satisfy the constraints that any difference of two survival functions
-must obey: the curve must equal zero at baseline, be continuous, remain
-bounded between minus one and one, and vanish as the follow-up grows
-large.
-Without such guarantees, fitted trajectories can be biologically
-implausible, for instance predicting a survival-probability difference
-that exceeds one or that is nonzero at time zero.
-Moreover, while model-agnostic neural formulations
-\citep{xu2024estimating,frauen2025orthogonal} allow gradient-based
-training of the encoder, they optimize only a single-horizon loss and,
-being unconstrained in their output, do not enforce the structural
-properties of a valid treatment-effect curve.
+Forest-based methods rely on splitting rules that are not differentiable with respect to the input representation.
+When treatment-effect information resides in unstructured data such as medical images or clinical text, one would like to train a feature encoder jointly with the treatment-effect model; non-differentiable learners preclude this.
+Model-agnostic formulations \citep{xu2024estimating,frauen2025orthogonal} allow neural-network second-stage learners but optimize only a single-horizon loss.
+Moreover, none of these approaches produces a treatment-effect \emph{curve} guaranteed to satisfy the constraints that any difference of two survival functions must obey: zero at baseline, continuous, bounded between minus one and one, and vanishing as the follow-up grows large (see Figure~\ref{fig:cate_curves}).
 
-\subsection*{Our approach}
-We take the R-learner framework of \citet{nie2021quasi} as a starting
-point and extend it to the time-varying, right-censored setting.
-The key difficulty is that survival status at any given time is
-unobserved for censored patients.
-We replace it with an augmented inverse-probability-of-censoring-weighted
-(AIPCW) pseudo-outcome \citep{rubin2006doubly,cui2023estimating},
-integrate the resulting squared loss over the follow-up, and prove two
-properties of the resulting time-varying R-loss:
-first, its unique population minimizer is the tv-CATE
-(Theorem~\ref{th:loss}); and second, it is Neyman-orthogonal with
-respect to the propensity score and the arm-specific survival
-functions (Proposition~\ref{prop:neyman_ort}), so that
-nuisance-estimation errors affect the treatment-effect regret only at
-second order \citep{foster2023orthogonal}.
+\subsection{Our approach and contributions}\label{subsec:contributions}
 
-\subsection*{The AIR estimator}
+We extend the R-learner framework of \citet{nie2021quasi} to the time-varying, right-censored setting.
+The key difficulty is that survival status at any given time is unobserved for censored patients.
+We replace it with an augmented inverse-probability-of-censoring-weighted (AIPCW) pseudo-outcome \citep{rubin2006doubly,cui2023estimating}, integrate the resulting squared loss over the follow-up, and prove that (i) the tv-CATE is the unique population minimizer (Theorem~\ref{thm:loss}) and (ii) the loss is Neyman-orthogonal with respect to all nuisance functions (Proposition~\ref{prop:neyman_ort}), so that nuisance-estimation errors affect the treatment-effect regret only at second order \citep{foster2023orthogonal}.
 
-We propose the \textbf{AIR} (\textit{Augmented time-Integrated R-loss})
-estimator, which minimizes an empirical version of the time-varying
-R-loss over a structured parametric family: a covariate-gated mixture of
-differences of Gamma survival functions.
-This parametrization enforces, by construction, the structural
-constraints that any valid treatment-effect curve must satisfy:
-the curve equals zero at baseline, is continuous, remains bounded, and
-vanishes as the follow-up grows large. It is also dense in the relevant
-function class
-(Theorem~\ref{thm:univ_approx}) and fully differentiable, so that the
-entire model, including any upstream feature encoder for images or text,
-can be trained end-to-end with standard gradient-based optimizers.
-Nuisance components are estimated by cross-fitting to exploit the
-orthogonality of the loss
-\citep{schick1986asymptotically,chernozhukov2018double}.
+We propose the \textbf{AIR} (\textit{Augmented time-Integrated R-loss}) estimator, which minimizes an empirical version of this loss over a structured parametric family: a covariate-gated mixture of differences of Gamma survival functions (MGD).
+This parametrization enforces, by construction, the structural constraints of any valid treatment-effect curve, is dense in the relevant function class (Theorem~\ref{thm:univ_approx}), and is fully differentiable, so that the entire model---including upstream feature encoders for images or text---can be trained end-to-end.
 
-\subsection*{Contributions}
-This paper makes four contributions.
+\paragraph{Contributions.}
 \begin{enumerate}
-  \item We formalize the tv-CATE and the conditional restricted mean
-    survival time difference as patient-level estimands for
-    right-censored data and establish their identification under standard
-    causal and censoring assumptions (Section~\ref{sec:notations}).
-
-  \item We construct the time-varying R-loss from an AIPCW
-    pseudo-outcome, prove that the tv-CATE is its unique minimizer, and
-    establish Neyman orthogonality with respect to all nuisance functions
-    (Section~\ref{sec:rlosses}).
-
-  \item We introduce the AIR estimator with a covariate-gated Gamma
-    mixture parametrization that is structurally valid, universally
-    approximating, and differentiable, enabling end-to-end training
-    with deep-learning optimizers and pretrained encoders for multimodal
-    clinical data (Section~\ref{sec:estimation}).
-
-  \item We evaluate the estimator in a semi-synthetic simulation
-    calibrated on the IST-3 stroke trial and in an observational
-    coronary-revascularization cohort comparing CABG and PCI, recovering
-    heterogeneous, time-resolved treatment-effect patterns
-    (Section~\ref{sec:experiments}).
+  \item We formalize the tv-CATE and the time-varying conditional restricted mean survival time difference (CRMSTD) as patient-level estimands and establish their identification under standard causal and censoring assumptions (Section~\ref{sec:notations}).
+  \item We construct the time-varying R-loss, prove that the tv-CATE is its unique minimizer, establish Neyman orthogonality (Section~\ref{sec:rlosses}), and derive a quasi-oracle excess risk bound showing that nuisance-estimation errors are asymptotically negligible (Section~\ref{sec:asymptotics}).
+  \item We introduce the AIR estimator with the MGD parametrization that is structurally valid, universally approximating, and differentiable (Section~\ref{sec:estimation}).
+  \item We evaluate the estimator on simulations of increasing complexity, including an empirically calibrated scenario whose covariate distributions are derived from a publicly available randomized trial, demonstrating faster convergence relative to unconstrained baselines (Section~\ref{sec:experiments}).
+  \item We apply the method to an observational coronary-revascularization cohort, recovering heterogeneous, time-resolved treatment-effect patterns from unstructured clinical text (Section~\ref{sec:application}).
+  \item We illustrate how the estimated tv-CATE can be internally validated using calibration-for-benefit via cross-validation and targeting operator characteristic (TOC) curves via sequential validation (Section~\ref{sec:application}).
 \end{enumerate}
 
 \section{Background and notations}\label{sec:notations}
@@ -236,58 +151,55 @@ In this section we recall standard objects in survival analysis and causal infer
 
 \bigskip 
 
-We consider a study on a time-frame $\mathcal{T} \eqdef [0,\tend]$ with $\tend \in \R^*_+$ the known maximum follow-up time in the study. At baseline $t=0$, each patient receives one of two treatment options; we represent baseline, pre-treatment covariates (assumed time-invariant) by a random variable $X$ with range $\mathcal{X} \subseteq \R^m$, and treatment assignment by a binary random variable $W$. We model the time to death $D$ and the censoring time $C$ as non-negative real random variables. We denote the time at which the first event (death or censoring) occurs by $Z \eqdef \min(C,D)$ and the non-censoring indicator by $\Delta \eqdef \IDF\{D \leq C\}$.
+We consider a study on a time-frame $\mathcal{T} \eqdef [0,\tend]$ with $\tend \in \R^*_+$ the known maximum follow-up time in the study. 
+At baseline $t=0$, each patient receives one of two treatment options; we represent baseline, pre-treatment covariates (assumed time-invariant) by a random variable $X$ with range $\mathcal{X} \subseteq \R^m$ assumed compact, and treatment assignment by a binary random variable $W$. We model the time to death $D$ and the censoring time $C$ as non-negative real random variables. We denote the time at which the first event (death or censoring) occurs by $Z \eqdef \min(C,D)$ and the non-censoring indicator by $\Delta \eqdef \IDF\{D \leq C\}$.
 Throughout, the \emph{observed data} refers to the random vector $(X,W,Z,\Delta)$.
 
-\bigskip
 
 To streamline notations, we define the propensity score by $e(X) \eqdef \EX[W \mid X]$ and define the different survival functions as the stochastic processes
 \begin{align*}
     S^\dag(t\mid X) \eqdef& \PR(D>t \mid X), \\
     S^\dag_w(t\mid X) \eqdef& \PR(D>t \mid X,\,W=w), \\
-    S^*_w(t \mid X)\eqdef& \PR(C>t \mid X,W=w).
+    S^*_w(t \mid X)\eqdef& \PR(C>t \mid X,W=w)
 \end{align*}
+generically we will denote by $S(t^-) \eqdef \PR(U \geq t)$ whenever $S(t) = \PR(U > t)$.
 
-\bigskip
 
 We will rely on the causal inference potential outcome setup, that is, we assume the existence of $D^{w=1}$ and $D^{w=0}$ that model the time at which a patient dies if (possibly contrary to fact) they receive treatment or control respectively. 
 
 \subsection*{Causal estimands}
-This paper focuses on two estimand of interest. The primary estimand is the \emph{time-varying conditional CATE} defined as follows.
+This paper focuses on two estimands of interest. The primary estimand is the \emph{tv-CATE} defined as follows.
 
-\begin{definition}[{\bf Time-varying and time-fixed CATEs}]\label{def:t-CATE}
+\begin{definition}[{\bf Time-varying CATE and time-fixed CATE}]\label{def:t-CATE}
 Let $t \in \mathcal{T}$, the $t$-time-fixed CATE (or generically time-fixed CATE) denoted $\tau_t(X)$ is defined as the random variable given by
 \begin{align*}
 \tau_t(X) \eqdef \, \PR \bigl(D^{w=1}>t \mid X\bigr)-\PR \bigl(D^{w=0}>t \mid X\bigr).
 \end{align*}
-Hence, we define the \emph{time-varying CATE}, denoted $\tau$ or $\{\tau(t|X)\}_t$, as the random process $\{\tau_t(X)\}_{t \in \mathcal{T}}$.
+Hence, we define the \emph{tv-CATE}, denoted $\tau$ or $\{\tau(t|X)\}_t$, as the random process $\{\tau_t(X)\}_{t \in \mathcal{T}}$.
 \end{definition}
 In particular, for any $t \in \mathcal{T}$ it follows from the definition of time-fixed CATE that $\tau_t(X)> 0$ signals that experimental treatment $W=1$ increases the probability of being alive at time $t$.
 
-\bigskip
 
-Our secondary estimand is the \emph{time-varying conditional restricted mean survival time difference (CRMST difference)}.
+Our secondary estimand is the \emph{time-varying conditional restricted mean survival time difference} (CRMSTD).
 
-\bigskip
 
-The RMST difference is well-established in population-level analyses~\cite{royston2013restricted}. Here, we examine it in its time varying, covariate-conditional form defined as follows.
+The RMST difference is well-established in population-level analyses~\citep{royston2013restricted}. Here, we examine it in its time varying, covariate-conditional form defined as follows.
 %
-\begin{definition}[{\bf Time-varying CRMST difference}]\label{def:time_conditional_RMSTD}
-The time-fixed CRMST difference $\Gamma_t(X)$ is defined as the random variable 
+\begin{definition}[{\bf Time-varying CRMSTD}]\label{def:time_conditional_RMSTD}
+The time-fixed CRMSTD $\Gamma_t(X)$ is defined as the random variable 
 \begin{align*}
 \Gamma_t (X) &\eqdef \int_0^{t} \PR \bigl(D^{w=1}>u \mid X \bigr) \nd u - \int_0^{t} \PR \bigl(D^{w=0}>u \mid X) \nd u.
 \end{align*}
-Hence, the time-varying CRMST difference denoted $\Gamma$ or $\{ \Gamma(t \mid X) \}_t$ is defined as the random process $\{ \Gamma_t(X) \}_{t \in \mathcal{T}}$.  
+Hence, the time-varying CRMSTD denoted $\Gamma$ or $\{ \Gamma(t \mid X) \}_t$ is defined as the random process $\{ \Gamma_t(X) \}_{t \in \mathcal{T}}$.  
 \end{definition}
 In particular, for any $t \in \mathcal{T}$ one has
 \[ \Gamma(t \mid X) = \Gamma_t(X) = \int_0^{t} \tau(u \mid X)\nd u\]
 hence $\Gamma(t\mid x)$ measures the \emph{expected difference in survival time} accumulated between study start and the horizon $t$ between two patients with baseline covariates $X$ that receive treatment or control respectively. If $\Gamma(t \mid X)$ is positive the treatment is predicted to prolong life by $\Gamma(t\mid X)$ time-units on average by time $t$, while a negative value signals a reduction.
 
-\bigskip
 
 
 \subsection*{Causal Identifiability Assumptions}
-The following assumption allows use to identify our estimands \cite{robins2000correcting}.
+The following assumption allows use to identify our estimands \citep{robins2000correcting}.
 \begin{assumption}[{\bf Consistency over time}]\label{as:cons_t} A treatment option is consistent regardless of how it is administered; that is, there are no \emph{versions} of a treatment option. Formally, $$D=WD^{w=1}+(1-W)D^{w=0}.$$
 \end{assumption}
 
@@ -297,106 +209,103 @@ The following assumption allows use to identify our estimands \cite{robins2000co
 \end{assumption}
 \begin{assumption}[{\bf Noninformative censoring}]\label{as:cens} Censoring and survival time are independent conditionally on treatment assignment and covariates. Formally, $$C \indep D \mid X, W.$$
 \end{assumption}
-\begin{assumption}[{\bf Positivity in non-censoring and being at risk}]\label{as:ovl_cens}
-Throughout the follow-up, there are strictly always patients at risk of censoring and death in each treatment arm.
+\begin{assumption}[{\bf Positivity in non-censoring}]\label{as:ovl_cens}
+Throughout the follow-up, there are strictly always patients at risk of censoring in each treatment arm.
 Formally, let $w \in \{0,1\}$ be a treatment and $t \in \mathcal{T}$; there exists $\eta \in \R_+^*$ such that
 \[
-  0<\eta < S^*_w(t\mid X)
-  \qquad\text{and}\qquad
-  0<\eta < S^\dag_w(t\mid X).
+  0<\eta < S^*_w(t\mid X).
 \]
 \end{assumption}
-
+%REMARK: Alex: As Stefan said, no need in positivity to be at risk for identification, maybe for asymptotics. I suggest that we remove it from here and add it (if needed to the asymptotic result)
 
 
 \section{R-Losses}\label{sec:rlosses}
 %
-We introduce time-varying (respectively, time-fixed) R-losses, extending the R-loss of Nie and Wager \cite{nie2021quasi} to the estimands in this paper: the time-varying (respectively, time-fixed) CATE.
+We introduce time-varying (respectively, time-fixed) R-losses, extending the R-loss of \citet{nie2021quasi} to the estimands in this paper: the tv-CATE (respectively, time-fixed CATE).
 %
-\subsection*{Time fixed and time-varying R-loss}
-
-We begin with a decomposition showing that the time-varying CATE is identifiable from uncensored data \cite{rosenbaum1983central}.
+We begin with a decomposition showing that the tv-CATE is identifiable from uncensored data \citep{rosenbaum1983central}.
 \begin{proposition}\label{prop:g}
 Under Assumptions \ref{as:cons_t}–\ref{as:ovl}, the time‐varying conditional average treatment effect from Definition \ref{def:t-CATE} decomposes as $$\tau(t \mid X)=S^\dag_1(t \mid X)-S^\dag_0(t \mid X).$$
 \end{proposition}
+
+\subsection{AIPCW pseudo-outcome}
+
 We next introduce the augmented inverse-probability-of-censoring-weighted (AIPCW) pseudo-outcome, following \citet{rubin2006doubly} and \citet{cui2023estimating}.
 \begin{definition}[{\bf AIPCW pseudo-outcome}]
-Under Assumption \ref{as:ovl_cens}, define the \emph{AIPCW pseudo-outcome} by
-   \begin{align*}
-Y_{\mathrm{PO}}(t) &\eqdef \frac{\IDF\{Z > t\}}{S^*_W(t \mid X)}
-+ \frac{\IDF\{Z \le t, \Delta=0\} S^\dagger_W(t \mid X)}{S^\dagger_W(Z \mid X) S^*_W(Z \mid X)} \\
-&-  \int_0^{\min(Z, t)} \frac{S^\dagger_W(t \mid X)\lambda^*_W(u \mid X) }{S^\dagger_W(u \mid X) S^*_W(u \mid X)} \nd u,
+Under Assumption \ref{as:ovl_cens}, define the \emph{AIPCW pseudo-outcome} $Y_{\mathrm{PO}}(t)$ by
+\begin{align*}
+Y_{\mathrm{PO}}(t) \eqdef \frac{\IDF\{Z > t\}}{S^*_W(t | X)} + S^\dagger_W(t | X)
+\left[ \frac{\IDF\{Z \le t, \Delta=0\}  }{S^\dagger_W(Z^- | X) S^*_W(Z| X)}
+-  \int_{0}^{t} \frac{\IDF\{u \leq Z\}  \nd\Lambda^*_W(u| X)}{S^\dagger_W(u^-| X) S^*_W(u| X)} \right] 
 \end{align*}
-where $\lambda^*_W$ denotes the censoring hazard function:  $$\lambda^*_W(t \mid X) \eqdef - \frac{\nd}{\nd t} \log S^*_W(t \mid X).$$ 
+where $\nd\Lambda^*_W$ denotes the censoring cumulative hazard measure on $(0,\tend]$ i.e.
+\[ \nd\Lambda_W^*(u|X) \eqdef -\frac{\nd S_W^*(u|X)}{S_W^*(u^-|X)}.\]
 \end{definition}
-The AIPCW pseudo-outcome is unbiased in the following sense.
-\begin{proposition}[{\bf  Unbiasedness of the pseudo-outcome}]\label{prop:unbiasedness}
-Under Assumptions \ref{as:cens} and \ref{as:ovl_cens}, the pseudo-outcome $Y_{\mathrm{PO}}(t)$ satisfies
-\[
-\EX\bigl[Y_{\mathrm{PO}}(t) \mid X,\, W\bigr] = S^\dagger_W(t \mid X).
-\]
+This AIPCW pseudo-outcome is unbiased in the following sense and yields an AIPCW version of the Robinson decomposition \citep{robinson1988root}.
+\begin{proposition}\label{prop:unbiasedness}
+Under Assumptions \ref{as:cens} and \ref{as:ovl_cens}, the pseudo-outcome $Y_{\mathrm{PO}}(t)$ satisfies $\EX\bigl[Y_{\mathrm{PO}}(t) | X,\, W\bigr] = S^\dagger_W(t | X)$.
 \end{proposition}
-A proof is provided in Appendix \ref{proof:unbiasedness}. Using this pseudo-outcome, we define R-losses adapted to the time-fixed and time-varying CATE in the presence of censoring.
+\begin{lemma}[{\bf Robinson decomposition}]\label{lemma:robinson_dec}
+For any $t \in \mathcal{T}$ define the Robinson residual by 
+\[
+\varepsilon_t \eqdef  Y_{\mathrm{PO}}(t)- S_0^\dag(t\mid X) - W\tau_t(X).
+\]
+Under Assumptions \ref{as:cons_t}-\ref{as:ovl_cens}, for any $t \in \mathcal{T}$ one has the decomposition 
+\[Y_{\mathrm{PO}}(t) - S^\dag(t|X) = \{W-e(X)\}\tau_t(X) + \varepsilon_t\]
+with $\EX [ \varepsilon_t \mid X,W ] = 0$.
+\end{lemma}
 
-\begin{definition}[{\bf Time-fixed and Time-varying R-Losses}]
+\subsection{Time fixed and time-varying R-loss}
+Using this pseudo-outcome, we define R-losses adapted to the time-fixed CATE and tv-CATE in the presence of censoring.
+
+\begin{definition}[{\bf Time-fixed and Time-varying R-Losses}]\label{def:loss}
 Define the $t$-time fixed R-loss $\mathcal{L}^R_t$ and time-varying R-loss $\mathcal{L}^R$ as the functionals given by
 \begin{align*}
-\mathcal{L}_t^R(\eta_t) &\eqdef \EX \left[ \Big(Y_{\mathrm{PO}}(t)- S^\dag(t|X) -\{W-e(X)\}\eta_t(X)\Big)^2 \right],\\
+\mathcal{L}_t^R(\xi) &\eqdef \EX \left[ \Big(Y_{\mathrm{PO}}(t)- S^\dag(t|X) -\{W-e(X)\}\xi(X)\Big)^2 \right],\\
 \mathcal{L}^{R}(\eta) &\eqdef \int_{\mathcal{T}} \EX \left[ \Big(Y_{\mathrm{PO}}(t)-S^\dag(t|X)-\{W-e(X)\}\eta(t|X)\Big)^2 \right] \nd t,
 \end{align*}
-for $\eta : \mathcal{T} \times \mathcal{X} \to \R$ and $\eta_t : \mathcal{X} \to \R$ any two square integrable functions.
+for $\eta : \mathcal{T} \times \mathcal{X} \to \R$ and $\xi : \mathcal{X} \to \R$ any two square integrable functions.
 \end{definition}
 %
-The argument of $\mathcal{L}_t^R$ is time-independent. The subscript $t$ is purely notational and serves two purposes: it distinguishes functions with codomain $\mathcal{X}$ from functions with codomain $\mathcal{T}\times\mathcal{X}$, and it indicates that an object is time-fixed (while dropping the subscript denotes its time-varying analogue). Moreover, for any square-integrable function $\eta$, the time-varying R-loss is the integral of the time-fixed R-loss, namely
+For any square-integrable function $\eta$, the time-varying R-loss is the integral of the time-fixed R-loss, namely
 \begin{align*}
 \mathcal{L}^R(\eta)=\int_{\mathcal{T}} \mathcal{L}_t^R(\eta_t)\,\nd t
 \end{align*}
 where, for any $t \in \mathcal{T}$, $\eta_t$ is defined by $x \mapsto \eta(t\mid x)$ and is square-integrable by Tonelli's theorem.
-
-\bigskip
-
-These losses recover the time-fixed and time-varying CATEs. Using the AIPCW pseudo-outcome, for any $t \in \mathcal{T}$ define the residual
-\begin{align*}
-\varepsilon_t \eqdef  Y_{\mathrm{PO}}(t)- S_0^\dag(t\mid X) - W\tau_t(X)
-\end{align*}
-which yields the following AIPCW version of the Robinson decomposition \cite{robinson1988root}.
-\begin{lemma}[{\bf AIPCW-type Robinson decomposition}]\label{lemma:robinson_dec}
-Under Assumptions \ref{as:cons_t}-\ref{as:ovl_cens}, for any $t \in \mathcal{T}$ one has the decomposition 
-$$Y_{\mathrm{PO}}(t) - S^\dag(t|X) = \{W-e(X)\}\tau_t(X) + \varepsilon_t.$$
-\end{lemma}
-
-\begin{theorem}[{\bf Identifiability}]\label{th:loss}
-Under Assumption \ref{as:cons_t}-\ref{as:ovl_cens}, for any $t \in \mathcal{T}$ the $t$-time-fixed CATE \( \tau_t \) (resp. the time varying CATE \( \tau \)) is the unique minimizer of $\mathcal{L}_t ^{R}$ (resp. $\mathcal{L}^{R}$).
+As intended, these losses recover the time-fixed CATE and tv-CATE. 
+\begin{theorem}[{\bf Identifiability}]\label{thm:loss}
+Under Assumption \ref{as:cons_t}-\ref{as:ovl_cens}, for any $t \in \mathcal{T}$ the $t$-time-fixed CATE \( \tau_t \) is the unique minimizer of $\mathcal{L}_t ^{R}$. Similarly, the tv-CATE \( \tau \) is the unique minimizer of $\mathcal{L}^{R}$.
 \end{theorem}
-The proofs of Lemma \ref{lemma:robinson_dec} and Theorem \ref{th:loss} are provided in Appendix \ref{proof:new_loss}.
 
+
+All proofs for the results from this section are provided in Appendix~\ref{appendix:proof_rlosses}.
+
+\subsection{Orthogonal statistical learning}
 An additional key property is that nuisance-estimation errors affect these losses only at second order. More precisely:
-\begin{proposition}\label{prop:neyman_ort}
-The $t$-time fixed R-loss $\mathcal{L}_t^R$ and the time-varying $R$-loss are Neyman-orthogonal (in the sense of \cite{foster2023orthogonal}).
+\begin{proposition}[{\bf Neyman orthogonality}]\label{prop:neyman_ort}
+Under Assumptions \ref{as:cons_t}–\ref{as:ovl_cens} and continuity of $S^\dagger_W(\cdot\mid X)$ on $(0,\tend]$, the time-fixed R-loss $\mathcal{L}_t^R$ is Neyman-orthogonal with respect to all nuisance functions: for every $t\in\mathcal{T}$,
+{\color{blue}\textit{[Alex to complete from his notes.]}}
+The same holds for the time-varying R-loss $\mathcal{L}^R$ by integration over $\mathcal{T}$.
 \end{proposition}
-This property allows us to apply results from the orthogonal statistical learning literature (see Section \ref{sec:quasioracle}).
+%TODO Alex: To make sure this is correct and add a proof
 
 \section{Estimation and Inference}\label{sec:estimation}
 
-We observe the data $(X_i,W_i,Z_i,\Delta_i)$ for all $i$ between $1$ and $n$ and suppose these random vectors are i.i.d. from some distribution. This section describes how we estimate the time-varying CATE and CRMST difference by minimizing the orthogonal $R$-loss built from the AIPCW pseudo-outcome.
+We observe the data $(X_i,W_i,Z_i,\Delta_i)$ for all $i$ between $1$ and $n$ and suppose these random vectors are i.i.d. from some distribution. This section describes how we estimate the tv-CATE and CRMSTD by minimizing the orthogonal $R$-loss built from the AIPCW pseudo-outcome.
 
 \subsection{Augmented and Integrated R-loss (AIR) estimator}
 \label{subsec:opt_objective}
-We posit a parametric family $\{\tau(\cdot\mid\cdot;\theta):\theta\in\Theta\}$ for the time-varying CATE (see Section~\ref{subsec:param_spec}).
+We posit a parametric family $\{\tau(\cdot\mid\cdot;\theta):\theta\in\Theta\}$ for the tv-CATE (see Section~\ref{subsec:param_spec}).
 We estimate $\theta$ by empirical risk minimization,
 \[
-\hat\theta \in \argmin_{\theta\in\Theta}\Big\{\widehat{\mathcal L}^{R}\big(\tau(\cdot\mid\cdot;\theta)\big)+\Lambda(\theta)\Big\},
+\hat\theta \in \argmin_{\theta\in\Theta}\Big\{\widehat{\mathcal L}^{R}\big(\tau(\cdot\mid\cdot;\theta)\big)+\Omega(\theta)\Big\},
 \]
-where $\Lambda(\theta)$ is a regularizer (e.g., weight decay, early stopping) controlling the effective complexity of the model class.
+where $\Omega(\theta)$ is a regularizer (e.g., weight decay, early stopping) controlling the effective complexity of the model class.
 
 \paragraph{Discretization.}
 Let $\{t_m\}_{m=0}^{M}$ be a uniform grid on $[0,\tend]$ with step size $\delta>0$ (so $t_m=m\delta$ and $M=\lfloor \tend/\delta\rfloor$).
 We approximate all time integrals in $\mathcal L^R$ and in the AIPCW augmentation term by Riemann sums over this grid.
 Since the censoring hazard estimator below uses a centered finite difference, it is evaluated only at interior points $m\in\{1,\ldots,M-1\}$.
-A convenient rule of thumb for choosing $\delta$ is
-\(
-\delta \;=\; \tfrac{1}{2}\min_{1\le i<j\le n}|Z_i-Z_j|.
-\)
 
 \paragraph{Cross-fitting and numerical stability.}
 Let $\hat e(x)$, $\widehat S_w^{\dag}(t\mid x)$, and $\widehat S_w^{*}(t\mid x)$ denote nuisance estimates of the propensity score and the arm-specific event and censoring survival functions.
@@ -419,7 +328,7 @@ For subject $i$, define
 \widetilde{Y}_i(t)
 \;\eqdef\;&\frac{\IDF\{Z_i>t\}}{\widetilde{S}^{*}_{W_i}(t\mid X_i)}
 + \frac{\IDF\{Z_i\le t,\,\Delta_i=0\}\,\widetilde{S}^{\dag}_{W_i}(t\mid X_i)}{\widetilde{S}^{\dag}_{W_i}(Z_i\mid X_i)\,\widetilde{S}^{*}_{W_i}(Z_i\mid X_i)}\\
-&-\frac{M}{M-2}\sum_{m=1}^{M-1}\delta\,\IDF\{t_m\le \min\{Z_i,t\}\}\,
+&-\frac{M\delta}{M-2}\sum_{m=1}^{M-1}\,\IDF\{t_m\le \min\{Z_i,t\}\}\,
 \frac{\widetilde{S}^{\dag}_{W_i}(t\mid X_i)\,\widehat{\lambda}^{*}_{W_i}(t_m\mid X_i)}{\widetilde{S}^{\dag}_{W_i}(t_m\mid X_i)\,\widetilde{S}^{*}_{W_i}(t_m\mid X_i)}.
 \end{aligned}
 \]
@@ -438,42 +347,42 @@ Given $\widetilde{Y}_i(t)$, define the marginal survival nuisance
 \widetilde{S}_1^{\dag}(t\mid X)\,\tilde e(X)
 +\widetilde{S}_0^{\dag}(t\mid X)\,\big(1-\tilde e(X)\big),
 \]
-and minimize the discretized empirical $R$-loss from Theorem~\ref{th:loss},
+and minimize the discretized empirical $R$-loss from Theorem~\ref{thm:loss},
 \[
 \widehat{\mathcal{L}}^{R}\!\big(\tau(\cdot\mid\cdot;\theta)\big)
 =
-\frac{1}{n}\sum_{i=1}^{n}\sum_{m=0}^{M}\delta\,
+\frac{\delta}{n}\sum_{i=1}^{n}\sum_{m=0}^{M}
 \Big\{\widetilde{Y}_i(t_m)
 -\widetilde{S}^{\dag}(t_m\mid X_i)
 -\big(W_i-\tilde e(X_i)\big)\,\tau(t_m\mid X_i;\theta)
 \Big\}^{2}.
 \]
 
-We summarize the AIR estimation procedure for the time-varying CATE and CRMST difference in Algorithm~\ref{algo:estimation}.
+We summarize the AIR estimation procedure for the tv-CATE and CRMSTD in Algorithm~\ref{algo:estimation}.
 
 \begin{algorithm}[h!]
-\caption{Cross-fitted AIR estimator for the time-varying CATE and CRMST difference}\label{algo:estimation}
+\caption{Cross-fitted AIR estimator for the tv-CATE and CRMSTD}\label{algo:estimation}
 \begin{algorithmic}[1]
-\Require Data $\{(X_i,W_i,Z_i,\Delta_i)\}_{i=1}^n$, horizon $\tend$, grid step $\delta>0$, regularizer $\Lambda(\cdot)$, model class $\{\tau(\cdot\mid\cdot;\theta):\theta\in\Theta\}$.
+\Require Data $\{(X_i,W_i,Z_i,\Delta_i)\}_{i=1}^n$, horizon $\tend$, grid step $\delta>0$, regularizer $\Omega(\cdot)$, model class $\{\tau(\cdot\mid\cdot;\theta):\theta\in\Theta\}$.
 \Ensure Fitted functions $\hat{\tau}:[0,\tend]\!\times\!\mathcal{X}\to\mathbb{R}$ and $\hat{\Gamma}:[0,\tend]\!\times\!\mathcal{X}\to\mathbb{R}$.
 \State Build the uniform grid $\mathcal{T}=\{t_m=m\delta:\ m=0,\ldots,M\}$ with $M=\lfloor\tend/\delta\rfloor$.
 \State Split indices into $Q$ folds; for each fold $q$, fit nuisance models on the complement and predict on fold $q$:
 \Statex \hspace{\algorithmicindent} propensity $\hat e^{-q}(x)$, event survivals $\widehat S_{w}^{\dag\,{-q}}(t\mid x)$, and censoring survivals $\widehat S_{w}^{*\,{-q}}(t\mid x)$.
-\State Clip nuisances for stability (for some $\varepsilon\in(0,1/2)$): $\tilde e=\mathrm{clip}(\hat e,\varepsilon,1-\varepsilon)$, $\widetilde S^{\dag}=\max(\widehat S^{\dag},\varepsilon)$, and $\widetilde S^{*}=\max(\widehat S^{*},\varepsilon)$.
+\State Clip nuisances for stability (for some $\varepsilon\in(0,1/2)$): $\tilde e=\mathrm{clip}(\hat e^{-q},\varepsilon,1-\varepsilon)$, $\widetilde S^{\dag}=\max(\widehat S^{\dag\,{-q}},\varepsilon)$, and $\widetilde S^{*}=\max(\widehat S^{*\,{-q}},\varepsilon)$.
 \State For each subject $i$ and interior grid point $m\in\{1,\ldots,M-1\}$, estimate the censoring hazard by a centered finite difference:
 \Statex \hspace{\algorithmicindent} $\displaystyle \widehat\lambda^{*}_{W_i}(t_m\mid X_i)=\frac{\log \widetilde S^{*}_{W_i}(t_{m-1}\mid X_i)-\log \widetilde S^{*}_{W_i}(t_{m+1}\mid X_i)}{t_{m+1}-t_{m-1}}.$
 \State For each $i$ and $t_m\in\mathcal T$, compute the discretized AIPCW pseudo-outcome $\widetilde{Y}_i(t_m)$ as in \S\ref{subsec:opt_objective}.
 \State Form the marginal survival nuisance $\widetilde{S}^{\dag}(t\mid X)=\widetilde S_1^{\dag}(t\mid X)\,\tilde e(X)+\widetilde S_0^{\dag}(t\mid X)\,(1-\tilde e(X))$.
 \State Minimize over $\theta\in\Theta$ the regularized discretized empirical $R$-loss
-\Statex \hspace{\algorithmicindent} $\displaystyle \widehat{\mathcal{L}}^{R}\!\big(\tau(\cdot\mid\cdot;\theta)\big)=\frac{1}{n}\sum_{i=1}^{n}\sum_{m=0}^{M}\delta\,\Big\{\widetilde{Y}_i(t_m)-\widetilde{S}^{\dag}(t_m\mid X_i)-\big(W_i-\tilde e(X_i)\big)\,\tau(t_m\mid X_i;\theta)\Big\}^{2}$
-\Statex \hspace{\algorithmicindent} plus $\Lambda(\theta)$, yielding $\hat\theta$.
-\State Output $\hat\tau(t\mid x)=\tau(t\mid x;\hat\theta)$ and the discretized CRMST difference
+\Statex \hspace{\algorithmicindent} $\displaystyle \widehat{\mathcal{L}}^{R}\!\big(\tau(\cdot\mid\cdot;\theta)\big)=\frac{\delta}{n}\sum_{i=1}^{n}\sum_{m=0}^{M}\Big\{\widetilde{Y}_i(t_m)-\widetilde{S}^{\dag}(t_m\mid X_i)-\big(W_i-\tilde e(X_i)\big)\,\tau(t_m\mid X_i;\theta)\Big\}^{2}$
+\Statex \hspace{\algorithmicindent} plus $\Omega(\theta)$, yielding $\hat\theta$.
+\State Output $\hat\tau(t\mid x)=\tau(t\mid x;\hat\theta)$ and the discretized CRMSTD
 \Statex \hspace{\algorithmicindent} $\displaystyle \hat\Gamma(t\mid x)=\sum_{m:\,t_m\le t}\delta\,\hat\tau(t_m\mid x)$.
 \end{algorithmic}
 \end{algorithm}
 
-\subsection{Unconstrained Parametric Specification for Time-Varying CATEs}
-A natural starting point is to model the time-varying CATE $\tau(t\mid x)$ directly with a generic tensor-product basis expansion, for instance
+\subsection{Unconstrained Parametric Specification for tv-CATEs}
+A natural starting point is to model the tv-CATE $\tau(t\mid x)$ directly with a generic tensor-product basis expansion, for instance
 \[
 \tau(t\mid x)
 \;=\;
@@ -491,13 +400,13 @@ Consequently, $\tau$ must satisfy basic structural restrictions for every $x$:
 (i) $\tau(0\mid x)=0$;
 (ii) $\tau(t\mid x)\in[-1,1]$ for all $t$;
 and (iii) $\tau(t\mid x)\to 0$ as $t\to\infty$ whenever both arm-specific survival functions vanish.
-A direct basis model does not enforce any of these constraints, so finite-sample fits may yield time-varying CATEs that are incompatible with any pair of survival distributions. This mismatch can persist even with large samples if regularization or limited basis size prevents the estimator from entering the constrained region.
+A direct basis model does not enforce any of these constraints, so finite-sample fits may yield tv-CATEs that are incompatible with any pair of survival distributions. This mismatch can persist even with large samples if regularization or limited basis size prevents the estimator from entering the constrained region.
 
 These considerations motivate adopting a parameterization that enforces survival compatibility by construction. In the next subsection, we introduce a flexible covariate-dependent specification for $\tau(t\mid x)$ that respects the structural restrictions above while remaining rich enough to approximate the target function class of interest.
 
-\subsection{Parametric Specification for Time-Varying CATEs}
+\subsection{Parametric Specification for tv-CATEs}
 \label{subsec:param_spec}
-We parameterize the time-varying CATE $\tau(t\mid x)$ directly as a covariate-gated mixture of $K$ time profiles,
+We parameterize the tv-CATE $\tau(t\mid x)$ directly as a covariate-gated mixture of $K$ time profiles,
 \[
 \tau(t\mid x;\theta)
 =\sum_{k=1}^{K}\rho_k(x;\beta)\,\mathrm{TE}_k(t),
@@ -513,9 +422,7 @@ Each profile $\mathrm{TE}_k$ is a difference of two Gamma survival functions,
 G(t;\bar\alpha,\lambda_{k,1})-G(t;\bar\alpha,\lambda_{k,0}),
 \]
 with a shared shape parameter $\bar\alpha$ across profiles and arm-specific scales $\lambda_{k,0},\lambda_{k,1}>0$.
-\emph{Rationale for a shared shape.} The next subsection establishes that this mixture family is dense in the target function class \emph{even under the restriction to a common shape parameter} $\bar\alpha$. Consequently, imposing a shared $\bar\alpha$ preserves approximation capacity while reducing the effective dimensionality of the parameter space and improving the statistical and numerical stability of estimation.
-
-We use the Gamma survival function:
+The next subsection establishes that this mixture family is dense in the target function class \emph{even under the restriction to a common shape parameter} $\bar\alpha$. Consequently, imposing a shared $\bar\alpha$ preserves approximation capacity while reducing the effective dimensionality of the parameter space and improving the numerical stability of estimation. We use the Gamma survival function:
 \[
 G(t;\alpha,\lambda)
 \;\eqdef\;
@@ -530,35 +437,1335 @@ The parameter vector is
 $\theta=\big(\bar\alpha,\{\beta_k\}_{k=1}^{K},\{\lambda_{k,0},\lambda_{k,1}\}_{k=1}^{K}\big)$,
 with a user-specified (or learned) feature map $\phi:\mathcal{X}\to\mathbb{R}^{p}$.
 
-\paragraph{Practical notes.}
+The hyperparameter $K$ controls flexibility and is tunable via cross-validation.
+The gating weights $\rho_k(x;\beta)$ and shape $\bar\alpha$ are shared across profiles, while the arm-specific scales $(\lambda_{k,0},\lambda_{k,1})$ determine the time pattern and magnitude of each $\mathrm{TE}_k(t)$.
+For a fixed $x$, the weights act as soft memberships over $K$ latent effect profiles.
+The feature map $\phi(\cdot)$ may be linear (with optional spline or interaction terms) or a learned representation from a neural network.
+Further practical details---including nuisance-function estimation, positivity constraints, and time-grid discretization---are deferred to Appendix~\ref{appendix:implementation}.
+
+\subsection{Universal Approximation by this parametrization}
+
+Let $\mathcal{S} \subseteq \mathcal{C}(\R_+ \times \mathcal{X})$ denote the set of continuous functions $\eta$ such that for every $x \in \mathcal{X}$ the function $t \mapsto 1 - \eta(t,x)$ is a cumulative distribution function (cdf) on $\R_+$. We denote by $\mathcal{S}  - \mathcal{S}$ the set of differences of such conditional survival functions.
+
+
+Define the softmax map $\omega:\mathbb R^n\to\mathbb R^n$ by $\omega_i(z)=e^{z_i}/ \sum_{j=1}^n e^{z_j}$ and recall that $G$ denotes the survival function of a gamma distribution.
+
+\begin{theorem}[\bf Universal approximation] \label{thm:univ_approx}
+There exists a sequence $\{\phi^i\}_{i\ge 1}$ in $\mathrm{C}(\mathcal{X})$ such that for any $\varepsilon \in \R_+^*$ and any $f \in \mathcal{S} - \mathcal{S}$ there exists $C \in \R^{p \times K}$, $b^1, b^0 \in \R_+^K$ and $\alpha \in \R_+^*$ such that
+\begin{align*}
+\sup_{(t,x) \in \R_+ \times \mathcal{X}} \Big| f(t,x) - \sum_{k=1}^K \omega_k\!\big(C^\top\phi_p(x)\big) \big[G(t;\alpha,b_k^1)-G(t;\alpha,b_k^0) \big]  \Big| < \varepsilon
+\end{align*}
+where $\phi_p \eqdef (\phi^1,\ldots,\phi^p)$.
+\end{theorem}
+A proof is provided in Appendix~\ref{proof:univ_approx}.
+
+
+\section{Asymptotic Properties}\label{sec:asymptotics}
+
+%TODO Alex: Detail the quasi-oracle regret bound that follows from Neyman orthogonality (Proposition~\ref{prop:neyman_ort}).
+% Verify Assumptions 1--4 of Foster et al. (2023) for the time-varying R-loss and state the excess risk bound.
+% Sketch: nuisance errors enter only through a product of two estimation rates, yielding the quasi-oracle property.
+
+\begin{theorem}[{\bf Quasi-oracle bound}]\label{thm:quasi_oracle}
+Under Assumptions \ref{as:cons_t}–\ref{as:ovl_cens} and regularity conditions detailed in Appendix~\ref{appendix:proof_rlosses}, let $\hat\tau$ be an estimator in a function class $\mathcal{F}$ with critical radius $\delta_n$. Then
+{\color{blue}\textit{[Alex to complete from his notes.]}}
+\end{theorem}
+%TODO Alex: To make sure the statement is correct, add regularity conditions, and write the proof.
+
+
+\section{Simulation Study}\label{sec:experiments}
+
+We evaluate the proposed estimator on three data-generating processes (DGPs) of increasing complexity, comparing six estimation strategies across training-set sizes $n \in \{500,\; 1{,}000,\; 2{,}000,\; 5{,}000,\; 10{,}000,\; 20{,}000\}$.
+All three DGPs generate right-censored survival data with censoring independent of event time given covariates and treatment.
+DGP~1 (Heterogeneous Weibull) tests basic recovery of covariate-driven heterogeneity; DGP~2 (Weibull Mixture) tests recovery of heterogeneity in the \emph{shape} of the CATE curve; and DGP~3 (Empirically Calibrated) is calibrated on baseline data from the Third International Stroke Trial \citep{sandercock2012benefits}, with structured covariates generated by a Tabular Variational Autoencoder \citep{xu2019modeling} trained on the trial's baseline patient characteristics.
+In addition to the structured covariates, synthetic embedding features are appended as a proxy for unstructured clinical inputs such as free-text notes or medical imaging; these embeddings carry treatment-effect information not captured by the structured covariates.
+This scenario evaluates whether the proposed estimator can exploit such auxiliary features to recover treatment-effect heterogeneity, as would arise when leveraging rich electronic health record data.
+Complete specifications are given in Appendix~\ref{appendix:dgps}.
+
+\subsection{Methods compared}
+
+For each DGP we evaluate six estimators of the tv-CATE; full architectural specifications, training hyperparameters, and preprocessing choices are given in Appendix~\ref{appendix:implementation}.
+\begin{enumerate}
+  \item \textbf{Cross-fitted AIR with Mixture of Gamma Differences (MGD).}  The proposed method: nuisance functions estimated via three-fold cross-fitting, and the CATE modelled by a covariate-gated mixture of $K=2$ Gamma survival differences.
+  \item \textbf{Cross-fitted AIR with Tensor Product (TP).}  Same cross-fitted nuisances; the CATE model is an unconstrained tensor-product basis.
+  \item \textbf{AIR with MGD (oracle nuisances).}  The MGD CATE model trained with true nuisance functions, isolating CATE-modelling error.
+  \item \textbf{AIR with TP (oracle nuisances).}  The tensor-product CATE model with oracle nuisances.
+  \item \textbf{Survival Forest T-learner.}  Two independent random survival forests, one per arm; the CATE is the difference of predicted survival curves.
+  \item \textbf{Survival Forest S-learner.}  A single random survival forest with treatment as an additional covariate.
+\end{enumerate}
+
+\subsection{Evaluation metric}
+
+Performance is measured by the integrated mean squared error (iMSE):
+\[
+  \mathrm{iMSE}(\hat\tau)
+  = \frac{1}{n_{\mathrm{test}}} \sum_{i=1}^{n_{\mathrm{test}}}
+    \sum_{m=0}^{M} \delta\,
+    \bigl(\hat\tau(t_m \mid x_i) - \tau(t_m \mid x_i)\bigr)^2,
+\]
+where $(t_0, t_1, \dots, t_M)$ is a uniform grid of $M=30$ points on $[0, \tend]$, $\delta = \tend / M$ is the grid spacing, and the test set contains $n_{\mathrm{test}} = 100{,}000$ subjects drawn independently from the same covariate distribution.
+For each sample size, $999$ independent datasets are drawn and all methods are fit on each dataset.
+
+\subsection{Results}\label{subsec:sim_results}
+
+Figure~\ref{fig:convergence} shows the mean iMSE (with 95\% confidence intervals) as a function of the training-set size on a log--log scale.  Detailed numerical results (mean iMSE, standard error, and runtime) for all DGP--method--sample-size combinations are reported in Table~\ref{tab:simulation}.
+All simulations were executed on the Sherlock computing cluster at Stanford University \citep{sherlock2024}, using a single core of an AMD EPYC 7502 processor (2.5\,GHz base clock) per replication.
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=\textwidth]{figures/simulation_convergence.pdf}
+  \caption{Convergence of the integrated mean squared error (iMSE) as a function of training-set size~$n$, for all three DGPs.  Top row: mean iMSE; bottom row: variance of the iMSE across replications.  Solid lines: methods that estimate their own nuisance functions; dashed lines: oracle nuisances.  Grey dashed horizontal line: iMSE of the population-average tv-ATE, $\bar\tau(t) = n_{\mathrm{test}}^{-1} \sum_i \tau(t \mid x_i)$; any method whose iMSE falls below this line is capturing individual-level heterogeneity beyond the marginal treatment effect.  Shaded bands: 95\% confidence intervals over $999$ replications.}
+  \label{fig:convergence}
+\end{figure}
+
+\paragraph{Benefit of structural constraints.}
+The constrained Gamma mixture model (MGD) consistently outperforms the unconstrained tensor-product basis (TP), both with cross-fitted and oracle nuisances.
+The structural constraints---zero effect at time zero, boundedness between minus one and one, and decay to zero at long horizons---reduce the effective model complexity, leading to faster convergence especially at small sample sizes.
+The advantage is most prominent on DGP~3, where the tensor-product model exhibits large iMSE at small~$n$ (exceeding~$1$ at $n = 500$) while the MGD remains stable.
+Figure~\ref{fig:cate_curves} illustrates these differences on a single test observation: the MGD closely tracks the true tv-CATE while the survival forests produce discontinuous step functions and the tensor-product basis does not enforce zero effect at baseline.
+
+\paragraph{Quasi-oracle property.}
+Across all three DGPs, the iMSE of Cross-fitted AIR w/ MGD decreases at essentially the same rate as its oracle counterpart, which uses the true propensity, event-time, and censoring survival functions.
+This demonstrates the quasi-oracle property: the additional error from estimating nuisance functions is asymptotically negligible relative to the CATE-modelling error.
+
+\paragraph{Heterogeneity recovery.}
+All methods eventually fall below the population-average tv-ATE reference line, confirming that they capture individual-level heterogeneity.
+Cross-fitted AIR with MGD crosses this threshold at the smallest sample size among cross-fitted methods in the synthetic DGPs.
+
+\paragraph{Variance reduction.}
+The bottom row of Figure~\ref{fig:convergence} shows that the variance of the iMSE across replications decreases steadily with sample size for all methods.  Cross-fitted AIR w/ MGD exhibits variance comparable to its oracle counterpart, further confirming the quasi-oracle property.
+
+\input{simulations/simulation_table}
+
+\section{Coronary Revascularization Application}\label{sec:application}
+
+For patients with complex CAD---defined as three-vessel or left main disease---both percutaneous coronary intervention (PCI) and coronary artery bypass grafting (CABG) are established revascularization strategies.
+Large randomized trials report comparable average outcomes at the population level \citep{thuijs2019percutaneous}, but these averages mask substantial individual heterogeneity in benefit that conventional subgroup analyses---stratified by single variables such as diabetes status or lesion count---are underpowered to capture \citep{takahashi2020redevelopment}.
+We apply the AIR estimator to an observational cohort from the Stanford Medicine Research Data Repository (STARR) \citep{datta2020new} to estimate patient-level time-varying treatment-effect trajectories and validate the resulting prioritization rule.
+
+\subsection{Cohort and descriptive statistics}
+
+Following the cohort design of \citet{takahashi2020redevelopment}, we included adults aged 65 years or older who had at least one coronary angiography report available in their medical record, carried a diagnosis of complex CAD, and underwent a single inpatient revascularization---either CABG or PCI---within 30 days of diagnosis.
+Patients presenting with acute ST-elevation myocardial infarction, records of both procedures, or evidence of dialysis or acute kidney injury prior to revascularization were excluded.
+The treatment is PCI ($W=1$) versus CABG ($W=0$); the outcome is time to all-cause mortality, with administrative censoring at $\tend = 5$ years.
+The final cohort comprised 3{,}830 patients: 71.7\% (n=2{,}747) received PCI and 28.3\% (n=1{,}083) underwent CABG.
+Median follow-up was 295.5 days; 349 deaths (12.7\%) were observed in the PCI group and 121 (11.2\%) in the CABG group.
+Baseline demographics, comorbidities, and an illustrative example of the coronary angiography reports used as input features are summarized in Appendix~Table~\ref{tab:baseline_treatment}; estimated population-average survival curves appear in Appendix~Figure~\ref{fig:km_curve}.
+
+\subsection{Results and internal validation}\label{subsec:results}
+
+Because strict inclusion criteria reduce even large EHR databases to modest analytic cohorts, a simple train/test split would sacrifice statistical precision.
+We therefore rely entirely on cross-validation, organized in three stages:
+\begin{enumerate}[leftmargin=*,nosep]
+  \item \emph{Model selection.} Cross-validated calibration-for-benefit is evaluated for each candidate number of mixture components $K \in \{2,3,4,5\}$ in the AIR--MGD parametrization (Section~\ref{subsec:param_spec}). We select $K = 4$, which produces quintile estimates that most closely track the $45^\circ$ line across all four time horizons (Figure~\ref{fig:calibration_benefit}).
+  \item \emph{Validation.} With $K = 4$ fixed, the sequential cross-fold procedure of \citet{wager2024sequential} tests whether the resulting treatment prioritization captures genuine heterogeneity (Figure~\ref{fig:toc}).
+  \item \emph{Clinical interpretation.} The model with $K = 4$ is refit on the full cohort and the resulting tv-CATE curves are examined for clinical meaning (Figure~\ref{fig:archetypes}).
+\end{enumerate}
+Details of data extraction, text embedding, and network architecture are in Appendix~\ref{appendix:pipeline}.
+
+\paragraph{Calibration for benefit.}
+To select the number of mixture components, we fit the model for each $K \in \{2,3,4,5\}$ and evaluate cross-validated calibration-for-benefit: the model is trained on outer folds and evaluated on each held-out fold using AIPCW doubly-robust pseudo-outcomes \citep{li2018balancing}, with nuisance models cross-fit within the held-out fold to ensure full independence between predictions and pseudo-outcome construction (Algorithm~\ref{alg:cv-calibration-appendix}; Appendix~\ref{appendix:calibration}).
+Figure~\ref{fig:calibration_benefit} presents calibration plots for the selected $K = 4$ at horizons of 6 months, 1, 3, and 5 years; quintile estimates closely track the $45^\circ$ line, indicating that predicted heterogeneity aligns with observed benefit.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/new_calibration_benefit_combined.pdf}
+    \caption{Cross-validated calibration-for-benefit at four time horizons. Each panel plots mean predicted CATE (x-axis) against mean AIPCW doubly-robust pseudo-outcome (y-axis) across quintiles of predicted benefit. Error bars: 95\% confidence intervals. Dashed line: perfect calibration ($45^\circ$). Orange curve: cubic smoothing spline fit to individual-level pseudo-outcomes.}
+    \label{fig:calibration_benefit}
+\end{figure}
+
+\paragraph{Treatment prioritization (TOC/RATE).}
+With the selected $K = 4$ fixed, we further assess whether the AIR prioritization rule captures genuine heterogeneity using the Targeting Operator Characteristic (TOC) and its area (AUTOC) \citep{yadlowsky2025rate}.
+Standard $K$-fold cross-validation is invalid for this purpose: because each fold's CATE model is trained on data overlapping with every other fold's evaluation set, fold-level statistics are positively correlated, rendering naive $p$-value aggregation anti-conservative \citep{grf_rate_cv_vignette}.
+We therefore adopt the sequential cross-fold validation of \citet{wager2024sequential}, which trains the CATE for each successive fold only on preceding folds, restoring a martingale structure that yields valid $p$-values and correctly aggregated confidence bands (Algorithm~\ref{alg:seq-validation-appendix}; Appendix~\ref{appendix:toc}).
+Figure~\ref{fig:toc} presents the TOC curves at four horizons; sequential $p$-values in each panel provide statistical evidence of genuine heterogeneity at all evaluated time points.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/toc_combined.pdf}
+    \caption{Targeting Operator Characteristic (TOC) curves at four horizons. The x-axis is the fraction of patients prioritized for PCI (ranked by predicted benefit); the y-axis is the excess treatment effect relative to the population ATE. Shaded regions: pointwise 95\% bootstrap confidence bands. Sequential validation $p$-values \citep{wager2024sequential} are reported in each panel.}
+    \label{fig:toc}
+\end{figure}
+
+\paragraph{Clinical interpretation.}
+Having validated both calibration and treatment prioritization, we refit the AIR--MGD model with $K = 4$ on the full cohort.
+Figure~\ref{fig:archetypes} displays the resulting tv-CATE curves, grouped into three archetypes by their long-term trajectory.
+By examining the angiography reports of patients in each group, we propose the following clinically motivated interpretations.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/tvcate_archetypes.pdf}
+    \caption{tv-CATE trajectories grouped into three archetypes. Positive values indicate a survival benefit from PCI relative to CABG; color encodes the 5-year CRMSTD. Individual curves can be mapped back to patient angiography reports to inform clinical interpretation.}
+    \label{fig:archetypes}
+\end{figure}
+
+\emph{Sustained harm from PCI.}
+These patients tend to have complex multivessel disease (e.g., three-vessel involvement with chronic total occlusions and heavy calcification).
+The CATE is negative at all horizons, consistent with more complete revascularization achieved by CABG.
+
+\emph{Early benefit, delayed harm.}
+A second group shows a positive CATE in the first months---possibly reflecting avoidance of acute surgical mortality---that crosses zero and becomes negative at longer horizons as graft durability outweighs the early procedural advantage of PCI.
+Representative angiographies suggest moderate three-vessel disease with elevated perioperative surgical risk (e.g., significant aortic calcification).
+
+\emph{Sustained benefit from PCI.}
+Patients in this group tend to have less severe, focal lesions (e.g., one- or two-vessel disease with discrete stenoses amenable to stenting).
+PCI may provide adequate revascularization with lower procedural burden for this anatomical profile.
+
+These archetypes illustrate the clinical value of tv-CATE curves: whether the benefit is sustained, transient, or reversed informs the shared decision-making conversation in a way that single-horizon summaries cannot.
+
+
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Summary.}
+The development of the AIR estimator was grounded in a concrete clinical application and its practical constraints: small sample size, unstructured text inputs, right-censored outcomes, and the need to inform decisions across multiple time horizons simultaneously.
+These constraints motivated each methodological choice---the integrated R-loss for joint estimation over time, the covariate-gated mixture of Gamma differences for built-in structural validity, and a differentiable architecture that accepts high-dimensional embeddings.
+Simulations confirmed that encoding structural constraints reduces effective model complexity and accelerates convergence relative to unconstrained alternatives.
+Applied to a revascularization cohort from Stanford Healthcare, the estimator recovered interpretable time-varying treatment-effect trajectories with evidence of genuine heterogeneity at different time horizons.
+By characterizing whether the benefit of percutaneous coronary intervention is sustained, transient, or eventually reversed for a given patient profile, such trajectories can inform shared clinical decision-making in ways that single-horizon treatment-effect summaries cannot.
+
+\paragraph{Limitations.}
+Our theoretical results guarantee Neyman orthogonality and a quasi-oracle error bound, but do not yet provide finite-sample convergence rates, which may be a practical concern with current dataset sizes.
+The clinical model was validated internally on observational EHR data; although internal calibration was encouraging, external validation---ideally on trial data or independent health systems---remains an important step toward clinical deployment.
+Despite covariate adjustment, unmeasured confounding cannot be ruled out in the observational analysis.
+
+\paragraph{Future directions.}
+As larger EHR datasets become available---potentially including richer modalities such as angiography video---the differentiable architecture of the AIR estimator can readily incorporate these inputs without structural modification.
+Natural extensions include competing risks, dynamic policy learning with time-to-event outcomes, distribution-free calibration for uncertainty quantification, and transportability constraints across institutions.
+
+\paragraph{Software.}
+An open-source Python implementation of the AIR estimator, together with code to reproduce all simulations and analyses, is available at \texttt{[repository URL]}.
+
+\bibliography{main}  % Tells LaTeX to use main.bib
+
+\appendix
+\section*{Appendix}
+Given a stochastic process $h$, let $\norm{h}_\infty$ denote the essential supremum of the variable
+\[ \sup_{0 \leq u \leq \tend} |h(u,-)|.\]
+%REMARK: Alex add references
+Following the standard counting-process framework, define the death counting process $N^\dagger$, the censoring counting process $N^*$ and 
+the at-risk indicator $Y$ for any $u \in [0,\tend]$ as follows
+\begin{align*}
+N^\dagger(u) \eqdef \IDF\{ Z \leq u, \Delta = 1\}, && N^*(u) \eqdef \IDF\{ Z \leq u, \Delta = 0\}, && Y(u) \eqdef \IDF\{ u \leq Z \}.
+\end{align*}
+For any $u \in (0,\tend]$, denote by $\mathcal{F}_u$ the filtration induced by the $\sigma$-algebras 
+generated by $\{X,W,N^\dagger(s),N^*(s),Y(s) \mid s \in [0,u] \}$.
+
+\section{Proofs for Section~3 (R-Losses)}\label{appendix:proof_rlosses}
+
+\begin{lemma}\label{lem:proba_identity}
+Under Assumption~\ref{as:cens} one has the identities for any $u \in (0,\tend]$
+\begin{align*}
+\PR(Z > u \mid X,W) &= S_W^*(u|X)S_W^\dagger(u|X) \\
+\PR(Z \geq u \mid X,W) &= S_W^*(u^-|X)S_W^\dagger(u^-|X).
+\end{align*}
+\end{lemma}
+\begin{proof}
+We only treat the first identity as the second follows mutatis mutandis
+\begin{align*}
+\PR(Z > u \mid X,W) &= \EX( \IDF\{C > u\} \IDF\{D > u\} \mid X,W )
+\end{align*}
+where Assumption~\ref{as:cens} allows to write
+\begin{align*}
+\PR(Z > u \mid X,W) &= \EX( \IDF\{C > u\} \mid X,W) \cdot \EX(\IDF\{D > u\} \mid X,W ).
+\end{align*}
+\end{proof}
+
+Hence, we denote $S_W^{\wedge}(u|X) \eqdef \PR(Z > u \mid X,W)$ for any $u \in [0,\tend]$. The AIPCW-pseudo outcome becomes
+\begin{align*}
+\YPO(t) = \frac{\IDF\{Z > t\}}{S^*_W(t | X)} + S^\dagger_W(t | X) 
+\left[ \frac{N^*(t) }{S^\wedge_W(Z^- | X)}
+-  \int_{0}^{t} \frac{Y(u)  d\Lambda^*_W(u| X)}{S^\wedge_W(u^-| X)} \right] 
+\end{align*}
+
+
+
+\begin{lemma}\label{lem:expected_predictable_process}
+Under Assumption~\ref{as:cens}, for any bounded Borel function $h:[0,\tend] \to \R$ and any $t \in [0,\tend]$ one has
+\[ \EX[ N^*(t)h(Z)] = \int_0^t h(u) S_W^\dagger(u|X) S_W^*(u^- |X) d \Lambda_W^*(u|X).\]
+In particular, if $S_{W}^\dagger(-|X)$ is continuous on $(0,\tend]$ then 
+\[ \EX[ N^*(t)h(Z)] = \int_0^t h(u) S_W^\wedge(u^- |X) d \Lambda_W^*(u|X).\]
+\end{lemma}
+
+\begin{proof}
+Under Assumption~\ref{as:cens} the conditional law of $C$ given $(X,W)$ is given by $u \mapsto S_W^*(u^-|X)\Lambda_W^*(du|X)$ on $(0,\tend]$ hence
+\[ \EX[N^*(t) h(Z) \mid X,W] = \int_{0}^t h(u) S_W^\dagger(u|X) S_W^*(u^- |X) d\Lambda_W^*(u|X).\]
+\end{proof}
+
+\begin{proof}[Proof of Proposition~\ref{prop:unbiasedness}]
+It follows from Lemma \ref{lem:proba_identity} that for any $t \in [0,\tend]$
+\begin{align*}
+\EX \left[ \frac{\IDF\{Z > t\}}{S^*_W(t|X)} \Big| X, W \right] = S_W^\dagger(t|X).
+\end{align*}
+Observe that the function  
+\[ u \mapsto \left( S^\dagger_W(u^-|X) \, S^*_W(u|X) \right)^{-1} \cdot \IDF \left\{ S^\dagger_W(u^-|X) > 0 \right\} \]
+is bounded Borel, hence, it follows from Lemma~\ref{lem:expected_predictable_process} that under the continuity of $S_{W}^\dagger(-|X)$ 
+\begin{align*}
+\EX \left[ \frac{N^*(t)}{S^\dagger_W(Z^-|X)\, S^*_W(Z|X)} \Big| X, W \right] = \int_0^t \frac{S_W^*(u^- |X) }{S^*_W(u|X)}  d \Lambda_W^*(u|X).
+\end{align*}
+Using Fubini-Tonelli and Lemma~\ref{lem:proba_identity} we get the complementary expression
+\begin{align*}
+\EX \left[ \int_0^t \frac{Y(u)  d\Lambda^*_W(u| X)}{S^\dagger_W(u^-| X) \, S^*_W(u| X)} \Big| X, W \right] =  \int_0^t \frac{S_W^*(u^- |X) }{S^*_W(u|X)}  d \Lambda_W^*(u|X).
+\end{align*}
+Summing these together yields the result.
+\end{proof}
+
+\begin{proof}[Proof of Lemma~\ref{lemma:robinson_dec}]
+The definition of $\varepsilon_t$ yields
+\begin{align*}
+Y_{\mathrm{PO}}(t) - S^\dag(t|X)&= \varepsilon_t + W \tau_t(X) - e(X)(S_1^\dagger(t|X) - S_0^\dagger(t|X)).
+\end{align*}
+Hence, the Robinson decomposition follows from Proposition~\ref{prop:g}. Moreover, this decomposition yields
+\[ \varepsilon_t = Y_{\mathrm{PO}}(t) - S^\dagger(t|X) + (W-e(X))\tau_t(X).\]
+Hence, the Proposition~\ref{prop:unbiasedness} ensures $\EX [\varepsilon_t \mid X,W] = 0$.
+\end{proof}
+
+
+\begin{proof}[Proof of Theorem~\ref{thm:loss}]
+Let $t \in \mathcal{T}$ and $\xi : \mathcal{X} \to \R$ be a square integrable function, using Robinson decomposition (Lemma~\ref{lemma:robinson_dec}) one has
+\begin{align*}
+\mathcal{L}_t(\xi)&=\EX\Bigl[\big(\{W-e(X)\}\bigl(\tau_t(X)- \xi(X) \bigr)+\varepsilon_t\big)^{2}\Bigr].
+\end{align*}
+It also follows from Lemma~\ref{lemma:robinson_dec} that
+\begin{align*}
+\EX\Bigl[\{W-e(X)\}\bigl(\tau_t(X)- \xi(X)\bigr)\EX[\varepsilon_t\mid X,W]\Bigr] = 0.
+\end{align*}
+Hence, expanding the square yields
+\begin{align}
+\mathcal{L}_t(\eta_t) =\EX\Bigl[\{W-e(X)\}^{2}\bigl(\tau_t(X)-\xi(X)\bigr)^{2}\Bigr] + \EX\bigl[\varepsilon_t^2\bigr] \label{eq:r_dec}
+\end{align}
+Since $\mathcal{L}_t(\tau_t) = \EX[ \varepsilon_t^2]$, the inequality $\mathcal{L}_t(\xi) \geq \mathcal{L}_t(\tau_t)$
+ensures that the time-fixed CATE $\tau_t$ is a minimizer of the loss $\mathcal{L}_t$.
+
+For any square integrable function
+$\eta: \mathcal{T} \times \mathcal{X} \to \R$ a similar argument yields $\mathcal{L}(\eta) \geq \mathcal{L}(\tau)$, hence
+the tv-CATE is a minimizer of $\mathcal{L}$.
+
+
+Suppose that $\xi^*$ is such that $\mathcal{L}_t(\xi^*) = \mathcal{L}_t(\tau_t)$, then using Equation~\eqref{eq:r_dec}
+\begin{align*}
+\EX\Bigl[\{W-e(X)\}^{2}\bigl(\tau_t(X)-\xi^*(X)\bigr)^{2}\Bigr] = 0.
+\end{align*}
+Therefore $ \{W-e(X)\}^{2}\bigl(\tau_t(X)-\eta_t^*(X)\bigr)^{2}$ vanishes almost surely. In particular, Assumption~\ref{as:ovl} ensures that $\{W-e(X)\}^{2}$ is positive. Finally $\xi^* = \tau_t$ almost surely, proving uniqueness. The argument holds mutatis mutandis for $\eta^*$ such that $\mathcal{L}(\eta) = \mathcal{L}(\tau)$.
+\end{proof}
+
+\section{Universal Approximation Property}\label{proof:univ_approx}
+
+\begin{lemma} \label{lem:universal-phi}
+There exists a sequence $\{\phi^i\}_{i=1}^{+\infty} \subseteq C(\mathcal X)$ such that
+for every $g\in C(\mathcal X)$ and $\eta \in \R_{+}^*$ there exist $p \in \mathbb{N}$ and coefficients $u\in\R^p$ with
+\[ \sup_{x\in\mathcal X}\big|u^\top \phi_p(x)-g(x)\big|<\eta \text{, where }\phi_p\equiv(\phi^1,\ldots,\phi^p).\]
+\end{lemma}
+\begin{proof}
+It suffices to take $\phi^{\psi(a_1,\ldots,a_d)} : (x_1,\ldots,x_d) \mapsto x_1^{a_1}\ldots x_d^{a_d}$ for $\psi : \mathbb{N}^d \to \mathbb{N}$ a bijective map and the result follows from Stone-Weirstra\ss\ theorem.
+\end{proof}
+
+Let $F$ be a continuous cumulative distribution function on $\R_{+}$ and for any $\alpha \in \R_{+}^*$, let $K_\alpha$ and $H_\alpha$ defined by
+\[
+  K_\alpha(t;y):=1-G\!\left(t;\alpha,\frac{y}{\alpha}\right),\qquad
+  H_\alpha(t):=\int_{0}^{+\infty} K_\alpha(t;y)\,F(dy).
+\]
+where $H_\alpha$ is given by a Riemann-Stieltjes with respect to $F$ and we recall that $G$ is the survival function of a Gamma distribution.
+
+\begin{lemma}\label{lem:fixedshape-kernel}
+For all $\varepsilon \in \R_{+}^*$ there exist $\alpha_0 \in \R_{+}^*$ such that for all $\alpha \geq \alpha_0$ one has  $\norm{H_\alpha-F}_\infty \leq \varepsilon$.
+\end{lemma}
+
+\begin{proof}
+Let $\varepsilon \in \R_{+}^*$. The function $F$ is a continuous cumulative distribution function, hence, let $\delta, M \in \R_+^*$ such that
+\begin{align*}
+\sup_{|x-y|\le\delta}|F(x)-F(y)|< \frac{\varepsilon}{3}, && \int_M^{+\infty} F(dy) < \frac{\varepsilon}{6}
+\end{align*}
+without loss of generality one can suppose $\delta \leq 1$. Let $t \in \R_{+}$ and observe that
+\[ \int_{(t - \delta/2)_+}^{t + \delta/2} \hspace{-1em} | \IDF\{y \leq t\} -   K_\alpha(t;y) |\, dF(y) \leq \sup_{|x-y|\le\delta}|F(x)-F(y)| < \frac{\varepsilon}{3} .\]
+For $y\le (t-\delta/2)_+$, let $X_y\sim\Gamma(\alpha,y/\alpha)$; then using Chebyshev
+\[1-K_\alpha(t;y)=\mathbb P(X_y>t) \le \mathbb P \Big(|X_y-y| \geq \frac{\delta}{2} \Big) \le \frac{4y^2}{\alpha\delta^2}.\]
+Define $M_{t,\delta} \eqdef \min(M,(t-\delta/2)_+)$, it follows from the inequality above that
+\begin{align*}
+\int_{0}^{(t-\delta/2)_+}\hspace{-1.5em}|1-K_\alpha(t;y)|F(dy) &= \int_{0}^{M_{t,\delta}}\hspace{-1.5em}|1-K_\alpha(t;y)|F(dy)
++ \int_{M_{t,\delta}}^{(t-\delta/2)_+} \hspace{-1.5em}|1-K_\alpha(t;y)| F(dy) \\
+&\le \int_{0}^{M} \frac{4y^2}{\alpha\delta^2} F(dy) + \int_{M}^{+\infty} F(dy) \\
+&\le \frac{4M^2}{\alpha\delta^2} + \frac{\varepsilon}{6}.
+\end{align*}
+It follows from a symmetric argument that
+\begin{align*}
+\int_{t+\delta/2}^{+\infty}|K_\alpha(t;y)|F(dy) &\le \frac{4M^2}{\alpha\delta^2} + \frac{\varepsilon}{6}.
+\end{align*}
+Hence,
+\[ \int_{0}^{+\infty} | \IDF\{y \leq t\} -   K_\alpha(t;y) |\, dF(y) < \frac{8M^2}{\alpha\delta^2} +  \frac{\varepsilon}{3} + \frac{\varepsilon}{3}.\]
+It suffices to choose $\alpha_0$ such that $8 M^2/\alpha_0 \delta^2 < \varepsilon / 3$.
+\end{proof}
+
+\begin{lemma}\label{lem:equalweight}
+For every $\eta,\varepsilon \in \R_{+}^*$ there exists $\alpha_0 \in \R_{+}^*$ and $\mu_\eta \in [0,1]$ with $1-\mu_\eta<\varepsilon$ such that for every $\alpha\ge \alpha_0$ there exist $M_\alpha\in\mathbb N$ with
+\[
+\forall m\ge M_\alpha,\ \exists \{y_i\}_{i=1}^m\subset \R_+:\qquad
+\bigl\|\mu_\eta F_{\alpha,m}-F\bigr\|_\infty<\eta,
+\]
+where
+\[
+F_{\alpha,m}(t)\eqdef \frac1m\sum_{i=1}^m K_\alpha(t;y_i).
+\]
+\end{lemma}
+
+\begin{proof}
+Let $\eta,\varepsilon \in \R_{+}^*$, we can choose
+$0<y_-<y_+$ such that
+\[
+\int_0^{y_-}F(dy)<\min \Bigl(\frac{\eta}{6},\frac{\varepsilon}{2}\Bigr),
+\qquad
+\int_{y_+}^{+\infty}F(dy)<\min \Bigl(\frac{\eta}{6},\frac{\varepsilon}{2}\Bigr).
+\]
+For any $\alpha > 0$, define $\mu_\eta$ and $T_\alpha:[y_-,y_+]\to C_b(\R_+)$ by
+\begin{align*}
+\mu_\eta \eqdef \int_{y_-}^{y_+}F(dy), &&  T_\alpha(y)\eqdef K_\alpha(\,\cdot\,;y),
+\end{align*}
+where $C_b(\R_+)$ is endowed with the sup-norm. By construction, $1-\mu_\eta <\varepsilon$.
+Let $g_{\alpha,y/\alpha}$ denotes the density of $\Gamma(\alpha,y/\alpha)$, then
+for $y,y'\in [y_-,y_+]$,
+\begin{align*}
+\|T_\alpha(y)-T_\alpha(y')\|_\infty
+&=
+\sup_{t \in \R_{+}}\left|\int_0^t
+\bigl(g_{\alpha,y/\alpha}(u)-g_{\alpha,y'/\alpha}(u)\bigr)\,du\right| \\
+&\le
+\int_0^{+\infty}
+\left|g_{\alpha,y/\alpha}(u)-g_{\alpha,y'/\alpha}(u)\right|\,du.
+\end{align*}
+Moreover, for $y\in [y_-,y_+]$,
+\[
+g_{\alpha,y/\alpha}(u)
+\le
+\frac{u^{\alpha-1}e^{-u\alpha/y_+}}
+{\Gamma(\alpha)(y_-/\alpha)^\alpha}.
+\]
+Hence, by dominated
+convergence, $T_\alpha$ is continuous. Since $[y_-,y_+]$ is compact,
+$T_\alpha$ is uniformly continuous.
+
+\medskip
+
+Therefore, there exists a finite open cover
+$\{U_j\}_{j=1}^{J_\alpha}$ of $[y_-,y_+]$ and points $z_j\in U_j$ such that
+\[
+\forall j\in\{1,\dots,J_\alpha\},\qquad
+\sup_{y\in U_j}\|T_\alpha(y)-T_\alpha(z_j)\|_\infty<\frac{\eta}{6}.
+\]
+
+\medskip
+
+Refining this cover if necessary, we may choose a Borel partition
+$\{A_j\}_{j=1}^{J_\alpha}$ of $[y_-,y_+]$ such that $A_j\subset U_j$ for every
+$j$. Let $\nu_\eta$ the probability measure given by
+\[ \nu_\eta(dy)\eqdef \frac{\mathbf 1_{[y_-,y_+]}(y)}{\mu_\eta}\,F(dy),\]
+and define $\lambda_j\eqdef \nu_\eta(A_j)$, for any $j \in \{1,\dots,J_\alpha \}$. Moreover,
+\begin{align*}
+\left\|
+\int T_\alpha(y)\,\nu_\eta(dy)-\sum_{j=1}^{J_\alpha}\lambda_j T_\alpha(z_j)
+\right\|_\infty \hspace{-0.5em} \le
+\sum_{j=1}^{J_\alpha}\int_{A_j}
+\|T_\alpha(y)-T_\alpha(z_j)\|_\infty\,\nu_\eta(dy) < \frac{\eta}{6}.
+\end{align*}
+
+Let $m\in\mathbb N$, we choose integers
+$n_1,\dots,n_{J_\alpha}\in\mathbb N$ summing to $m$ such that
+\[
+\sum_{j=1}^{J_\alpha}\left|\lambda_j-\frac{n_j}{m}\right|
+<\frac{2J_\alpha}{m}.
+\]
+Since $0\le K_\alpha(t;y)\le 1$, one has
+$\|T_\alpha(z_j)\|_\infty\le 1$, and therefore
+\[
+\left\|
+\sum_{j=1}^{J_\alpha}\lambda_j T_\alpha(z_j)
+-
+\sum_{j=1}^{J_\alpha}\frac{n_j}{m}T_\alpha(z_j)
+\right\|_\infty
+\le
+\sum_{j=1}^{J_\alpha}\left|\lambda_j-\frac{n_j}{m}\right|
+<
+\frac{2J_\alpha}{m}.
+\]
+Choose $M_\alpha\in\mathbb N$ such that
+\[
+\frac{2J_\alpha}{M_\alpha}<\frac{\eta}{6}.
+\]
+Then, for every $m\ge M_\alpha$, we can define
+$y_1,\dots,y_m\in\{z_1,\dots,z_{J_\alpha}\}$ by repeating each $z_j$ exactly
+$n_j$ times. For this choice,
+\[
+\frac1m\sum_{i=1}^m T_\alpha(y_i)
+=
+\sum_{j=1}^{J_\alpha}\frac{n_j}{m}T_\alpha(z_j),
+\]
+hence
+\[
+\left\|
+\int T_\alpha(y)\,\nu_\eta(dy)-\frac1m\sum_{i=1}^m T_\alpha(y_i)
+\right\|_\infty
+<\frac{\eta}{3}.
+\]
+Multiplying by $\mu_\eta\le 1$, we obtain
+\[
+\left\|
+\int_{y_-}^{y_+} K_\alpha(\,\cdot\,;y)\,F(dy)
+-
+\mu_\eta F_{\alpha,m}
+\right\|_\infty
+<\frac{\eta}{3}.
+\]
+On the other hand, since $0\le K_\alpha(t;y)\le 1$,
+\begin{align*}
+\left\|
+H_\alpha-\int_{y_-}^{y_+}K_\alpha(\,\cdot\,;y)\,F(dy)
+\right\|_\infty
+&\le
+\int_0^{y_-}F(dy)+\int_{y_+}^{+\infty}F(dy)
+<\frac{\eta}{3}.
+\end{align*}
+Therefore, $\|H_\alpha-\mu_\eta F_{\alpha,m}\|_\infty< 2\eta/3$. Finally, by Lemma~\ref{lem:fixedshape-kernel}, there exists $\alpha_0>0$ such
+that for every $\alpha\ge \alpha_0$ one has $\|H_\alpha-F\|_\infty<\eta/3$
+Hence, for every $\alpha\ge \alpha_0$ and every $m\ge M_\alpha$,
+\[
+\|\mu_\eta F_{\alpha,m}-F\|_\infty
+\le
+\|\mu_\eta F_{\alpha,m}-H_\alpha\|_\infty+\|H_\alpha-F\|_\infty
+<\eta.
+\]
+This concludes the proof.
+\end{proof}
+
+\begin{lemma}\label{lem:softmax}
+For any continuous $w:\mathcal X\to \{w\in[0,1]^K:\sum_k w_k=1\}$ and any positive $\eta$,
+there exist $p$ and $C\in\R^{p\times K}$ such that for any $k \in \{1,\ldots,K\}$ one has
+\[
+  \sup_{x\in\mathcal X}\, \Big\vert \,\omega_k(C^\top\phi_p(x))- w_k(x)\, \Big\vert <\eta.
+\]
+\end{lemma}
+
+\begin{proof}
+Let $\delta < \eta$ and define
+\[ w^\delta_k(x) \eqdef \frac{w_k(x)+\delta/K}{1+\delta}, \quad \quad  z_k(x) \eqdef \log w^\delta_k(x)\]
+It follows from Lemma~\ref{lem:universal-phi} that for any $\eta' \in \R_+$  and any $k \in \{1, \ldots, K\}$ there exist $p_k \in \mathbb{N}$ and $(c_{i,k})_{i=1}^{p_k} \subset \R$ such that
+\[ \sup_{x \in \mathcal{X}} \Big\vert \sum_{i=1}^{p_k} c_{i,k} \phi^i(x) - z_k(x) \Big\vert \le 2\eta'.\]
+One can form a matrix $C$ whose $k$-column is given by $(c_{1,k},\ldots,c_{p,k})^\top$ where $p = \max \{ p_k \}_{k=1}^K$ and $c_{i,k} = 0$ if $i > p_k$.
+The softmax map is $1/2$-Lipschitz, hence, for any $k \in \{1,\ldots, K\}$
+\[ \sup_{x \in \mathcal{X}} \big| \omega_k(C^\top\phi_p(x))-\omega_k\circ z(x) \big| \le \eta'. \]
+Since $\omega \circ z = w^\delta$, setting $\eta'= (\eta - \delta) $ and using $|w_k^\delta - w_k| < \delta$ yields the result.
+\end{proof}
+
+\begin{proof}[Proof of Theorem~\ref{thm:univ_approx}]
+Let $\varepsilon$ be a positive real number and $f \in \mathcal{S} - \mathcal{S}$. It follows from Dini and Heine-Cantor theorems that the function
+\begin{align*}
+ f_\mathcal{X} : x \mapsto (t \mapsto f(t,x)).
+\end{align*}
+which is uniformly-continuous for the sup-norm on $\mathcal{C}_b(\R_+)$.
+Let $\{U_j\}_{j=1}^J$ be an open cover of $\mathcal X$ such that for any $j \in \{1,\ldots,J\}$ one has
+\begin{align*}
+\sup_{x,x' \in U_j} \sup_{t \in \R_{+}} \abs{f(t,x)-f(t,x')}\le \frac{\varepsilon}{5}.
+\end{align*}
+Let $\{ x_j \in U_j \}_{j=1}^J$ and a continuous partition of unity $\{ \psi_j\}_{j=1}^J$ subordinate to $\{ U_j\}_{j=1}^J$ and define the function
+\[ f': \R_{+} \times \mathcal{X} \to \R, \quad \quad  f'(t,x):=\sum_{j=1}^J \psi_j(x)\,f(t,x_j).\]
+In particular, by construction one has $\norm{f-f'}_\infty\le \varepsilon/5$.
+
+\medskip
+
+Define for any $(j,r) \in \{1,\ldots,J\} \times \{0,1\}$, the survival functions $S_j^r \in \mathcal{C}(\R_+)$ and their cumulative distribution function counterpart $F_j^r$ such that
+\[ \forall j \in \{1, \ldots, J\}: \quad f(t,x_j)=S_j^1(t)-S_j^0(t) .\]
+It follows from Lemma~\ref{lem:equalweight} that we can choose a single $\bar\alpha$ large enough that
+there is a common $M\in\mathbb N$ with a collection of points
+\[ \Big\{ y_{j,i}^r \in \R_{+} \mid (j,i,r) \in \{1,\ldots, J\}\times\{1,\ldots, M\} \times \{0,1\} \Big\}\]
+and $\mu_j^r$ such that $1-\mu_j^r <  \varepsilon / (80J) $  such that the functions defined by
+\[ S_{j,M}^r : \R_{+} \to \R, \quad \quad S_{j,M}^r(t)\eqdef\frac1M\sum_{i=1}^M G\!\left(t;\bar\alpha,\frac{y_{j,i}^r}{\bar\alpha}\right)\]
+have the following property $ \norm{\mu_j^r (1-S_{j,M}^r) - (1 - S_j^r)}_\infty < \varepsilon / (40J)$ which yields for $\mu = \max_{j,r}(\mu_j^r)$ the estimation
+\begin{align*}
+\norm{\mu (1-S_{j,M}^r) - (1 - S_j^r)}_\infty &\leq |\mu - \mu_j^r| \cdot \norm{(1-S_{j,M}^r)}_\infty +  \norm{\mu_j^r (1-S_{j,M}^r) - (1 - S_j^r)}_\infty\\
+&< |1-\mu| + |1-\mu_j^r| +  \frac{\varepsilon}{40J}\\
+&< \frac{\varepsilon}{20J}
+\end{align*}
+Define the function $h_j = \mu (S_{j,M}^1 -  S_{j,M}^0)$
+and observe that
+\[\sup_{t \in \R_+} |h_j(t) - f(t,x_j)| < \frac{\varepsilon}{10J}.\]
+Now we construct the function
+\begin{align*}
+ f'': \R_{+} \times \mathcal{X} \to \R, &&  f''(t,x):=\sum_{j=1}^J \psi_j(x)\,h_j(t)
+\end{align*}
+which admit the following properties
+\begin{align*}
+\norm{f''-f'}_\infty< \frac{\varepsilon}{5}, && \norm{f''-f}_\infty< \frac{2\varepsilon}{5}.
+\end{align*}
+
+Let $K = JM$ and $\varphi: \{1,\dots,J\}\times\{1,\dots,M\} \to \{1,\ldots,K\}$ be a bijection and define the following weights
+\begin{align*}
+b_{\varphi(j,i)}^0:= \frac{y_{j,i}^0}{\bar\alpha} && b_{\varphi(j,i)}^1:= \frac{y_{j,i}^1}{\bar\alpha} && \widehat\omega_{\varphi(j,i)}(x) = \frac{\psi_j(x)}{M}
+\end{align*}
+so that
+\[ f''(t,x) = \sum_{k=1}^K \widehat\omega_k(x) \mu \Big[G(t;\bar\alpha,b_k^1)- G(t;\bar\alpha,b_k^0)\Big].\]
+Using Lemma~\ref{lem:softmax}, choose $p$ and $C$ so that for $k \in \{1,\ldots,K\}$
+\[ \sup_{x \in \mathcal{X}} \Big\vert \omega_k(C^\top\phi_p(x))- \widehat\omega_k(x) \Big\vert  < \frac{3\varepsilon}{10 K}. \]
+Define the function $\widetilde f: \R_{+} \times \mathcal{X}$ as
+\[
+  \widetilde f(t,x) \;\eqdef\; \sum_{k=1}^K \omega_k\!\big(C^\top\phi_p(x)\big) \Big[G(t;\bar\alpha,b_k^1)-G(t;\bar\alpha,b_k^0)\Big].
+\]
+Since the application $t \mapsto |G(t;\bar\alpha,b_k^1)-G(t;\bar\alpha,b_k^0)|$ is bounded by $1$, one has
+\begin{align*}
+  ||\widetilde f- f''||_\infty &\le  \abs{1-\mu} +  \sup_{x \in \mathcal{X}} \, \sum_{k=1}^K\abs{\omega_k(C^\top\phi_p(x))-\widehat\omega_k(x)} < \frac{3 \varepsilon}{5}
+\end{align*}
+Therefore,
+\[
+  ||\widetilde f-f||_\infty
+  \le || \widetilde f- f''||_\infty +\norm{ f''-f}_\infty
+  < \varepsilon.
+\]
+\end{proof}
+
+\section{Asymptotic Properties}\label{appendix:asymptotic}
+
+
+In this section, following the usual notations in double/debiased machine learning, we
+denote the CATE $\tau_0$, time-fixed CATE $\tau_{t,0}$ and nuisance parameters 
+$\eta_0 \eqdef (e_0(-), S^\dagger_{-,0}(-|-), S^*_{-,0}(-|-))$.
+
+\medskip
+
+Denote by $\mathscr{S}$ the set of functions $S: [0,\tend] \times \mcl{X} \times \{0,1\} \to [0,1]$ such that
+for almost any $(x,w) \in \mcl{X} \times \{0,1\}$ the function $u \mapsto S(u|x,w)$ is càdlàg survival function. Similarily, denote the natural associated perturbation space $\mathscr{T}$  of functions $h : [0,\tend] \times \mcl{X} \times \{0,1\} \to \R$ such that
+for any $(x,w) \in \mcl{X} \times \{0,1\}$ the function $u \mapsto h(u|x,w)$ is càdlàg of bounded variation and $h(0|x,w) = 0$.
+
+\medskip
+
+Denote by $\mathscr{T}^\dagger = \mathscr{S} - \{ S_0^\dagger \}$ and $\mathscr{T}_{\varepsilon,M}^\dagger$ the set of function $h^\dagger \in \mathscr{T}^\dagger$ such that $||h^\dagger||_{L^\infty} \leq M$, $|S_0^\dagger + h^\dagger| > \varepsilon$ and $||h^\dagger||_{L^4}$ is finite. 
+Similarily denote by $\mathscr{T}^* = \mathscr{S} - \{ S_{0}^\ast \}$ and $\mathscr{T}_{\varepsilon,M}^\ast$ the set of functions $h^* \in \mathscr{T}_M^\dagger$ such that $h^*/S^\ast_{0}$ has a total variation on $(0, \tend]$ bounded by $M$, $|S_0^\ast + h^\ast| > \varepsilon$ and $||h^*||_{L^4}$ is finite. 
+Finally denote $\mathscr{T}^e = L^2(\mathcal{X})$ and $\mathscr{T}^e_M$ accordingly.
+
+
+\begin{definition}
+Let $f_1,\ldots,f_n$ and $\delta$ square integrable functions and we define the directional (Gateaux) derivative operator as
+\begin{align*}
+\mathbf{D}_{f_i} L(f_1,\ldots,f_n) [\delta] \eqdef \partial_t L \Big( f + t \delta e_i \Big) \Big \vert_{t = 0}
+\end{align*}
+\end{definition}
+
+For any given direction $h=(h^e,h^\dagger,h^*) \in \mathscr{T}_M^{e \dagger *}$, write
+\[
+  \eta_r(h) \eqdef \bigl(e_0 + rh^e,\; S^\dagger_{-,0}(-|-)+rh^\dagger,\; S^*_{-,0}(-|-)+rh^*\bigr),
+\]
+whenever this path is admissible for $|r|$ small enough. We denote its tangent at $r=0$ by $\delta\eta \eqdef h$.
+
+\begin{lemma}\label{lem:PO_orth}
+Under Asssumptions \ref{as:cons_t}-\ref{as:ovl_cens} and continuity of $S_{0,W}^\dagger(-|X)$ on $(0,\tend]$, 
+the pseudo-outcome $\YPO$ is Neyman-orthogonal i.e. 
+\begin{align*}
+\forall h \in \mathscr{T}_M^{e\dagger*}, \qquad \EX[ \bD_\eta  \YPO (t;\eta_0) [h] | X,W] = 0.
+\end{align*}
+\end{lemma}
+\begin{proof}
+The pseudo-outcome decomposes as
+\begin{align*}
+\YPO(t ; \eta) = A(t ; \eta^*) 
++ B(t ; \eta^\dagger, \eta^*)
++ C(t ; \eta^\dagger, \eta^*)
+\end{align*}
+with the summand $A,B$ and $C$ given by
+\begin{align*}
+A(t; \eta^\dagger, \eta^*) &= \frac{\IDF\{Z > t\}}{\eta_W^*(t|X)},\\ 
+B(t; \eta^\dagger, \eta^*) &= \frac{ \eta_W^\dagger(t|X) \cdot N^*(t) }{\eta_W^\dagger(Z^-|X) \eta_W^*(Z|X) },\\
+C(t; \eta^\dagger, \eta^*) &=  - \eta_W^\dagger(t|X) \int_{0}^{t} \frac{Y(u)  d\Lambda^*_{W,\eta}(u|X)}{\eta_W^\dagger(u^-|X) \eta_W^\ast(u|X)} .
+\end{align*}
+where $d\Lambda^*_{W,\eta_r}(u|X)$ is given by
+\begin{align*}
+  d\Lambda^*_{W,\eta_r}(u|X) \eqdef - \frac{d \eta_{r,W}^*(u|X)}{\eta_{r,W}^*(u^-|X)}.
+\end{align*}
+
+Since $\YPO$ does not depend on $\eta^e$ it suffices to verify the condition in the $\eta^\dagger$ and $\eta^*$ directions. Starting with $\eta^\dagger$, 
+it is clear that the summand arising from $A$ vanishes. The summand yield by $B$ is given by
+\begin{align*}
+\bD_\eta  B(t;\eta_0) [h^\dagger] &= \frac{N^*(t)}{S_{0,W}^*(Z|X)} 
+\left[ \frac{h_W^\dagger(t|X)}{S_{0,W}^\dagger(Z^-|X)} 
+- \frac{S_{0,W}^\dagger(t|X) \cdot h_W^\dagger(Z^-|X)}{S_{0,W}^\dagger(Z^-|X)^2} \right]
+\end{align*}
+which using Lemma \ref{lem:expected_predictable_process}
+\begin{align*}
+\EX[\bD_\eta  B(t;\eta_0) [h^\dagger]|X,W] &= h_W^\dagger(t|X) \int_0^t \frac{S_{0,W}^*(u^-|X)}{S_{0,W}^*(u|X)} d \Lambda_{0,W}^*(u|X) \\ 
+& \quad - S_{0,W}^\dagger(t|X) \int_0^t \frac{S_{0,W}^*(u^-|X)h_W^\dagger(u^-|X)}{S_{0,W}^\dagger(u|X)S_{0,W}^*(u|X)} d \Lambda_{0,W}^*(u|X)  
+\end{align*}
+Similarly,
+\begin{align*}
+\bD_\eta  C(t;\eta_0) [h^\dagger] &= 
+- h_W^\dagger(t|X) \int_{0}^{t} \frac{Y(u) d\Lambda^*_{0,W}(u|X)}{S_{0,W}^*(u|X) S_{0,W}^\dagger(u^-|X)}  \\
+& \quad + \int_{0}^{t} \frac{Y(u) S_{0,W}^\dagger(t|X)h_{0,W}^\dagger(u^-|X)}{S_{0,W}^*(u|X) S_{0,W}^\dagger(u^-|X)^2} d\Lambda^*_{0,W}(u|X).
+\end{align*}
+It follows from Fubini-Tonelli and Lemma \ref{lem:proba_identity} that
+\begin{align*}
+\EX[\bD_\eta  C(t;\eta_0) [h^\dagger]|X,W] &= - \EX[\bD_\eta  B(t;\eta_0) [h^\dagger]|X,W]
+\end{align*}
+hence, $\EX[ \bD_\eta  \YPO (t;\eta_0) [h^\dagger] | X,W] = 0$. In a symmetric fashion,
+\begin{align*}
+\EX [ \bD_\eta  A(t;\eta_0) [h^*] | X,W ] &= 
+- \frac{\mbb{P}(Z > t| X,W)}{S_{0,W}^*(t|X)^2} h_W^*(t|X) \\
+&= - \frac{S_{0,W}^\dagger(t|X)}{S_{0,W}^*(t|X)} h_W^*(t|X).
+\end{align*}
+Handling $B$ requires Lemma \ref{lem:expected_predictable_process} again, and yields
+\begin{align*}
+\EX[\bD_\eta  B(t;\eta_0) [h^*]|X,W] &= - S_{0,W}^\dagger(t|X) \int_0^t \frac{h_W^*(u|X) S_{0,W}^*(u^-|X)}{S_{0,W}^*(u|X)^2} d\Lambda^*_{0,W}(u|X).
+\end{align*}
+We denote the path induced by $h^*$ by 
+\begin{align*}\eta_r^*: r \mapsto S_{0,W}^\ast(u|X)+r h^*_W(u|X)
+\end{align*} 
+and its inverse by $\gamma_{r,W}^*(u|X) \eqdef 1/\eta_r^*(u)$. Observe that 
+\begin{align*}
+d\Lambda_{r,W}^\ast(u|X) = \eta_r^*(u^-) d \gamma_{r,W}^*(u|X).
+\end{align*}
+and consider the map $r \mapsto d \gamma_{r,W}^*(u|X)$. 
+It follows from Assumption \ref{as:ovl_cens} and the fact that $h^\ast_W(-|X)$ has bounded variation
+that it is differentiable at the origin with derivative $d \dot \gamma_{0,W}^\ast(u|X)$ where
+\begin{align*}
+\dot{\gamma}_{0,W}^\ast : u \mapsto \frac{-h_W^*(u|X)}{S_{0,W}^\ast(u|X)^2}.
+\end{align*}
+This yields the identity
+\begin{align*}
+\bD_\eta  C(t;\eta_0) [h^*] &= \int_0^t \frac{Y(u) \, S^\dagger_{0,W}(t|X)}{S^\dagger_{0,W}(u^-|X)}\,d \dot \gamma_{0,W}^\ast(u|X).
+\end{align*}
+which yields using Lemma \ref{lem:proba_identity} 
+\begin{align*}
+\EX[\bD_\eta  C(t;\eta_0) [h^*] |X,W] &=  S^\dagger_{0,W}(t|X) \int_0^t\!S_{0,W}^*(u^-|X) \, d \dot \gamma_{0,W}^\ast(u|X).
+\end{align*}
+It follows from Lebesgue-Stieltjes integration by part and the boundary condition $h_W^*(0|X) = 0$ that
+\begin{align*}
+\int_0^t \!S_{0,W}^*(u^-|X) \,d \dot \gamma_{0,W}^\ast(u|X) &= 
+\frac{h_W^*(t|X)}{S_{0,W}^\ast(t|X)} - \int_0^t \frac{h_W^*(u|X)}{S_{0,W}^\ast(u|X)^2} d S_{0,W}^*(u|X) \\
+&= \frac{h_W^*(t|X)}{S_{0,W}^\ast(t|X)} + \int_0^t \frac{h_W^*(u|X)S_{0,W}^\ast(u^-|X)}{S_{0,W}^\ast(u|X)^2} d \Lambda_{0,W}^*(u|X) 
+\end{align*}
+This yields the result i.e. $\EX[\bD_\eta \YPO (t;\eta_0) [h^*] |X,W] = 0$.
+\end{proof}
+For the sake of readibility of the Gateaux calculus that follows, we introduce
+the two shorthands $\alpha(\eta) \eqdef W - \eta^e(X)$ and 
+\begin{align*}
+\beta(t; \eta) \eqdef \YPO(t;\eta) 
+- \eta_1^\dagger(t|X) \eta^e(X) - \eta_0^\dagger(t|X) \{1-\eta^e(X)\} 
+- \alpha(\eta) \tau_{0,t}(X).
+\end{align*}
+Moreover, $\EX[\alpha(\eta_0)|X] = 0$ and $\EX[\beta(\tau; \eta_0)|X,W] = 0$ (Lemma~\ref{lemma:robinson_dec}).
+\begin{lemma}[\citet{foster2023orthogonal} Assumption 1]
+Under Assumption~\ref{as:cons_t}-\ref{as:ovl_cens} and assuming that the function $S_{0,W}^\dagger(-|X)$ 
+is continuous, the time-fixed R-loss is Neyman orthogonal, namely,
+\begin{align*}
+ \bD_\eta \bD_{\tau_t} \mathcal{L}^R_t(\tau_{0,t}; \eta_0)[h^{\tau_t}, h] = 0, 
+\qquad \forall h^\tau \in, \forall h \in %Alex: TO FILL 
+\end{align*}
+\end{lemma}
+\begin{proof}
+The notations $\alpha$ and $\beta$ allow us to write the score associated with $\mathcal{L}_t^R$ as
+\begin{align*}
+ \bD_{\tau_t} \mathcal{L}^R_t(\tau_{0,t}; \eta)[h^{\tau_t}] = 
+ -2\EX [ \beta(t;\eta)\alpha(\eta)h^{\tau_t}(X) ].
+\end{align*}
+Moreover, using Lemma~\ref{lem:PO_orth} we get 
+\begin{align*}
+\EX[\bD_{\eta} \beta(t; \eta_0) [h^\dagger]|X,W] = -h_1^\dagger(t|X)e(X) - h_0^\dagger(t|X) \{1-e(X) \}.
+\end{align*}
+This yields the following expression of the $h^\dagger$-Gateaux differential 
+\begin{align*}
+\bD_{\eta} \bD_{\tau_t} \mathcal{L}^R_t(\tau_{0,t}; \eta_0)[h^{\tau_t}, h^\dagger] &= 
+  2\EX [ h_1^\dagger(t|X)e(X) \cdot \EX[\alpha(\eta_0)|X] \cdot h^{\tau_t}(X)] \\
+& \quad + 2\EX [ h_0^\dagger(t|X)\{1-e(X)\}  \cdot \EX[\alpha(\eta_0)|X] \cdot h^{\tau_t}(X)]  
+\end{align*}
+which vanishes since $\EX[\alpha(\eta_0)] = 0$.
+Similarly, 
+\begin{align*}
+\bD_{\eta} \bD_{\tau_t} \mathcal{L}^R_t(\tau_{0,t}; \eta_0)[h^{\tau_t}, h^*] = 
+-2\EX [ \EX[\bD_{\eta}\YPO(t;\eta_0)[h^*]|X,W] \cdot \alpha(\eta_0) h^{\tau_t}(X) ]
+\end{align*}
+which vanishes by Lemma~\ref{lem:PO_orth}. Finally, the $h^e$-Gateaux differential is given by 
+\begin{align*}
+\bD_{\eta} \bD_{\tau_t} \mathcal{L}^R_t(\tau_{0,t}; \eta_0)[h^{\tau_t}, h^e] =
+2 \EX[ (\beta(t;\eta_0) h^e(X) - \alpha(\eta_0) \bD_{\eta} \beta(t;\eta_0)[h^e] ) h^{\tau_t}(X)].
+\end{align*}
+Using $\EX[\beta(t;\eta_0)|X,W] = 0$ and the following consequence of Lemma~\ref{lem:PO_orth} 
+\begin{align*}
+\EX[\bD_{\eta} \beta(t;\eta_0)[h^e]|X,W] &= 
+h^e(X) \{ \tau_{0,t}(X) - S_1^\dagger(t|X) + S_0^\dagger(t|X)\}.
+\end{align*}
+the differential writes
+\begin{align*}
+\bD_{\eta} \bD_{\tau_t} \mathcal{L}^R_t(\tau_{0,t}; \eta_0)[h^{\tau_t}, h^e] &= 
+ 2\EX[\EX[\alpha(\eta_0)|X] \{S_1^\dagger(t|X) - S_0^\dagger(t|X)\} h^e(X) h^{\tau_t}(X)] \\ 
+& \quad -2\EX[\EX[\alpha(\eta_0)|X]  \tau_{0,t}(X) h^e(X) h^{\tau_t}(X)]
+\end{align*}
+which vanishes since $\EX[\alpha(\eta_0)|X,W] = 0$.
+\end{proof}
+
+\begin{lemma}[\citet{foster2023orthogonal} Assumption 2]
+Under Assumption~\ref{as:cons_t}-\ref{as:ovl_cens}, 
+$\bD_{\tau_t} \mathcal{L}^R_t(\tau_{0,t}; \eta_0)[h^{\tau_t}]$ vanishes.
+\end{lemma}
+\begin{proof}
+It follows from Lemma~\ref{lemma:robinson_dec} that if $\varepsilon_{0,t}$ denotes the Robinson residual, then
+\begin{align*}
+\bD_{\tau_t} \mathcal{L}^R_t(\tau_{0,t}; \eta_0)[h^{\tau_t}] &= 
+-2\EX [ \beta(t; \eta_0)\alpha(\eta_0) h^{\tau_t}(X)] 
+\end{align*}
+which vanishes since $\EX[\beta(\eta_0)|X,W]=0$.
+\end{proof}
+
+We introduce the following notations that allows to conveniently write perturbations bounds
+\begin{align*}
+\lceil h_w^\dagger \rceil(x) \eqdef \sup \{ \max(|h_w^\dagger(u|x)|, |h_w^\dagger(u^-|x)|) \mid u \in [0,\tend]\} \\ 
+\lceil h_w^\ast \rceil(x) \eqdef \sup \{ \max(|h_w^\ast(u|x)|, |h_w^\ast(u^-|x)|) \mid u \in [0,\tend]\}
+\end{align*}
+which yields the norms
+\begin{align*}
+||h^\dagger||_{L^4} &\eqdef \EX \Big[ \max \{ \lceil h_1^\dagger \rceil, \lceil h_0^\dagger \rceil \} (X)^4 \Big]^{1/4}, \\
+||h^\ast||_{L^4} &\eqdef \EX \Big[ \max \{ \lceil h_1^\ast \rceil, \lceil h_0^\ast  \rceil\} (X)^4 \Big]^{1/4}.
+\end{align*}
+In order to use Riemann-Stieltjes integrals we introduce the total variation analogues namely $\mathrm{V}(h_w^\ast) \eqdef \mathrm{V}_0^{\tend}(u \mapsto h_w^\ast(u|x))$ and
+\begin{align*}
+||\mathrm{V}(h^\ast)||_{L^4} &\eqdef \EX \Big[ \max \{ \mathrm{V}(h_1^\ast), \mathrm{V}(h_0^\ast)\}(X)^4 \Big]^{1/4}.
+\end{align*}
+Also the norm on the total perturbation $h = (h^e,h^\ast,h^\dagger)$ is given by
+\begin{align*}
+\norm{h}^2 = \norm{h^e}_{L^4}^2 + \norm{h^\dagger}_{L^4}^2 
++ \left( \norm{h^\ast}_{L^4} + \norm{\mathrm{V}(h^\ast)}_{L^4}\right)^2
+\end{align*}
+
+For the sake of conciseness, denote $H_\dagger \eqdef \lceil h_{W}^\dagger \rceil (X)$, 
+$H_\ast \eqdef \lceil h_{W}^\ast \rceil (X)$ and $V_* = \mathrm{V}(h^\ast_W)(X)$.
+
+\begin{lemma}[\citet{foster2023orthogonal} Assumption 3, Pseudo-outcome] \label{lem:ass3_PO}
+Under Assumption ? %To fill here
+we get the bounds 
+\begin{align*}
+|\bD_\eta \YPO(t;S^*, S^\dagger)[h]| &< 
+6\varepsilon^{-3}\,H_\ast + 2 \varepsilon^{-1}(2\varepsilon^{-1}-1)H_\dagger,\\
+|\bD_\eta^2 \YPO(t;S^*, S^\dagger)[h,h]| &< 
+16 \varepsilon^{-3}(H_\dagger^{2} + H_\ast^{2}) + 4\varepsilon^{-3}(H_\dagger + H_\ast)V_\ast.
+\end{align*}
+\begin{proof}
+For the sake of conciseness we shall drop the reference to $X$ and $W$ when the context allows it. Using the notation from Lemma \ref{lem:PO_orth} one has
+\begin{align*}
+\bD_\eta A(t;S^*)[h^*] &= - \IDF\{Z>t\} S^*(t)^{-2} \cdot h^*(t),\\ 
+\bD_\eta^2 A(t;S^*)[h^*,h^*] &= 2 \cdot \IDF\{Z>t\} S^*(t)^{-3} \cdot h^*(t)^2. 
+\end{align*}
+In particular,
+\begin{align*}
+|\bD_\eta A(t;S^*)[h]| < \varepsilon^{-2}\,H_\ast, && 
+|\bD_\eta^2 A(t;S^*)[h,h]| <  2 \varepsilon^{-3}\,H_\ast^2. 
+\end{align*}
+Similarly with the $B$ summand,
+\begin{align*}
+\bD_\eta B(t;S^*, S^\dagger)[h^*] &= 
+- N^*(t)\,\frac{S^\dagger(t) h^*(Z)}{S^\dagger(Z^-) S^*(Z)^{2}}  \\
+\bD_\eta B(t;S^*,S^\dagger)[h^\dagger] &=  
+\frac{N^*(t)}{S^*(Z)} \, \left[ \frac{h^\dagger(t)}{S^\dagger(Z^-)} 
+- \frac{S^\dagger(t)h^\dagger(Z^-)}{S^\dagger(Z^-)^2} \right] \\
+\bD_\eta^2 B(t;S^*, S^\dagger)[h^*,h^*] &= 
+2 N^*(t)\,\frac{S^\dagger(t) h^\ast(Z)^2}{S^\dagger(Z^-) S^\ast(Z)^{3}}\\
+\bD_\eta^2 B(t;S^*, S^\dagger)[h^*, h^\dagger] &= 
+- \frac{N^*(t) h^*(Z)}{S^*(Z)^{2}} \, \left[ \frac{h^\dagger(t)}{S^\dagger(Z^-)} 
+- \frac{S^\dagger(t) h^\dagger(Z^-)}{S^\dagger(Z^-)^2} \right]\\
+\bD_\eta^2 B(t;S^*,S^\dagger)[h^\dagger, h^\dagger] &=  
+\frac{2N^*(t)}{S^*(Z)} \,  \left[ \frac{S^\dagger(t)h^\dagger(Z^-)^2}{S^\dagger(Z^-)^3}
+- \frac{h^\dagger(t) h^\dagger(Z^-)}{S^\dagger(Z^-)^2} \right]
+\end{align*}
+which yields
+\begin{align*}
+|\bD_\eta B(t;S^*, S^\dagger)[h^*]| &< \varepsilon^{-2}\, H_\ast, \\ 
+|\bD_\eta B(t;S^*, S^\dagger)[h^\dagger]| &< 2\varepsilon^{-2}\,H_\dagger \\ 
+|\bD^2_\eta B(t;S^*, S^\dagger)[h^*, h^*]| &< 2\varepsilon^{-3}\,H_\ast^2, \\
+|\bD^2_\eta B(t;S^*, S^\dagger)[h^\ast, h^\dagger]| &< 2\varepsilon^{-3}\,H_\ast H_\dagger, \\ 
+|\bD^2_\eta B(t;S^*, S^\dagger)[h^\dagger, h^\dagger]| &< 4\varepsilon^{-3} H_\dagger^2.
+\end{align*}
+In particular,
+\begin{align*}
+|\bD_\eta B(t;S^*, S^\dagger)[h]| &< \varepsilon^{-2} \cdot ( H_\ast + 2 H_\dagger), \\ 
+|\bD^2_\eta B(t;S^*, S^\dagger)[h, h]| &< \varepsilon^{-3} \cdot ( 6\,H_\dagger^2 + 4\,H_*^2).
+\end{align*}
+Finally with the $C$ summand, 
+\begin{align*}
+C(t; \eta^\dagger, \eta^*) &= \eta_W^\dagger(t|X) \int_{0}^{t} \frac{Y(u)  dS^*_{W,\eta}(u|X)}{\eta_W^\dagger(u^-|X) \eta_W^\ast(u|X) \eta_W^\ast(u^-|X)}\\
+\bD_\eta C(t;S^*, S^\dagger) [h^\dagger] &= 
+\int_{0}^{t} \left[\frac{ h^\dagger(t)}{S^\dagger(u^-)} - \frac{S^\dagger(t) h^\dagger(u^-)}{S^\dagger(u^-)^2} \right] 
+\frac{Y(u) \nd S^*(u)}{S^*(u)S^*(u^-)} \\ 
+%%%%
+\bD_\eta C(t;S^*, S^\dagger) [h^\ast] &= 
+- \int_{0}^{t} \frac{S^\dagger(t)Y(u)}{S^\dagger(u^-)} \left( \frac{h^\ast(u)}{S^\ast(u)^2 S^\ast(u^-)} +  \frac{h^\ast(u^-)}{S^\ast(u) S^\ast(u^-)^2} \right) dS^*(u)\\
+& \qquad + \int_{0}^{t} \frac{S^\dagger(t) Y(u)}{S^\dagger(u^-) S^\ast(u) S^\ast(u^-)} \nd h^*(u) \\  
+%%%%
+\bD^2_\eta C(t;S^*, S^\dagger) [h^\dagger, h^\dagger] &=  
+2 \int_{0}^{t} \left[\frac{S^\dagger(t) h^\dagger(u^-)^2}{S^\dagger(u^-)^3 } -  
+\frac{h^\dagger(t) h^\dagger(u^-)}{S^\dagger(u^-)^2 } \right] \frac{Y(u)dS^*(u)}{S^*(u)S^*(u^-)} \\
+%%%%
+\bD^2_\eta C(t;S^*, S^\dagger) [h^\ast, h^\ast] &=  
+2\int_{0}^{t} \frac{S^\dagger(t)Y(u)}{S^\dagger(u^-)} \left(  
+  \frac{h^\ast(u)^2}{S^\ast(u)^3 S^\ast(u^-)} 
+  + \frac{h^\ast(u^-)^2}{S^\ast(u) S^\ast(u^-)^3} \right) dS^\ast(u)\\ 
+& \qquad - 2 \int_0^t \frac{S^\dagger(t)Y(u)}{S^\dagger(u^-)} \left(
+  \frac{h^\ast(u)}{S^\ast(u)^2 S^\ast(u^-)} 
+  + \frac{h^\ast(u^-)}{S^\ast(u) S^\ast(u^-)^2} \right) \nd h^\ast(u)\\ 
+& \qquad + 2 \int_0^t \frac{S^\dagger(t)Y(u)}{S^\dagger(u^-)}
+  \frac{h^\ast(u)h^\ast(u^-)}{S^\ast(u)^2 S^\ast(u^-)^2} \nd S^\ast(u)\\ 
+%%%%
+\bD^2_\eta C(t;S^*, S^\dagger) [h^\dagger, h^*] &= 
+- \int_{0}^{t} 
+\left[\frac{ h^\dagger(t)}{S^\dagger(u^-)} - \frac{S^\dagger(t) h^\dagger(u^-)}{S^\dagger(u^-)^2} \right]
+\left[ \frac{h^\ast(u)}{S^\ast(u)} + \frac{h^\ast(u^-)}{S^\ast(u^-)} \right] \frac{Y(u) dS^*(u)}{S^\ast(u) S^\ast(u^-)} \\
+& \qquad + \int_{0}^{t} 
+\left[\frac{ h^\dagger(t)}{S^\dagger(u^-)} - \frac{S^\dagger(t) h^\dagger(u^-)}{S^\dagger(u^-)^2} \right]
+\frac{Y(u) \nd h^\ast(u)}{S^\ast(u)S^\ast(u^-)}
+\end{align*}
+Hence we can write
+\begin{align*}
+|\bD_\eta C(t;S^*, S^\dagger) [h^\dagger]| &\leq 
+2 \varepsilon^{-1}(\varepsilon^{-1} - 1) H_\dagger\\
+|\bD_\eta C(t;S^*, S^\dagger) [h^\ast]| &\leq 
+2 \varepsilon^{-2}(\varepsilon^{-1} - 1)\,H_\ast + 4 \varepsilon^{-3}H_\ast \\
+|\bD^2_\eta C(t;S^*, S^\dagger) [h^\dagger, h^\dagger]| &\leq 
+4 \varepsilon^{-2}(\varepsilon^{-1} - 1) H_\dagger^2 \\
+|\bD^2_\eta C(t;S^*, S^\dagger) [h^\ast, h^\ast]| &\leq 
+6 \varepsilon^{-2}(\varepsilon^{-1} - 1) H_\ast^2 + 4 \varepsilon^{-3} H_\ast V_*\\
+|\bD^2_\eta C(t;S^*, S^\dagger) [h^\dagger, h^\ast]| &\leq 
+4 \varepsilon^{-2}(\varepsilon^{-1} - 1)\,H_\dagger H_\ast+ 2 \varepsilon^{-3} H_\dagger V_* 
+\end{align*}
+In particular, we get the bound
+\begin{align*}
+|\bD^2_\eta C(t;S^*, S^\dagger) [h, h]| &\leq 
+10 \varepsilon^{-2}(\varepsilon^{-1} - 1)\,(H_\dagger^2 + H_\ast^2)+ 4 \varepsilon^{-3} (H_\dagger + H_\ast) V_*.
+\end{align*}
+\end{proof}
+\end{lemma}
+
+Moreover, for the sake of conciseness for a given function $\Psi$ depending on $(\tau,\eta)$ we 
+shall use the notations $\partial_h{\Psi}(\tau) \eqdef \bD_\eta \Psi(\tau;\eta) [h]$ 
+and $\partial_h^2{\Psi}(\tau) \eqdef \bD^2_\eta \Psi(\tau;\eta) [h, h]$. 
+Similarly, $\Psi_0 \eqdef \Psi(\tau_0)$ and 
+$\mathcal{S}_{t,v}^R(\eta) \eqdef \bD_\eta \mathcal{L}^R_t(\tau_{0,t};\eta) [v]$.
+
+\begin{lemma}[\citet{foster2023orthogonal} Assumption 3]
+Under Assumption~\ref{as:cons_t}-\ref{as:ovl_cens}, there exist $\gamma_1,\gamma_2 \in \Rpstar$ such that 
+the following bounds hold 
+\begin{align*}
+|\bD_{\tau_t}^2 \mathcal{L}^R_t(\tau_t; \eta_0)[v,v]|
+&\leq \gamma_1 \norm{v}^2, 
+&\qquad \forall \tau_t \in \mathrm{L}^2(\Rp \times \mathcal{X}),\, \forall v \in ; \\ %Alex: TO FILL;
+|\partial_h^2 \mathcal{S}^R_{t,v}| 
+&\leq \gamma_2 \norm{v} \cdot \norm{h}^2 
+&\qquad \forall v \in; 
+\end{align*}
+\end{lemma}
+\begin{proof}
+First of all,
+\begin{align*}
+\left| \bD_{\tau_t}^2 \mathcal{L}^R_t(\tau_{t}; \eta_0)[v,v] \right|
+&= 2 \left| \EX\!\left[\alpha(\eta_0)^2 v^2 \right] \right| \leq 2 \norm{v}^2  
+\end{align*}
+Observe that $\partial_h \alpha \eqdef - h^e(X)$ and $\partial_h^2 \alpha = 0$
+\begin{align*}
+\partial_h \beta &= \partial_h \YPO(t) - h^\dagger_1(t|X)\eta^e(X) 
+- h_0^\dagger(t|X)\{1 - \eta^e(X)\} + h^e(X) \tau_{0,t}(X) \\ 
+& \quad + \{ \eta_0^\dagger(t|X) - \eta_1^\dagger(t|X)\} h^e(X) \\
+\partial^2_h \beta &= \partial^2_h \YPO(t) + 2\{ h^\dagger_0(t|X) - h^\dagger_1(t|X) \} h^e(X) 
+\end{align*}
+Since $\mathcal{S}^R_{t,v}(\eta) = -2 \EX\!\left[ \beta_0(\eta)\alpha(\eta) v\right]$ we get
+\begin{align*}
+\partial_h^2 \mathcal{S}^R_{t,v}(\eta) 
+&= -2 \EX\!\left[ v\alpha(\eta)\partial^2_h\beta_0 - 2v h^e(X)\partial_h\beta_0 \right] \\
+&= -2 \EX\!\left[ v\alpha(\eta)\partial^2_h \YPO(t) \right] 
+- 4 \EX\!\left[ v\alpha(\eta) \{ h^\dagger_0(t|X) - h^\dagger_1(t|X) \} h^e(X) \right] \\
+& \quad + 4 \EX\!\left[ v h^e(X)\partial_h\beta_0 \right]
+\end{align*}
+where using Lemma~\ref{lem:ass3_PO}
+\begin{align*}
+\left| \EX\!\left[ v\alpha(\eta)\partial^2_h \YPO(t) \right] \right| 
+&\leq 16 \varepsilon^{-3} \norm{v}
+\left(\norm{h^\dagger}_{L^4}^{2} + \norm{h^\ast}_{L^4}^2 \right) \\ 
+& \qquad + 4 \varepsilon^{-3} \norm{v} 
+\left( \norm{h^\dagger}_{L^4} + \norm{h^\ast}_{L^4}\right) 
+\norm{\mathrm{V}(h^\ast)}_{L^4} \\
+&\leq 16 \varepsilon^{-3} \norm{v}
+\left(\norm{h^\dagger}_{L^4}^{2} + \norm{h^\ast}_{L^4}^2 \right) \\ 
+& \qquad + 4 \varepsilon^{-3} \norm{v} 
+\left( \norm{h^\dagger}_{L^4}^2 + \left\{ \norm{h^\ast}_{L^4} + \norm{\mathrm{V}(h^\ast)}_{L^4} \right\}^2 \right) \\ 
+&\leq 18 \varepsilon^{-3} \norm{v} \cdot \norm{h}^2
+\end{align*}
+\begin{align*}
+\left|\EX\!\left[ v\alpha(\eta) \{ h^\dagger_0(t|X) - h^\dagger_1(t|X) \} h^e(X) \right] \right|
+&\leq 2\,\norm{v} \cdot \norm{h^\dagger}_{L^4} \norm{h^e}_{L^4}
+\leq \norm{v} \cdot \norm{h}^2.
+\end{align*}
+\begin{align*}
+\left| \partial_h \beta_0 \right| \leq \left| \partial_h \YPO(t) \right|
++ \max_{w \in \{0,1\}}\left|h_w^\dagger(t|X)\right|  + 2|h^e|
+\end{align*}
+Using Lemma~\ref{lem:ass3_PO} with $\varepsilon$ small enough
+\begin{align*}
+\left| \EX\!\left[ v h^e(X)\partial_h\beta_0 \right] \right| 
+&\leq \norm{v} \cdot \norm{h^e}_{L^4} 
+\left[ \norm{\partial_h \YPO(t)}_{L^4} 
++ \norm{h^\dagger}_{L^4} 
++ 2\norm{h^e}_{L^4}\right] \\
+&\leq \norm{v} \cdot \norm{h^e}_{L^4} 
+\left[ 6 \varepsilon^{-3} \norm{h^\ast}_{L^4} 
++ (4\varepsilon^{-2}+1) \norm{h^\dagger}_{L^4} 
++ 2\norm{h^e}_{L^4}\right] \\
+&\leq  \norm{v} \cdot 3\varepsilon^{-3} \left\{ \norm{h^e}^2_{L^4} + \norm{h^\ast}^2_{L^4} \right\} 
++ 2 \norm{v} \cdot \norm{h^e}^2_{L^4}  \\ 
+& \qquad + \norm{v} \cdot \frac{4\varepsilon^{-2}+1}{2} \left\{ \norm{h^e}^2_{L^4} + \norm{h^\dagger}^2_{L^4} \right\} \\ 
+&\leq 6\varepsilon^{-3}\, \norm{v} \cdot \norm{h}^2 
+\end{align*}
+Hence 
+\begin{align*}
+|\partial_h^2 \mathcal{S}^R_{t,v}| \leq 4(15 \varepsilon^{-3} + 1) \norm{v} \cdot \norm{h}^2
+\end{align*}
+
+\end{proof}
+
+\begin{lemma}[\citet{foster2023orthogonal} Assumption 4]
+Under Assumption~\ref{as:cons_t}-\ref{as:ovl_cens}, there exist $\lambda \in \Rpstar$ such that the following bound condition holds 
+\begin{align*}
+\bD_{\tau_t}^2 \mathcal{L}^R_t(\xi ;\eta_0)[h^{\tau_t}, h^{\tau_t}] \geq \lambda \cdot ||h^{\tau_t}||^2, 
+\qquad \forall \xi \in \mathrm{L}^2(\Rp \times \mathcal{X}),
+\, \forall h^{\tau_t} \in .%Alex:TO FILL 
+\end{align*}
+\end{lemma}
+\begin{proof}
+\begin{align*}
+\bD_{\tau_t}^2 \mathcal{L}^R_t(\xi ; \eta)[h^{\tau_t}, h^{\tau_t}] 
+&= 2\EX\!\left[\alpha(\eta)^2 h^{\tau_t}(X)^2 \right] \\  
+&= 2\EX\!\left[\alpha(\eta_0)^2 h^{\tau_t}(X)^2 + \{e(X) - \eta^e(X)\}^2 h^{\tau_t}(X)^2 \right] \\  
+&\geq 2 \EX\!\left[ \EX[ \{ W - e(X) \}^2 | X] \cdot h^{\tau_t}(X)^2 \right].
+\end{align*}
+Using Assumption \ref{as:ovl}, one obtains the bound
+\begin{align*}
+\bD_{\tau_t}^2 \mathcal{L}^R_t(\xi; \eta)[h^{\tau_t},h^{\tau_t}] 
+&\geq 2 \eta(1-\eta) \cdot || h^{\tau_t}||^2.
+\end{align*}
+\end{proof}
+
+\section{Implementation Details}\label{appendix:implementation}
+
+The AIR estimator is implemented in Python using JAX \citep{jax2018github} and Keras \citep{chollet2025deep}, which provide automatic differentiation and GPU acceleration for the end-to-end training pipeline. The propensity score is estimated by a multi-layer perceptron, and the conditional event and censoring survival functions are estimated by Weibull accelerated failure time networks. Positivity constraints on the Gamma distribution parameters ($\alpha > 0$, $b_k^0, b_k^1 > 0$) are enforced via softplus activations. The covariate encoder that maps inputs to the Gamma mixture parameters is a multi-layer perceptron. The time grid for evaluating the integrated R-loss is a uniform discretization of $[0, \tend]$ with 100 points. Cross-fitting is performed with $V = 5$ folds.
+
+\subsection*{Simulation Study}
+
+\paragraph{Network architectures.}
+For the AIR methods, the propensity score is modelled by a two-hidden-layer MLP (16 neurons per layer); the event and censoring survival functions for each arm are modelled by Weibull accelerated failure time networks (two hidden layers, 16 neurons each).  The MGD CATE model uses a single-hidden-layer encoder (16 neurons) feeding a covariate-gated mixture of $K=2$ Gamma survival differences.  The tensor-product CATE model uses polynomial bases of degree two in covariates and eight time basis functions.
+For the Survival Forest baselines, each forest uses 50 trees with minimum leaf size 15 and maximum depth 15.
+
+\paragraph{Training protocol.}
+Nuisance models are trained for $200$ epochs.  The CATE model is trained for $200$ epochs with learning rate $10^{-3}$ and early stopping (patience $30$ epochs).  The CATE fit is restarted $5$ times from different random initialisations; the restart with the lowest training R-loss is selected.
+
+\paragraph{Preprocessing.}
+For DGP~3, covariates sampled from the TVAE are not inherently on a common scale; we therefore apply standard feature scaling (zero mean, unit variance) to all inputs before training to ensure numerical stability of gradient-based optimisation.  True CATEs and oracle nuisances are evaluated on the original covariate scale.
+
+\section{Application Data Pipeline}\label{appendix:pipeline}
+
+Data were extracted from Stanford Healthcare (SHC) electronic health records.
+Less than 1\% of structured covariate values were missing; we performed a complete-case analysis, excluding patients with any missing baseline variable from all subsequent modelling steps.
+Coronary angiography reports were chunked to retain only the medical narrative describing anatomical findings, removing boilerplate template text.
+The resulting text was embedded using Bio\_ClinicalBERT \citep{alsentzer2019clinicalbert}, yielding 768-dimensional vectors per chunk, averaged at the patient level.
+Principal component analysis on the embedding matrix retained the first 100 components, which were concatenated with the structured clinical covariates from Table~\ref{tab:baseline_treatment}.
+All features were standardized to zero mean and unit variance.
+The AIR covariate encoder is a multilayer perceptron with 3 hidden layers of 50 neurons each.
+
+\begin{table}[htbp]
+\centering
+\caption{Baseline Characteristics by Revascularization Strategy}
+\label{tab:baseline_treatment}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcc}
+\hline
+\textbf{Characteristic} & \textbf{PCI (n=2747)} & \textbf{CABG (n=1083)} \\
+\hline
+\multicolumn{3}{l}{\textbf{Demographics}} \\
+Age (years), mean (SD) & 75.4 (7.6) & 73.6 (5.8) \\
+Body-mass index (kg/m²), mean (SD) & 26.6 (5.1) & 27.0 (5.3) \\
+Sex, n (\%) & & \\
+\quad Male & 1865 (67.9) & 816 (75.3) \\
+\quad Female & 879 (32.0) & 267 (24.7) \\
+\quad Unknown & 3 (0.1) & 0 (0.0) \\
+Race/ethnicity, n (\%) & & \\
+\quad White & 1735 (63.2) & 643 (59.4) \\
+\quad Asian & 488 (17.8) & 207 (19.1) \\
+\quad Other & 377 (13.7) & 174 (16.1) \\
+\quad Black & 55 (2.0) & 16 (1.5) \\
+\quad Pacific Islander & 23 (0.8) & 20 (1.8) \\
+\quad Native American & 12 (0.4) & 6 (0.6) \\
+\quad Unknown & 57 (2.1) & 17 (1.6) \\
+\hline
+\multicolumn{3}{l}{\textbf{Clinical characteristics}} \\
+Comorbidities, n (\%) & & \\
+\quad Congestive heart failure & 514 (18.7) & 346 (31.9) \\
+\quad Peripheral vascular disease & 468 (17.0) & 272 (25.1) \\
+\quad Chronic obstructive pulmonary disease & 373 (13.6) & 154 (14.2) \\
+\quad Diabetes mellitus (uncomplicated) & 543 (19.8) & 320 (29.5) \\
+\quad Diabetes with complications & 248 (9.0) & 187 (17.3) \\
+\quad Renal disease & 332 (12.1) & 337 (31.1) \\
+\quad Hypertension (uncomplicated) & 1336 (48.6) & 651 (60.1) \\
+\quad Hypertension (complicated) & 423 (15.4) & 289 (26.7) \\
+\quad Coagulopathy & 112 (4.1) & 126 (11.6) \\
+\quad Obesity & 273 (9.9) & 146 (13.5) \\
+\quad Dyslipidaemia & 1698 (61.8) & 877 (81.0) \\
+\quad Current smoker & 2597 (94.5) & 993 (91.7) \\
+\quad Previous myocardial infarction & 770 (28.0) & 457 (42.2) \\
+\quad Previous stroke & 144 (5.2) & 99 (9.1) \\
+\hline
+\multicolumn{3}{l}{\textbf{Functional measures}} \\
+Creatinine clearance (mL/min), mean (SD) & 68.1 (23.3) & 70.7 (23.6) \\
+Left ventricular ejection fraction (\%), mean (SD) & 54.5 (13.1) & 52.4 (13.5) \\
+\hline
+\multicolumn{3}{l}{\textbf{Complex CAD type}} \\
+Stable angina & 100 (3.6) & 19 (1.8) \\
+Unstable angina & 107 (3.9) & 20 (1.8) \\
+Acute MI & 828 (30.1) & 131 (12.1) \\
+Chronic CAD & 1585 (57.7) & 911 (84.1) \\
+None/Other & 127 (4.6) & 2 (0.2) \\
+\hline
+\multicolumn{3}{l}{\textbf{Coronary angiography report (example excerpt)}} \\
+ & \multicolumn{1}{p{6cm}}{\footnotesize ``\ldots Two-vessel disease: discrete 65\% mid-LAD, 60\% distal circumflex. Left main: 70\% distal bifurcation, low-complexity lesion amenable to single-stent strategy.\,\ldots''} & \multicolumn{1}{p{6cm}}{\footnotesize ``\ldots Three-vessel disease: 80\% proximal LAD with calcification, 70\% mid-circumflex, 90\% RCA with chronic total occlusion. Left main: 40\% ostial.\,\ldots''} \\
+\hline
+\end{tabular}%
+}
+\vspace{0.5em}
+\parbox{\textwidth}{\footnotesize Summary statistics are computed on the complete-case cohort (patients with any missing baseline variable excluded). Continuous variables: mean (SD); categorical variables: n (\%). Percentages may not sum to 100\% due to rounding. CABG: coronary artery bypass grafting; PCI: percutaneous coronary intervention.}
+\end{table}
+
+\section{Simulation Data-Generating Processes}\label{appendix:dgps}
+
+This appendix provides the full mathematical specifications of the three data-generating processes used in the simulation study.
+
+\subsection*{Shared structure}
+DGPs~1 and~2 share a common covariate and treatment-assignment mechanism:
+\begin{align*}
+  X &\sim \mathrm{Uniform}(-1,1)^p, \quad p=5, \\
+  e(x) &= \mathrm{sigmoid}(0.5\, x_1)
+         = \frac{1}{1+\exp(-0.5\, x_1)}, \\
+  W \mid X &\sim \mathrm{Bernoulli}\bigl(e(X)\bigr).
+\end{align*}
+DGP~3 replaces these with empirically calibrated covariates and balanced treatment assignment (see below).
+In all three settings the censoring time is independent of the event time given covariates and treatment, and the administrative end of follow-up is $\tend=5$.  The observed data are $Z = \min(D, C)$ and $\Delta = \IDF\{D \le C\}$.
+
+\subsection*{DGP~1: Heterogeneous Weibull}
+
+The event time in each arm follows a Weibull distribution whose scale depends on covariates:
+\begin{align*}
+  D \mid X, W=w
+    &\sim \mathrm{Weibull}\!\bigl(\alpha,\; \lambda_w(X)\bigr),
+    &
+  \alpha &= 1.5,
+  \\
+  \lambda_w(x)
+    &= \exp\!\bigl(1 + 0.3\, x_1 + 0.5\, w\, x_2\bigr).
+\end{align*}
+The Weibull parametrization is such that the survival function is
+$S_w(t \mid x) = \exp\!\bigl(-(t / \lambda_w(x))^{\alpha}\bigr)$.
+The censoring time is $C \mid X \sim \mathrm{Exp}(1/5)$.
+The true CATE is
+\[
+  \tau(t \mid x) = S_1(t \mid x) - S_0(t \mid x)
+  = \exp\!\Bigl(-\bigl(t / \lambda_1(x)\bigr)^{1.5}\Bigr)
+  - \exp\!\Bigl(-\bigl(t / \lambda_0(x)\bigr)^{1.5}\Bigr).
+\]
+Treatment-effect heterogeneity enters exclusively through~$x_2$: when $w=0$ the scale $\lambda_0(x)$ does not depend on~$x_2$, whereas $\lambda_1(x)$ does.
+
+\subsection*{DGP~2: Weibull Mixture}
+
+Each arm's survival function is a three-component Weibull mixture:
+\[
+  S_w(t \mid x)
+  = \sum_{k=1}^{3} \pi_k^{(w)}(x)\;
+    \exp\!\Bigl(-\bigl(t / \lambda_k^{(w)}(x)\bigr)^{\alpha_k}\Bigr),
+\]
+with component shapes $(\alpha_1, \alpha_2, \alpha_3) = (1, 2, 3)$ and base log-scales $(\mu_1, \mu_2, \mu_3) = (0.8,\, 1.2,\, 1.8)$.
+
+\paragraph{Control arm ($w=0$).}
+The mixture weights are uniform and the scales depend only on~$x_1$:
+\begin{align*}
+  \pi_k^{(0)}(x) &= \tfrac{1}{3}, \quad k=1,2,3, \\
+  \lambda_k^{(0)}(x) &= \exp(\mu_k + 0.2\, x_1).
+\end{align*}
+
+\paragraph{Treatment arm ($w=1$).}
+Both the mixture weights and the scales depend on covariates:
+\begin{align*}
+  \bigl(\pi_1^{(1)}(x),\; \pi_2^{(1)}(x),\; \pi_3^{(1)}(x)\bigr)
+    &= \mathrm{softmax}\!\bigl(0.8\, x_2,\; 0,\; -0.8\, x_2\bigr), \\
+  \lambda_k^{(1)}(x)
+    &= \exp(\mu_k + 0.2\, x_1 + \gamma_k\, x_2),
+    \quad (\gamma_1, \gamma_2, \gamma_3) = (0.5,\; 0,\; -0.3).
+\end{align*}
+Censoring is the same as DGP~1: $C \mid X \sim \mathrm{Exp}(1/5)$.
+The true CATE is $\tau(t \mid x) = S_1(t \mid x) - S_0(t \mid x)$.
+
+\subsection*{DGP~3: Empirically Calibrated IST-3}
+
+This DGP is calibrated on baseline data from the Third International Stroke Trial (IST-3) and augmented with synthetic text embeddings that carry treatment-effect information orthogonal to the structured covariates.
+Structured covariates~$X \in \R^{10}$ are drawn from a Tabular Variational Autoencoder (TVAE) pool trained on IST-3 baseline characteristics, and treatment assignment is balanced: $e(x, h) = 0.5$.
+The covariate vector available to the learner is the concatenation $\tilde X = (X, H) \in \R^{p+d}$, where $H \in \R^{d}$ ($d=5$) is defined below.
+
+\paragraph{Two latent indices.}
+The survival mechanism is driven by two standardised indices:
 \begin{itemize}
-\item \textbf{Hyperparameter.} $K$ controls flexibility (typically small, e.g., $K\in\{2,\ldots,8\}$): larger $K$ yields richer time patterns and effect heterogeneity through the gating weights $\rho_k(X;\beta)$.
-\item \textbf{Shared structure.} The gating $\rho_k(X;\beta)$ and the shape $\bar\alpha$ are shared across all profiles, while $(\lambda_{k,0},\lambda_{k,1})$ are profile-specific and determine the time pattern and magnitude of $\mathrm{TE}_k(t)$.
-\item \textbf{Interpretability.} For a fixed $x$, the weights $\rho_k(x;\beta)$ act as soft memberships over $K$ latent effect profiles; inspecting the dominant weights and their associated $(\lambda_{k,0},\lambda_{k,1})$ provides a profile-level explanation for $\tau(\cdot\mid x)$.
-\item \textbf{Features.} $\phi(\cdot)$ may be linear (optionally with splines/interactions) or a compact representation from a neural network or other embeddings.
+  \item \textbf{Prognostic index} $U_{\mathrm{prog}} = \mathrm{standardize}\!\bigl(\mathrm{PC}_1(X)\bigr)$, the first principal component of~$X$ in the super-population.
+  \item \textbf{Treatment modifier} $U_{\mathrm{treat}} \sim \mathcal{N}(0,1)$, drawn independently of~$X$.
 \end{itemize}
-This parameterization yields a tunable model class with a single structural choice $K$, and enables efficient computation of \(\widehat{\mathcal{L}}^{R}\).
 
-\subsection{Implementation Notes}
-To facilitate the practical implementation of the proposed method in deep learning frameworks (such as PyTorch or JAX), we outline several concrete design choices and architectural recommendations below.
+\paragraph{Synthetic embeddings.}
+Each coordinate of the embedding vector is a noisy observation of the treatment modifier:
+\[
+  H_j \mid U_{\mathrm{treat}} = u_{\mathrm{treat}} \;\overset{\mathrm{iid}}{\sim}\; \mathcal{N}(u_{\mathrm{treat}},\; \sigma^2),
+  \qquad j = 1, \dots, d, \qquad \sigma = 1.
+\]
 
-\subsection{Implementation Notes}
-To facilitate the practical implementation of the proposed method, we explicitly propose developing the codebase using \textbf{JAX} in combination with the \textbf{Keras} framework (e.g., Keras 3 with the JAX backend). This ecosystem provides the high-performance auto-differentiation required for our loss functions alongside the structural modularity needed for custom network components. We outline several concrete design choices below.
+\paragraph{Survival mechanism.}
+Both the Weibull shape and scale depend on covariates:
+\begin{align*}
+  \alpha(x) &= \exp\!\bigl(\log \alpha_0 + a_\alpha \cdot u_{\mathrm{prog}}\bigr), \\
+  \lambda_0(x) &= \lambda_{\mathrm{base}} \cdot \exp\!\bigl(-a_\lambda \cdot u_{\mathrm{prog}}\bigr), \\
+  \lambda_1(x, u_{\mathrm{treat}}) &= \lambda_0(x) \cdot \exp\!\bigl(\gamma_0 + \beta \cdot u_{\mathrm{treat}}\bigr),
+\end{align*}
+\[
+  S_w(t \mid x, u_{\mathrm{treat}}) = \exp\!\Bigl(-\bigl(t / \lambda_w\bigr)^{\alpha(x)}\Bigr),
+\]
+with $\alpha_0 = 1.5$, $a_\alpha = 0.3$, $\lambda_{\mathrm{base}} = 3$, $a_\lambda = 1.0$, $\gamma_0 = 0.7$, $\beta = 0.5$.
+The shape $\alpha(x)$ varies with prognosis: sicker patients have steeper hazards, producing different CATE curve shapes.
 
-\begin{itemize}
-    \item \textbf{Nuisance Function Estimators:} 
-    Computing the AIPCW pseudo-outcomes requires evaluating the censoring and event survival functions at the exact continuous observed times $Z_i$. To naturally accommodate this, we recommend utilizing a Weibull Accelerated Failure Time (AFT) model for the survival nuisance components, parameterized by a Multi-Layer Perceptron (MLP). For the propensity score nuisance component, a standard MLP is also recommended. Using Keras, these network architectures should be implemented as modular \texttt{keras.Model} or \texttt{keras.layers.Layer} objects, allowing the user to readily substitute alternative models depending on the dataset.
-    
-    \item \textbf{Enforcing Gamma Distribution Constraints:} 
-    Because our parametrization relies on Gamma survival functions, the shape parameter $\bar{\alpha}$ and the scale parameters $\lambda_{k,w}$ must be strictly positive. Standard deep learning optimizers operate in unconstrained Euclidean space. Therefore, implementations must apply a \texttt{Softplus} activation function (e.g., via \texttt{jax.nn.softplus} or \texttt{keras.activations.softplus}) to the raw neural network outputs associated with these parameters before passing them into the incomplete Gamma function.
-    
-    \item \textbf{Feature Encoder $\phi(x)$:} 
-    The covariate-gated mixture weights depend on a feature representation $\phi(x)$. For standard tabular applications, we recommend employing an MLP as the default encoder. As with the nuisance components, $\phi(x)$ should be implemented as an easily swappable Keras module, enabling users to seamlessly insert domain-specific backbones (e.g., CNNs or Transformers) when working with unstructured data.
-    
-    \item \textbf{Integration Grid and Discretization:} 
-    While a theoretical grid step size $\delta$ may be discussed in the derivations, enforcing a fixed $\delta$ is often computationally impractical. In practice, we propose defining the time grid over a fixed number of evaluation points (e.g., $M=100$), exposing $M$ as a hyperparameter that the user can tune based on their memory and resolution constraints. 
-    
-    Additionally, when discretizing the integral for the pseudo-outcome via a Riemann sum, the equation includes a $\frac{M}{M-2}$ pre-factor. The explicit intent of this scalar is to correct for the volume loss incurred by utilizing only the $M-2$ interior points in the centered-difference approximation.
-\end{itemize}
+\paragraph{Censoring.}
+Censoring times follow a covariate-dependent exponential distribution:
+\[
+  \lambda_c(x) = \lambda_{c,\mathrm{base}} \cdot \exp\!\bigl(-b_\lambda \cdot u_{\mathrm{prog}}\bigr),
+  \qquad
+  C \mid X \;\sim\; \mathrm{Exp}\bigl(1/\lambda_c(x)\bigr),
+\]
+with $\lambda_{c,\mathrm{base}} = 5$, $b_\lambda = 0.3$.
+
+\paragraph{True CATE.}
+\[
+  \tau(t \mid x, u_{\mathrm{treat}})
+  = S_1(t \mid x, u_{\mathrm{treat}}) - S_0(t \mid x, u_{\mathrm{treat}}).
+\]
+
+\paragraph{Inputs provided to estimators.}
+The latent indices $U_{\mathrm{prog}}$ and $U_{\mathrm{treat}}$ are unidimensional variables internal to the data-generating process and are never observed by any estimator.
+All neural-network-based methods (cross-fitted AIR with MGD, cross-fitted AIR with TP, and their oracle-nuisance counterparts) receive the concatenated vector $\tilde X = (X, H) \in \R^{p+d}$ as input, combining structured covariates with embeddings that mimic unstructured clinical text or imaging features.
+The survival forest estimators (T-learner and S-learner) receive only the structured covariates~$X \in \R^p$, consistent with their typical use in practice where tree-based splitting rules do not naturally accommodate high-dimensional dense embeddings.
+
+\section{Kaplan--Meier Curves for the Revascularization Cohort}\label{appendix:km}
+
+{\color{blue} [François will provide an updated version of the Kaplan--Meier curves.]}
+
+
+\section{Cross-Validated Calibration-for-Benefit}\label{appendix:calibration}
+
+We evaluate the AIR estimator's predictions via calibration-for-benefit: a cross-validated comparison of predicted benefit against a doubly-robust estimate of observed benefit across patient subgroups.
+
+\paragraph{Doubly-robust pseudo-outcome.}
+Given nuisance estimates (propensity score $\hate(x)$, event survival $\hatS^\dagger_w(t \mid x)$, censoring survival $\hatS^*_w(t \mid x)$), we construct the overlap-weighted doubly-robust CATE pseudo-outcome:
+\begin{equation}\label{eq:phi-appendix}
+\phi_i(t) = \bigl[\hatS^\dagger_1(t \mid X_i) - \hatS^\dagger_0(t \mid X_i)\bigr] + (W_i - \hate(X_i)) \cdot \mathrm{clip}\bigl(\tilde{Y}_i(t) - \hatS^\dagger_{W_i}(t \mid X_i),\; -1,\; 1\bigr),
+\end{equation}
+where $\hatS^\dagger_{W_i}(t \mid X_i)$ is the outcome model prediction under the observed arm, and $\tilde{Y}_i(t)$ is the augmented inverse-probability-of-censoring-weighted (AIPCW) pseudo-outcome estimating $S^\dagger_{W_i}(t \mid X_i)$.
+The overlap weight $(W_i - \hate(X_i)) \in [-1, 1]$ replaces standard inverse-probability weights to stabilize inference under near-positivity violations \citep{li2018balancing}.
+This pseudo-outcome construction is equivalent to the doubly-robust score given in Supplementary Materials~A.3 of \citet{yadlowsky2025rate}.
+
+\begin{algorithm}[H]
+\caption{Cross-Validated Calibration-for-Benefit}
+\label{alg:cv-calibration-appendix}
+\begin{algorithmic}[1]
+\Require Data $\mathcal{D} = \{(X_i, W_i, Z_i, \Delta_i)\}_{i=1}^n$; horizon $t$; outer folds $K=5$; inner folds $Q=2$; quintile groups $G=5$
+\Ensure Calibration plot: quintile points $(\bar{\tau}_g,\, \bar{\phi}_g)$ with 95\% CI error bars; quintile-level point estimates and confidence intervals; smoothing spline curve fit to individual-level pairs $(\hattau^{\mathrm{oof}}_i(t),\, \phi_i(t))$
+
+\Statex
+\State Partition $\{1, \ldots, n\}$ into $K$ folds $\mathcal{I}_1, \ldots, \mathcal{I}_K$ (stratified on $W, \Delta$)
+\For{$k = 1, \ldots, K$}
+    \State $\mathcal{I}^{\mathrm{train}}_k \gets \{1,\ldots,n\} \setminus \mathcal{I}_k$; \quad $\mathcal{I}^{\mathrm{val}}_k \gets \mathcal{I}_k$
+    \State Estimate the tv-CATE $\hattau^{(k)}$ on $\mathcal{I}^{\mathrm{train}}_k$ via Algorithm~\ref{algo:estimation}
+    \State Predict: $\hattau^{\mathrm{oof}}_i(t) \gets \hattau^{(k)}(t \mid X_i)$ for $i \in \mathcal{I}^{\mathrm{val}}_k$
+    \Statex
+    \State \textbf{Cross-fit nuisance models within} $\mathcal{I}^{\mathrm{val}}_k$ \textbf{and compute doubly-robust pseudo-outcomes:}
+    \State Partition $\mathcal{I}^{\mathrm{val}}_k$ into $Q$ inner folds $\mathcal{J}_1, \ldots, \mathcal{J}_Q$
+    \For{$q = 1, \ldots, Q$}
+        \State Fit propensity, event, and censoring models on $\mathcal{I}^{\mathrm{val}}_k \setminus \mathcal{J}_q$
+        \State Compute $\phi_i(t)$ via~\eqref{eq:phi-appendix} for $i \in \mathcal{J}_q$
+    \EndFor
+\EndFor
+
+\Statex
+\State \textbf{Calibration assessment:}
+\State Assign quintiles: $g_i \gets \mathrm{quintile}(\hattau^{\mathrm{oof}}_i(t))$
+\For{$g = 1, \ldots, G$}
+    \State Predicted: $\bar{\tau}_g = |\mathcal{G}_g|^{-1}\sum_{i \in \mathcal{G}_g} \hattau^{\mathrm{oof}}_i(t)$
+    \State Observed: $\bar{\phi}_g = |\mathcal{G}_g|^{-1}\sum_{i \in \mathcal{G}_g} \phi_i(t)$, \quad SE$_g = \mathrm{sd}(\phi_i)_{i \in \mathcal{G}_g} / \sqrt{|\mathcal{G}_g|}$
+    \State CI$_g = \bar{\phi}_g \pm 1.96 \times \mathrm{SE}_g$
+\EndFor
+\Statex
+\State \textbf{Output:}
+\State \hspace{\algorithmicindent} (i) Plot quintile points $(\bar{\tau}_g,\, \bar{\phi}_g)$ with 95\% CI error bars against the $45^\circ$ line
+\State \hspace{\algorithmicindent} (ii) Report $(\bar{\tau}_g,\, \bar{\phi}_g,\, \mathrm{CI}_g)$ for $g = 1, \ldots, G$
+\State \hspace{\algorithmicindent} (iii) Fit a cubic smoothing spline to $\{(\hattau^{\mathrm{oof}}_i(t),\, \phi_i(t))\}_{i=1}^n$ and overlay on the calibration plot
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Interpretation.}
+A well-calibrated model produces points near the $45^\circ$ line. Points above (below) the diagonal indicate the model underestimates (overestimates) benefit in that subgroup. A flat relationship across quintiles suggests the model's heterogeneity signal is spurious. A cubic smoothing spline fit to individual-level pairs $(\hattau^{\mathrm{oof}}_i(t), \phi_i(t))$ complements the quintile summary.
+
+\paragraph{Implementation details.}
+Outer and inner folds are stratified on $(W_i, \Delta_i)$. Nuisance models for $\phi$ are trained exclusively within $\mathcal{I}^{\mathrm{val}}_k$, ensuring independence from the CATE model. The propensity score is clipped to $[0.01, 0.99]$; the AIPCW pseudo-outcome $\tilde{Y}_i(t)$ is winsorized at the 99th percentile of $|\tilde{Y}|$; the residual is clipped to $[-1, 1]$.
+
+
+\section{Sequential Validation for Treatment Effect Heterogeneity}\label{appendix:toc}
+
+We test whether the AIR model's prioritization captures genuine heterogeneity using the Targeting Operator Characteristic (TOC) and its area (AUTOC) \citep{yadlowsky2025rate}. Internal validation of CATE prioritization rules cannot rely on standard $K$-fold cross-validation. Because each fold's CATE model is trained on data that overlap with every other fold's evaluation set, the resulting fold-level statistics are positively correlated. This invalidates not only naive $p$-value aggregation---which becomes anti-conservative---but also naive averaging of pointwise confidence-interval bounds across folds, since neither the sum-of-variances formula (which assumes independence) nor the single-fold width (which assumes perfect correlation) produces calibrated intervals when the cross-fold covariance is unidentifiable \citep{grf_rate_cv_vignette}. Moreover, no unbiased estimator of the variance of $K$-fold cross-validation exists in general \citep{bengio2004no}.
+
+\paragraph{TOC and AUTOC.}
+Let $S(x) = \hattau(t \mid x)$ be the prioritization rule at horizon $t$, with cumulative distribution function $F_S$. The TOC at fraction $u$ measures how much the average treatment effect among the top-$u$ fraction exceeds the population average treatment effect:
+\[
+\mathrm{TOC}(u;\, S) = \EX\bigl[Y_i(1) - Y_i(0) \mid F_S(S(X_i)) \geq 1 - u\bigr] - \EX\bigl[Y_i(1) - Y_i(0)\bigr].
+\]
+The AUTOC integrates across all fractions: $\mathrm{AUTOC}(S) = \int_0^1 \mathrm{TOC}(u; S)\, \nd u$. Under the null $H_0$ of no explained heterogeneity, $\mathrm{AUTOC} = 0$.
+
+\paragraph{Doubly-robust TOC estimation.}
+Within an evaluation fold $\mathcal{I}_k$, nuisance models are cross-fit within $\mathcal{I}_k$ to construct pseudo-outcomes $\phi_i(t)$ via equation~\eqref{eq:phi-appendix}, ensuring independence from the prioritization rule.
+Subjects are ranked by decreasing predicted benefit $\hattau^{(1:(k{-}1))}(t \mid X_i)$, and the TOC is estimated as
+\begin{equation}\label{eq:toc-dr-estimator}
+\widehat{\mathrm{TOC}}_k(u) \;=\; \frac{1}{\lceil u\, n_k \rceil}\!\sum_{i \in \mathcal{I}_k:\, r_i \leq \lceil u\, n_k\rceil} \!\phi_i(t) \;-\; \frac{1}{n_k}\sum_{i \in \mathcal{I}_k} \phi_i(t),
+\end{equation}
+where $n_k = |\mathcal{I}_k|$ and $r_i$ denotes the rank of subject $i$ within fold $k$ (with rank 1 assigned to the highest predicted benefit and rank $n_k$ to the lowest).
+The AUTOC is $\widehat{\mathrm{AUTOC}}_k = n_k^{-1}\sum_{i \in \mathcal{I}_k} \widehat{\mathrm{TOC}}_k(r_i / n_k)$.
+
+\paragraph{Sequential validation.}
+The sequential cross-fold validation procedure of \citet{wager2024sequential} resolves these issues by processing folds in a fixed order and training the CATE for fold $k$ only on folds $1, \ldots, k{-}1$. Conditional on the preceding folds, fold $k$'s evaluation is exactly the fixed-rule setting of \citet{yadlowsky2025rate}, so each fold-level statistic is conditionally valid. The centered fold estimates then form a martingale difference sequence---hence are uncorrelated---which simultaneously (i) permits aggregation of studentized statistics into a valid $p$-value via the martingale CLT, and (ii) justifies summing within-fold variances to construct pointwise confidence intervals for the procedure-level TOC curve.
+
+\begin{algorithm}[H]
+\caption{Sequential Validation for TOC/AUTOC}
+\label{alg:seq-validation-appendix}
+\begin{algorithmic}[1]
+\Require Data $\mathcal{D} = \{(X_i, W_i, Z_i, \Delta_i)\}_{i=1}^n$; folds $K=5$; horizon $t$; quantile grid $\mathcal{Q}$
+\Ensure Sequential $p$-value $p_{\mathrm{seq}}$; pointwise CIs for the TOC curve
+
+\Statex
+\State Partition $\{1, \ldots, n\}$ into $K$ folds $\mathcal{I}_1, \ldots, \mathcal{I}_K$ (stratified on $W, \Delta$)
+\For{$k = 2, \ldots, K$}
+    \State $\mathcal{I}^{\mathrm{train}}_k \gets \mathcal{I}_1 \cup \cdots \cup \mathcal{I}_{k-1}$
+    \State Estimate the tv-CATE $\hattau^{(1:(k{-}1))}$ on $\mathcal{I}^{\mathrm{train}}_k$ via Algorithm~\ref{algo:estimation}
+    \State Predict: $\hattau^{(1:(k{-}1))}(t \mid X_i)$ for $i \in \mathcal{I}_k$
+    \State Compute $\widehat{\mathrm{TOC}}_k(u)$ for each $u \in \mathcal{Q}$ and $\widehat{\mathrm{AUTOC}}_k$ within fold $k$ via~\eqref{eq:toc-dr-estimator}
+    \State Estimate $\hat{\sigma}_k(u)$ and $\hat{\sigma}_k$ via half-sample bootstrap within fold $k$
+    \State $T_k \gets \widehat{\mathrm{AUTOC}}_k / \hat{\sigma}_k$
+\EndFor
+\Statex
+\State $p_{\mathrm{seq}} = 2\,\Phi\!\left(-\left|\frac{1}{\sqrt{K-1}} \sum_{k=2}^K T_k\right|\right)$
+\Statex
+\For{each $u \in \mathcal{Q}$}
+    \State $\widehat{\overline{\mathrm{TOC}}}(u) \gets \frac{1}{K-1}\sum_{k=2}^K \widehat{\mathrm{TOC}}_k(u)$; \quad $\widehat{\mathrm{SE}}(u) \gets \frac{1}{K-1}\sqrt{\sum_{k=2}^K \hat{\sigma}_k(u)^2}$
+    \State Pointwise CI: $\widehat{\overline{\mathrm{TOC}}}(u) \pm z_{1-\alpha/2}\,\widehat{\mathrm{SE}}(u)$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Validity.}
+Under $H_0$, each $T_k$ is asymptotically $\mathcal{N}(0,1)$ conditionally on $\hattau^{(1:(k-1))}$, and the $T_k$ form a martingale difference sequence because the CATE for fold $k$ depends only on preceding folds. The aggregated statistic converges to $\mathcal{N}(0,1)$ under the null by the martingale CLT, yielding exact asymptotic size. For the confidence intervals, the martingale property ensures that the within-fold estimation errors are uncorrelated, so the variance of the averaged TOC equals the sum of within-fold variances divided by $(K-1)^2$---no cross-fold covariance correction is needed.
+
+\paragraph{Implementation details.}
+$K = 5$ folds (yielding 4 sequential statistics $T_2, \ldots, T_5$), stratified on $(W_i, \Delta_i)$. Nuisance models for~\eqref{eq:toc-dr-estimator} are cross-fit with $Q = 2$ inner folds within each evaluation fold $\mathcal{I}_k$. Half-sample bootstrap with $B = 2{,}000$ draws for SE estimation of the AUTOC and $B = 5{,}000$ for the pointwise TOC confidence bands. The reported TOC curve and confidence bands average across folds $2, \ldots, K$, targeting the procedure-level estimand $\bar\theta_K(u) = (K{-}1)^{-1}\sum_{k=2}^K \mathrm{TOC}(u;\, S_k)$, which validates the learning procedure rather than any single fitted model.
+
 
 \end{document}
