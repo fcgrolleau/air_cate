@@ -35,6 +35,10 @@ One (DGP, method, seed-block) shard -- how the SLURM array in sherlock/ drives i
 Then collect:
   ... --merge partial_*.json --output merged.json
   ... --plot-only --output merged.json
+
+Excess at both recorded reversal thresholds, one row per DGP and one column per
+threshold, in a single figure (needs no test set, so no IST-3 embedding artifact):
+  ... --plot-only --output merged.json --figures-dir <dir> --excess-thresholds
 """
 
 import argparse
@@ -71,7 +75,7 @@ import keras
 from air_cate.baselines import SurvivalForestTLearner, SurvivalForestSLearner
 from air_cate.baselines_csf import CausalSurvivalForest, grf_available
 from air_cate.cate_model.tensor_product import CATETensorProduct
-from air_cate.metrics import METRIC_KEYS, curve_metrics
+from air_cate.metrics import DEFAULT_THRESHOLD_FRAC, METRIC_KEYS, curve_metrics
 from air_cate.nuisance.oracle import build_oracle_nuisances
 from air_cate.utils import build_time_grid
 from conftest import WeibullDGP, WeibullMixtureDGP
@@ -289,6 +293,27 @@ METRIC_SPECS = {
         mean_ymin_at_most=-2.0, mean_ytick_step=2.0,
     ),
 }
+
+# The reversal thresholds the results files actually carry, in increasing order.
+#
+# Both entries are the SAME metric -- mean over test subjects of
+# N(tau_hat) - N(tau_true) -- computed under a different rule for what counts as a
+# direction reversal rather than against a different target, which is why they belong
+# side by side on a shared y axis instead of in two unrelated figures.
+#
+# There are two and only two, because `curve_metrics` calls `n_sign_changes` exactly
+# twice: once with no threshold, once at DEFAULT_THRESHOLD_FRAC. A third threshold is
+# not a re-plot -- the result files keep these scalars, not the fitted curves, so it
+# would mean re-running the simulation.
+#
+# `title` is what the column header says. Keeping the 5% out of the string and reading
+# it from DEFAULT_THRESHOLD_FRAC means the header cannot drift from the constant the
+# numbers underneath it were computed with.
+EXCESS_THRESHOLD_VARIANTS = [
+    dict(key="excess", title="No flatness threshold (any sign change)"),
+    dict(key="excess_thresh",
+         title=f"Flat below {DEFAULT_THRESHOLD_FRAC:.0%} of the curve's own range"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -776,7 +801,7 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None,
             # Excess is a difference against the truth's own reversal count, so the
             # meaningful reference is exact agreement, not a competing estimator.
             ax_mean[col].axhline(0.0, color="#888888", ls="--", linewidth=1.2,
-                                 zorder=1, label="Truth's reversal count")
+                                 zorder=1, label="True tv-CATE")
 
         # --- Method curves ---
         for method_name, _ in METHODS:
@@ -898,7 +923,7 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None,
     handles, labels = ax_mean[0].get_legend_handles_labels()
     # The reference line first, then the solid (cross-fitted) methods, then the dashed
     # oracle ones, so the legend reads in the same visual grouping as the panels.
-    preferred = ["True tv-ATE", "Truth's reversal count"] + [
+    preferred = ["True tv-ATE", "True tv-CATE"] + [
         METHOD_LABELS[m]
         for m in ("AIR", "Tensor-prod", "RSF-T", "RSF-S", "CSF",
                   "AIR-oracle", "TP-oracle")
@@ -918,6 +943,170 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None,
     os.makedirs(out_dir, exist_ok=True)
     for ext in ("png", "pdf"):
         path = os.path.join(out_dir, f"{spec['stem']}.{ext}")
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        print(f"Saved: {path}")
+    plt.close(fig)
+
+
+def _mean_ci_series(vals, n_values, metric_key):
+    """(ns, means, halfwidths) for one method's `metric_key` across sample sizes.
+
+    Exactly the top-row computation `plot_convergence` does inline: drop sample sizes
+    with no finite replication, then a normal-theory 95% CI on the mean with the
+    t critical value at (n_seeds - 1) degrees of freedom.
+
+    `.get`, not `[...]`: result files written before these metrics existed carry only
+    `imse`, and merging new results into a copy of one must degrade to an empty curve
+    rather than a KeyError.
+    """
+    def _finite(n):
+        a = np.array([v.get(metric_key, float("nan")) for v in vals[n]], dtype=float)
+        return a[np.isfinite(a)]
+
+    ns = [n for n in n_values
+          if n in vals and len(vals[n]) > 0 and len(_finite(n)) > 0]
+    if not ns:
+        return [], np.array([]), np.array([])
+
+    means = np.array([_finite(n).mean() for n in ns])
+    ses = np.array([_finite(n).std(ddof=1) / np.sqrt(len(_finite(n))) for n in ns])
+    t_crit = np.array([t_dist.ppf(0.975, max(len(_finite(n)) - 1, 1)) for n in ns])
+    return ns, means, t_crit * ses
+
+
+def _ordered_legend_handles(ax):
+    """Legend handles/labels for `ax`, in the paper's reading order.
+
+    Reference line first, then the solid cross-fitted methods, then the dashed oracle
+    ones, so the legend groups the way the panels do. Ordered BY LABEL rather than by a
+    hardcoded index permutation, which breaks under any --methods subset. Unknown labels
+    sort last in their existing order rather than being dropped: a legend entry silently
+    missing from a figure is worse than one out of place.
+    """
+    handles, labels = ax.get_legend_handles_labels()
+    preferred = ["True tv-ATE", "True tv-CATE"] + [
+        METHOD_LABELS[m]
+        for m in ("AIR", "Tensor-prod", "RSF-T", "RSF-S", "CSF",
+                  "AIR-oracle", "TP-oracle")
+    ]
+    rank = {label: i for i, label in enumerate(preferred)}
+    order = sorted(range(len(labels)), key=lambda i: (rank.get(labels[i], len(rank)), i))
+    return [handles[i] for i in order], [labels[i] for i in order]
+
+
+def plot_excess_thresholds(results, n_values, figures_dir=None,
+                           stem="simulation_convergence_excess_thresholds"):
+    """Average excess reversal count under every recorded threshold, in one figure.
+
+    One row per DGP, one COLUMN per entry of EXCESS_THRESHOLD_VARIANTS, so the two
+    thresholds sit next to each other left to right and the left-to-right change within
+    a row is the flatness rule and nothing else.
+
+    Only the mean panel, deliberately: `simulation_convergence_excess` already carries
+    the variance row at the default threshold, and what this figure exists to answer is
+    whether a method's excess count survives being asked to ignore small wiggles.
+
+    The y axis is shared ACROSS each row. Autoscaling the two columns independently
+    would rescale away exactly the effect being shown -- a method whose count falls from
+    13 to 6 under thresholding would draw two identical-looking panels.
+
+    Unlike `plot_convergence`, this takes no X_tests: every panel's reference line is
+    y = 0, so no population-average curve has to be evaluated. Note that y = 0 is the
+    right reference in BOTH columns even though the truth's own reversal count differs
+    between them -- each column's excess is a difference against the truth counted under
+    that same column's threshold (metrics.py:171-177).
+    """
+    out_dir = figures_dir or FIGURES_DIR
+    plt.rcParams.update({
+        "font.family": "serif",
+        "mathtext.fontset": "cm",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.linewidth": 0.6,
+        "xtick.major.width": 0.6,
+        "ytick.major.width": 0.6,
+    })
+
+    # One row per DGP PRESENT IN THE RESULTS, in the canonical DGPS order -- not one per
+    # entry of DGPS, so a two-DGP smoke run does not get a blank third row.
+    dgps_present = [n for n, _ in DGPS if n in results]
+    if not dgps_present:
+        raise ValueError(
+            f"no DGP in the results matches DGPS; results hold {sorted(results)}, "
+            f"expected some of {[n for n, _ in DGPS]}"
+        )
+
+    n_rows = len(dgps_present)
+    n_cols = len(EXCESS_THRESHOLD_VARIANTS)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6.5 * n_cols, 4.3 * n_rows),
+                             sharex="col", sharey="row", squeeze=False)
+
+    for row, dgp_name in enumerate(dgps_present):
+        dgp_results = results[dgp_name]
+
+        for col, variant in enumerate(EXCESS_THRESHOLD_VARIANTS):
+            ax = axes[row][col]
+            ax.axhline(0.0, color="#888888", ls="--", linewidth=1.2, zorder=1,
+                       label="True tv-CATE")
+
+            for method_name, _ in METHODS:
+                if method_name not in dgp_results:
+                    continue
+                ns, means, hw = _mean_ci_series(
+                    dgp_results[method_name], n_values, variant["key"]
+                )
+                if not ns:
+                    continue
+                st = METHOD_STYLES[method_name]
+                ax.plot(
+                    ns, means,
+                    marker=st["marker"], ls=st["ls"],
+                    linewidth=st["lw"], markersize=st["ms"],
+                    color=st["color"],
+                    markeredgecolor="white", markeredgewidth=0.5,
+                    label=METHOD_LABELS[method_name], zorder=st["zorder"],
+                )
+                ax.fill_between(ns, means - hw, means + hw,
+                                color=st["color"], alpha=0.12, zorder=st["zorder"] - 1)
+
+            ax.set_xscale("log")
+            ax.set_xticks(n_values)
+            ax.set_xticklabels([str(n) for n in n_values], fontsize=12)
+            ax.tick_params(axis="y", labelsize=12)
+            ax.grid(True, alpha=0.12, linewidth=0.4)
+
+            # Column headers on the top row only: every panel below repeats the same
+            # threshold, and the DGP is named by the row's y label.
+            if row == 0:
+                ax.set_title(variant["title"], fontsize=13, fontweight="bold", pad=10)
+            if row == n_rows - 1:
+                ax.set_xlabel("Sample size", fontsize=15)
+
+        # Floor and tick step from the Excess spec, for the reason argued there: the
+        # metric goes negative, and left alone the locator anchors its lowest tick on 0,
+        # so every method that beats the truth's own count sits in an unlabelled sliver.
+        # Applied to the left panel only -- sharey="row" carries it across the row.
+        spec = METRIC_SPECS["excess"]
+        lo, hi = axes[row][0].get_ylim()
+        axes[row][0].set_ylim(min(lo, spec["mean_ymin_at_most"]), hi)
+        axes[row][0].yaxis.set_major_locator(MultipleLocator(spec["mean_ytick_step"]))
+
+        # The row label carries the DGP; the quantity itself is named once by supylabel,
+        # since all six panels plot it.
+        axes[row][0].set_ylabel(f"{dgp_name} DGP", fontsize=14, fontweight="bold")
+
+    fig.supylabel("Average excess reversal count", fontsize=15)
+
+    handles, labels = _ordered_legend_handles(axes[0][0])
+    fig.legend(handles, labels, loc="lower center", ncol=4,
+               fontsize=14, frameon=False, bbox_to_anchor=(0.5, -0.02),
+               columnspacing=2.5, handletextpad=0.8, handlelength=2.8,
+               labelspacing=0.8)
+
+    fig.tight_layout(rect=[0.02, 0.05, 1, 1], w_pad=2.5, h_pad=1.5)
+    os.makedirs(out_dir, exist_ok=True)
+    for ext in ("png", "pdf"):
+        path = os.path.join(out_dir, f"{stem}.{ext}")
         fig.savefig(path, dpi=200, bbox_inches="tight")
         print(f"Saved: {path}")
     plt.close(fig)
@@ -1048,6 +1237,13 @@ def main():
                         help="Comma-separated metrics to plot (default: all of "
                              f"{','.join(METRIC_SPECS)}). Every metric is computed and "
                              "stored on every run regardless; this only selects figures.")
+    parser.add_argument("--excess-thresholds", action="store_true",
+                        help="With --plot-only: render ONLY the threshold-comparison "
+                             "figure (average excess reversal count, one row per DGP, "
+                             "one column per recorded threshold). Its reference line is "
+                             "y=0, so unlike the per-metric figures it needs no test "
+                             "set and runs without the gitignored IST-3 embedding "
+                             "artifact.")
     parser.add_argument("--csf-rscript", type=str, default=None,
                         help="Path to the Rscript binary for the CSF baseline. Needed "
                              "wherever R is provided by a module rather than being on "
@@ -1081,6 +1277,14 @@ def main():
     if args.plot_only:
         print("Loading saved results...")
         results, n_values, cfg = load_results(args.output or RESULTS_PATH)
+        # Handled before the test sets are built, which is the point of the flag: this
+        # figure needs none, so it renders on a machine with no IST-3 embedding artifact.
+        if args.excess_thresholds:
+            print_summary(results, n_values)
+            print("\nGenerating plots...")
+            plot_excess_thresholds(results, n_values, figures_dir=args.figures_dir)
+            print(f"Figure saved to {args.figures_dir or FIGURES_DIR}/")
+            return
         # Recreate per-DGP test sets, for the DGPs the file actually holds. Building
         # all of DGPS unconditionally made re-plotting a two-DGP smoke run impossible
         # on any machine without the IST-3 embedding artifact, which is gitignored.
