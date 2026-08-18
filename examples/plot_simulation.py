@@ -36,8 +36,8 @@ Then collect:
   ... --merge partial_*.json --output merged.json
   ... --plot-only --output merged.json
 
-Excess at both recorded reversal thresholds, one row per DGP and one column per
-threshold, in a single figure (needs no test set, so no IST-3 embedding artifact):
+Reversal count at both recorded thresholds, one row per DGP and one column per
+threshold, in a single figure, against the true tv-CATE's own count:
   ... --plot-only --output merged.json --figures-dir <dir> --excess-thresholds
 """
 
@@ -75,7 +75,13 @@ import keras
 from air_cate.baselines import SurvivalForestTLearner, SurvivalForestSLearner
 from air_cate.baselines_csf import CausalSurvivalForest, grf_available
 from air_cate.cate_model.tensor_product import CATETensorProduct
-from air_cate.metrics import DEFAULT_THRESHOLD_FRAC, METRIC_KEYS, curve_metrics
+from air_cate.metrics import (
+    DEFAULT_THRESHOLD_FRAC,
+    METRIC_KEYS,
+    curve_metrics,
+    n_sign_changes,
+    range_threshold,
+)
 from air_cate.nuisance.oracle import build_oracle_nuisances
 from air_cate.utils import build_time_grid
 from conftest import WeibullDGP, WeibullMixtureDGP
@@ -296,22 +302,28 @@ METRIC_SPECS = {
 
 # The reversal thresholds the results files actually carry, in increasing order.
 #
-# Both entries are the SAME metric -- mean over test subjects of
-# N(tau_hat) - N(tau_true) -- computed under a different rule for what counts as a
-# direction reversal rather than against a different target, which is why they belong
-# side by side on a shared y axis instead of in two unrelated figures.
+# Both entries are the same quantity -- mean over test subjects of the reversal count
+# N(tau_hat) -- computed under a different rule for what counts as a direction reversal
+# rather than against a different target, which is why they belong side by side on a
+# shared y axis instead of in two unrelated figures.
 #
 # There are two and only two, because `curve_metrics` calls `n_sign_changes` exactly
 # twice: once with no threshold, once at DEFAULT_THRESHOLD_FRAC. A third threshold is
 # not a re-plot -- the result files keep these scalars, not the fitted curves, so it
 # would mean re-running the simulation.
 #
+# `key` names the EXCESS scalar the files store, N(tau_hat) - N(tau_true); the raw count
+# is recovered by adding back the truth's own count under the same rule (see
+# `_true_reversal_count` and `plot_reversal_counts`). `thresholded` says which rule that
+# is, so the truth is counted exactly the way the stored excess counted it.
+#
 # `title` is what the column header says. Keeping the 5% out of the string and reading
 # it from DEFAULT_THRESHOLD_FRAC means the header cannot drift from the constant the
 # numbers underneath it were computed with.
 EXCESS_THRESHOLD_VARIANTS = [
-    dict(key="excess", title="No flatness threshold (any sign change)"),
-    dict(key="excess_thresh",
+    dict(key="excess", thresholded=False,
+         title="No flatness threshold (any sign change)"),
+    dict(key="excess_thresh", thresholded=True,
          title=f"Flat below {DEFAULT_THRESHOLD_FRAC:.0%} of the curve's own range"),
 ]
 
@@ -759,6 +771,33 @@ def _pop_avg_metric(dgp_class, X_test, M, metric="imse"):
     return curve_metrics(tau_bar, tau_true, delta)[metric]
 
 
+def _true_reversal_count(dgp_class, X_test, M, thresholded):
+    """Mean reversal count of the TRUE tv-CATE on the fixed test set.
+
+    This is the reference line for `plot_reversal_counts`, and the constant that turns
+    the stored excess back into a raw count. It needs no fitted model -- only the DGP's
+    own `true_tau` on the same grid and test set the metrics were computed against --
+    which is why a figure of raw counts costs nothing beyond building the test set.
+
+    It is a per-DGP CONSTANT, identical for every method and every sample size: the test
+    set is drawn once per DGP outside the seed loop (see `_make_test_set`) and the grid
+    is fixed at `build_time_grid(t_end, M)`. Reconstructing it here rather than reading
+    `n_true_mean` off the results is what makes the thresholded column possible at all --
+    the files store the thresholded count only inside the excess difference, never on its
+    own. Verified against `n_true_mean` for all three DGPs, which it reproduces exactly.
+
+    `thresholded` must match the variant whose excess it will be added to: the truth has
+    to be counted under the same flatness rule as the estimate it was differenced from,
+    or the sum is not a reversal count of anything.
+    """
+    t_end = getattr(dgp_class, "t_end", 5.0)
+    time_grid, _ = build_time_grid(t_end, M)
+    tau_true = dgp_class.true_tau(np.asarray(time_grid), X_test)   # (n_test, M+1)
+    thr = (range_threshold(tau_true, DEFAULT_THRESHOLD_FRAC)
+           if thresholded else None)
+    return float(np.mean(n_sign_changes(tau_true, thr)))
+
+
 def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None,
                      metric="imse"):
     """Multi-panel convergence plot: metric mean (top) and variance (bottom) per DGP.
@@ -1007,27 +1046,38 @@ def _ordered_legend_handles(ax):
     return [handles[i] for i in order], [labels[i] for i in order]
 
 
-def plot_excess_thresholds(results, n_values, figures_dir=None,
-                           stem="simulation_convergence_excess_thresholds"):
-    """Average excess reversal count under every recorded threshold, in one figure.
+def plot_reversal_counts(results, n_values, cfg, X_tests, figures_dir=None,
+                         stem="simulation_convergence_excess_thresholds"):
+    """Average reversal count under every recorded threshold, in one figure.
+
+    Plots the RAW count N(tau_hat), not the excess N(tau_hat) - N(tau_true), with the
+    true tv-CATE's own count drawn as the target. That line therefore sits at whatever
+    the truth's count happens to be -- 1.0 for Weibull unthresholded, 0.25 for Weibull
+    thresholded -- and not at zero, so a method is read against the truth's roughness
+    rather than against a difference pinned to the axis.
+
+    The result files store only the excess, so each series is the stored excess plus the
+    truth's count under that column's rule (`_true_reversal_count`). Adding a constant is
+    exact, not an approximation: the truth's count is fixed for a DGP, so the sum is the
+    mean raw count and the CI half-width is unchanged by the shift. For the unthresholded
+    column this reproduces the stored `n_hat_mean` exactly; for the thresholded column
+    there is no stored raw count, which is why it is reconstructed rather than read.
 
     One row per DGP, one COLUMN per entry of EXCESS_THRESHOLD_VARIANTS, so the two
     thresholds sit next to each other left to right and the left-to-right change within
-    a row is the flatness rule and nothing else.
+    a row is the flatness rule and nothing else. Both the curves AND the target line move
+    between columns, since thresholding lowers the truth's count too.
 
     Only the mean panel, deliberately: `simulation_convergence_excess` already carries
     the variance row at the default threshold, and what this figure exists to answer is
-    whether a method's excess count survives being asked to ignore small wiggles.
+    whether a method's count survives being asked to ignore small wiggles.
 
     The y axis is shared ACROSS each row. Autoscaling the two columns independently
     would rescale away exactly the effect being shown -- a method whose count falls from
     13 to 6 under thresholding would draw two identical-looking panels.
 
-    Unlike `plot_convergence`, this takes no X_tests: every panel's reference line is
-    y = 0, so no population-average curve has to be evaluated. Note that y = 0 is the
-    right reference in BOTH columns even though the truth's own reversal count differs
-    between them -- each column's excess is a difference against the truth counted under
-    that same column's threshold (metrics.py:171-177).
+    Unlike the excess version this DOES need X_tests, because the target line is the
+    truth's own count and has to be evaluated from the DGP.
     """
     out_dir = figures_dir or FIGURES_DIR
     plt.rcParams.update({
@@ -1054,12 +1104,22 @@ def plot_excess_thresholds(results, n_values, figures_dir=None,
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(6.5 * n_cols, 4.3 * n_rows),
                              sharex="col", sharey="row", squeeze=False)
 
+    dgp_classes = dict(DGPS)
+
     for row, dgp_name in enumerate(dgps_present):
         dgp_results = results[dgp_name]
 
         for col, variant in enumerate(EXCESS_THRESHOLD_VARIANTS):
             ax = axes[row][col]
-            ax.axhline(0.0, color="#888888", ls="--", linewidth=1.2, zorder=1,
+
+            # The target, and the constant that turns the stored excess back into a
+            # count. Computed per column: thresholding lowers the truth's count too, so
+            # a single line reused across the row would be wrong in one of them.
+            n_true = _true_reversal_count(
+                dgp_classes[dgp_name], X_tests[dgp_name], cfg["M"],
+                variant["thresholded"],
+            )
+            ax.axhline(n_true, color="#888888", ls="--", linewidth=1.2, zorder=1,
                        label="True tv-CATE")
 
             for method_name, _ in METHODS:
@@ -1070,6 +1130,7 @@ def plot_excess_thresholds(results, n_values, figures_dir=None,
                 )
                 if not ns:
                     continue
+                means = means + n_true
                 st = METHOD_STYLES[method_name]
                 ax.plot(
                     ns, means,
@@ -1095,20 +1156,23 @@ def plot_excess_thresholds(results, n_values, figures_dir=None,
             if row == n_rows - 1:
                 ax.set_xlabel("Sample size", fontsize=15)
 
-        # Floor and tick step from the Excess spec, for the reason argued there: the
-        # metric goes negative, and left alone the locator anchors its lowest tick on 0,
-        # so every method that beats the truth's own count sits in an unlabelled sliver.
+        # A count, so unlike the excess it cannot go negative and needs no negative
+        # floor -- but 0 is still forced onto the axis so the near-flat methods are read
+        # against it rather than against whatever autoscale chose, and the tick step is
+        # set explicitly because moving the limit alone does not move the locator's
+        # anchor. min(), so autoscale's own margin below a curve sitting at 0 is kept.
         # Applied to the left panel only -- sharey="row" carries it across the row.
-        spec = METRIC_SPECS["excess"]
         lo, hi = axes[row][0].get_ylim()
-        axes[row][0].set_ylim(min(lo, spec["mean_ymin_at_most"]), hi)
-        axes[row][0].yaxis.set_major_locator(MultipleLocator(spec["mean_ytick_step"]))
+        axes[row][0].set_ylim(min(lo, 0.0), hi)
+        axes[row][0].yaxis.set_major_locator(
+            MultipleLocator(METRIC_SPECS["excess"]["mean_ytick_step"])
+        )
 
         # The row label carries the DGP; the quantity itself is named once by supylabel,
         # since all six panels plot it.
         axes[row][0].set_ylabel(f"{dgp_name} DGP", fontsize=14, fontweight="bold")
 
-    fig.supylabel("Average excess reversal count", fontsize=15)
+    fig.supylabel("Average reversal count", fontsize=15)
 
     handles, labels = _ordered_legend_handles(axes[0][0])
     fig.legend(handles, labels, loc="lower center", ncol=4,
@@ -1252,11 +1316,11 @@ def main():
                              "stored on every run regardless; this only selects figures.")
     parser.add_argument("--excess-thresholds", action="store_true",
                         help="With --plot-only: render ONLY the threshold-comparison "
-                             "figure (average excess reversal count, one row per DGP, "
-                             "one column per recorded threshold). Its reference line is "
-                             "y=0, so unlike the per-metric figures it needs no test "
-                             "set and runs without the gitignored IST-3 embedding "
-                             "artifact.")
+                             "figure (average reversal count, one row per DGP, one "
+                             "column per recorded threshold, against the true "
+                             "tv-CATE's own count). Like the per-metric figures it "
+                             "needs the test sets, since the target line is evaluated "
+                             "from the DGP.")
     parser.add_argument("--csf-rscript", type=str, default=None,
                         help="Path to the Rscript binary for the CSF baseline. Needed "
                              "wherever R is provided by a module rather than being on "
@@ -1290,14 +1354,6 @@ def main():
     if args.plot_only:
         print("Loading saved results...")
         results, n_values, cfg = load_results(args.output or RESULTS_PATH)
-        # Handled before the test sets are built, which is the point of the flag: this
-        # figure needs none, so it renders on a machine with no IST-3 embedding artifact.
-        if args.excess_thresholds:
-            print_summary(results, n_values)
-            print("\nGenerating plots...")
-            plot_excess_thresholds(results, n_values, figures_dir=args.figures_dir)
-            print(f"Figure saved to {args.figures_dir or FIGURES_DIR}/")
-            return
         # Recreate per-DGP test sets, for the DGPs the file actually holds. Building
         # all of DGPS unconditionally made re-plotting a two-DGP smoke run impossible
         # on any machine without the IST-3 embedding artifact, which is gitignored.
@@ -1308,6 +1364,11 @@ def main():
             X_tests[dgp_name] = _make_test_set(dgp_class, cfg["n_test"])
         print_summary(results, n_values)
         print("\nGenerating plots...")
+        if args.excess_thresholds:
+            plot_reversal_counts(results, n_values, cfg, X_tests,
+                                 figures_dir=args.figures_dir)
+            print(f"Figure saved to {args.figures_dir or FIGURES_DIR}/")
+            return
         plot_all_metrics(results, n_values, cfg, X_tests,
                          figures_dir=args.figures_dir, metrics=plot_metrics)
         print(f"All figures saved to {args.figures_dir or FIGURES_DIR}/")
