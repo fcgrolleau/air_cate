@@ -1101,10 +1101,20 @@ CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 \
 # (Weibull, Mixture), 2.5-3.2h (IST-3). 64G, NOT the 16G default, and not the 32G that
 # job 39190716 was OOM-killed at on all 150 tasks: grf's footprint is QUADRATIC in n
 # (see below), so stage 2's 12.1G at n=10000 projects to ~46-50G here.
-CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 N_VALUES=20000 \
+CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 \
+    N_VALUES=500,1000,2000,5000,10000,20000 \
     sbatch --dependency=afterany:<pass1_jobid> --array=0-149 \
     --mem-per-cpu=64G sherlock/submit_csf.sh
 ```
+
+**Pass 2 names the WHOLE ladder, not `N_VALUES=20000`.** `run_all` builds `results` from
+scratch over `n_values` only, and `save_results` writes exactly the rungs in it, so a pass
+narrowed to the top rung **replaces** each file with a single-rung file rather than adding to
+it — resume preserves a *cell* it is asked about, and never sees a rung outside `n_values`.
+Naming the full ladder makes resume cache the five cheap rungs (they print as `cached`) and
+compute only n=20000. This is how the metrics50 run lost CSF's n<=10000 cells and had to redo
+them; [plot_simulation.py:608-620](../examples/plot_simulation.py#L608-L620) now carries over
+prior rungs outside `n_values` as a backstop, but the full-ladder form is still the recipe.
 
 **Why CSF's memory is quadratic in n, and why a failed pass 2 must be purged before
 resubmitting.** [baselines_csf.R](../src/air_cate/baselines_csf.R) calls

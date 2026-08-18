@@ -26,7 +26,15 @@
 # range: Weibull 0-49, Mixture 50-99, IST-3 100-149.
 #
 # Submitted in TWO PASSES, cheap rungs first. Both write the same tag, and resume skips
-# by (n, seed), so pass 2 fills in the top rung rather than redoing anything:
+# by (n, seed), so pass 2 caches the cheap rungs rather than redoing them.
+#
+# PASS 2 MUST NAME THE WHOLE LADDER, not the top rung alone. run_all builds `results`
+# from scratch over n_values only, and save_results writes exactly what is in it, so a
+# pass narrowed to N_VALUES=20000 REPLACES each file with a single-rung file instead of
+# adding to it. That is how the metrics50 run lost CSF's five n<=10000 rungs and had to
+# redo them. plot_simulation.py now carries over prior rungs outside n_values, which
+# closes the hole -- but naming the full ladder in pass 2 is the belt to that braces,
+# and is required on any cluster copy predating that fix.
 #
 #   mkdir -p sherlock/logs
 #   # Pass 1 -- the five rungs to n=10000. Measured on Sherlock at 10 seeds: 2.5h
@@ -50,7 +58,8 @@
 #   # pass 2 once pass 1 has finished in ANY state; `afterok` would demand all 150 pass-1
 #   # tasks exit 0 and deadlock the whole pass on one hiccup. Submitting pass 2 by hand
 #   # after pass 1 drains is equally safe -- what is unsafe is submitting it un-gated.
-#   CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 N_VALUES=20000 \
+#   CENSORING_FIX=1 RUN_TAG=metrics50 N_SEEDS=50 \
+#       N_VALUES=500,1000,2000,5000,10000,20000 \
 #       sbatch --dependency=afterany:<pass1_jobid> --array=0-149 \
 #       --mem-per-cpu=64G sherlock/submit_csf.sh
 #

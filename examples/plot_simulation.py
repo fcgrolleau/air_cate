@@ -605,6 +605,19 @@ def run_all(cfg, resume=False, results_path=None, dgps=None, methods=None):
         X_test = X_tests[dgp_name]
         for method_name, method_opts in methods:
             results[dgp_name][method_name] = {n: [] for n in n_values}
+            # Carry over any rung the prior file holds that this invocation was not
+            # asked to run. `results` starts empty and only ever gains the requested
+            # n_values, so without this a pass narrowed with --n-values REPLACES the
+            # output file rather than adding to it -- save_results writes exactly the
+            # rungs in `results`. That silently destroyed the CSF n<=10000 cells of the
+            # metrics50 run, whose two-pass recipe ran the top rung alone as pass 2 and
+            # believed resume would preserve the rest. Resume preserves a CELL it is
+            # asked about; it never sees a rung outside n_values.
+            if resume:
+                for prior_n, prior_rung in (prior.get(dgp_name, {})
+                                            .get(method_name, {}).items()):
+                    if prior_n not in results[dgp_name][method_name]:
+                        results[dgp_name][method_name][prior_n] = prior_rung
             for n in n_values:
                 # Check for complete prior results (all seeds present)
                 prior_vals = (prior.get(dgp_name, {})
