@@ -10,9 +10,12 @@ import numpy as np
 import pytest
 
 from air_cate.metrics import (
+    H_GRID,
     METRIC_KEYS,
     curve_metrics,
+    n_direction_reversals,
     n_sign_changes,
+    n_sign_reversals,
     range_threshold,
 )
 
@@ -149,6 +152,214 @@ def test_range_threshold_is_a_fraction_of_each_curves_own_span():
     np.testing.assert_allclose(
         range_threshold(curves, 0.05), [0.0, 0.05 * T_END, 0.10 * T_END]
     )
+
+
+# ---------------------------------------------------------------------------
+# n_direction_reversals -- the swing filter that supersedes the per-step threshold
+# ---------------------------------------------------------------------------
+
+def test_swing_filter_reduces_to_the_raw_count_at_zero_tolerance():
+    """The anchor: at h = 0 the new rule must be the old rule, exactly.
+
+    Same random-walk-with-ties battery the naive cross-check uses, because ties are
+    where a boundary bug between the two implementations would show up.
+    """
+    rng = np.random.default_rng(0)
+    steps = rng.choice([-1.0, 0.0, 0.0, 1.0], size=(200, M))
+    curves = np.concatenate([np.zeros((200, 1)), np.cumsum(steps, axis=1)], axis=1)
+    np.testing.assert_array_equal(
+        n_direction_reversals(curves, 0.0), n_sign_changes(curves)
+    )
+
+
+def test_swing_filter_sees_a_reversal_the_per_step_rule_misses():
+    """The whole reason the swing filter exists, and why h > 0 is a *new* quantity.
+
+    A dip of 0.20 spread over ten steps of 0.02 is a real 0.20 reversal. The per-step
+    rule zeroes each 0.02 step against a tolerance of 0.05 and so erases the dip
+    entirely; the swing filter asks whether the retrace *totals* more than 0.05.
+    """
+    curve = np.concatenate([
+        np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0]),        # rise, steps of 0.20
+        1.0 - 0.02 * np.arange(1, 11),                    # dip, ten steps of 0.02
+        np.array([0.90, 1.00, 1.10, 1.20, 1.30]),         # rise, steps of 0.10
+    ])[None, :]
+    assert curve.shape == (1, M + 1)
+    assert curve.min() == 0.0 and curve.max() == pytest.approx(1.30)
+
+    # Untouched, both rules see the down-then-up pair.
+    assert n_sign_changes(curve) == 2
+    assert n_direction_reversals(curve, 0.0) == 2
+
+    # At the same tolerance the two disagree, and the swing filter is the one that is
+    # right about the dip's size.
+    assert n_sign_changes(curve, 0.05) == 0
+    assert n_direction_reversals(curve, 0.05) == 2
+
+
+def test_swing_filter_still_drops_a_genuinely_small_reversal():
+    """Monotone in the other direction too: a dip worth less than h is not a reversal."""
+    curve = np.concatenate([
+        np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0]),
+        1.0 - 0.002 * np.arange(1, 11),                   # dip totalling only 0.02
+        np.array([1.00, 1.10, 1.20, 1.30, 1.40]),
+    ])[None, :]
+    assert curve.shape == (1, M + 1)
+
+    assert n_direction_reversals(curve, 0.0) == 2
+    assert n_direction_reversals(curve, 0.05) == 0        # 0.02 total < 0.05
+
+
+# ---------------------------------------------------------------------------
+# n_sign_reversals -- zero crossings of the effect, which is a different quantity
+# ---------------------------------------------------------------------------
+
+def test_a_clean_crossing_reverses_sign_but_never_changes_direction():
+    """The pair of curves that shows the two counts are not variants of each other."""
+    crossing = np.linspace(-0.3, 0.3, M + 1)[None, :]
+    assert n_sign_reversals(crossing) == 1
+    assert n_sign_changes(crossing) == 0                  # monotone: no turning point
+
+    wiggly_positive = (1.0 + 0.5 * (np.arange(M + 1) % 2))[None, :]
+    assert n_sign_reversals(wiggly_positive) == 0          # never approaches zero
+    assert n_sign_changes(wiggly_positive) == M - 1
+
+
+def test_monotone_curve_has_no_sign_reversals():
+    assert n_sign_reversals(GRID[None, :]) == 0
+    assert n_sign_reversals(-GRID[None, :]) == 0
+    assert n_sign_reversals(_flat(1, 0.3)) == 0
+    assert n_sign_reversals(_flat(1, -0.3)) == 0
+
+
+def test_alternating_sign_counts_every_crossing():
+    curve = ((-1.0) ** np.arange(M + 1))[None, :]
+    assert n_sign_reversals(curve) == M
+
+
+def test_the_structural_zero_at_the_origin_seeds_no_sign_reversal():
+    """Every method in the study enforces tau(0|x) = 0, so the first grid point sits
+    exactly on the boundary. It must establish no state at all, or every curve would
+    be credited with a reversal it did not make."""
+    rising = np.concatenate([[0.0], np.linspace(0.1, 1.0, M)])[None, :]
+    assert n_sign_reversals(rising) == 0
+
+    falling = np.concatenate([[0.0], np.linspace(-0.1, -1.0, M)])[None, :]
+    assert n_sign_reversals(falling) == 0
+
+    # And a curve that starts at zero, rises, then genuinely crosses is exactly one.
+    crosses = np.concatenate([[0.0], np.linspace(0.5, -0.5, M)])[None, :]
+    assert n_sign_reversals(crosses) == 1
+
+
+def test_the_band_is_a_hysteresis_not_a_clip():
+    """An excursion has to clear h on the *new* side to count, so noise skimming zero
+    costs nothing while a real crossing of the same width counts."""
+    m = np.arange(M + 1)
+    jitter = (0.01 * (-1.0) ** m)[None, :]                # +-0.01 about zero
+    assert n_sign_reversals(jitter, 0.0) == M             # every crossing, no band
+    assert n_sign_reversals(jitter, 0.05) == 0            # none clears the band
+
+    real = (0.20 * (-1.0) ** m)[None, :]
+    assert n_sign_reversals(real, 0.05) == M              # all of them clear it
+
+
+def test_sign_reversals_accept_a_scalar_and_a_per_row_array():
+    curves = np.stack([
+        0.01 * (-1.0) ** np.arange(M + 1),                # small oscillation
+        1.00 * (-1.0) ** np.arange(M + 1),                # large oscillation
+    ])
+    np.testing.assert_array_equal(n_sign_reversals(curves, 0.05), [0, M])
+    np.testing.assert_array_equal(n_sign_reversals(curves, np.array([0.005, 2.0])), [M, 0])
+
+
+def test_the_epsilon_floor_kills_float_round_off_at_zero_tolerance():
+    """Why h = 0 is not literally zero. tau is a difference of exponentials, so a curve
+    that touches zero analytically lands a few ULP either side of it. On the Mixture
+    DGP's true tau those excursions peak at 2.22e-16 and would be reported as sign
+    reversals by a bare h = 0."""
+    ulp = (2.22e-16 * (-1.0) ** np.arange(M + 1))[None, :]
+
+    assert n_sign_reversals(ulp, 0.0) == 0                # SIGN_EPS absorbs it
+    assert n_sign_reversals(ulp, 0.0, eps=0.0) == M       # and it is the eps doing it
+
+
+@pytest.mark.parametrize("counter", [n_sign_reversals, n_direction_reversals])
+def test_both_counts_are_monotone_non_increasing_in_the_tolerance(counter):
+    """Raising the tolerance may only ever remove reversals. Without this a column of
+    the figure could exceed the column to its left, which would be meaningless."""
+    rng = np.random.default_rng(7)
+    steps = rng.choice([-1.0, 0.0, 0.0, 1.0], size=(200, M))
+    curves = np.concatenate([np.zeros((200, 1)), np.cumsum(steps, axis=1)], axis=1)
+
+    previous = counter(curves, 0.0)
+    for h in (0.25, 0.5, 1.0, 2.0, 4.0):
+        current = counter(curves, h)
+        assert np.all(current <= previous), f"tolerance {h} increased a count"
+        previous = current
+
+
+# ---------------------------------------------------------------------------
+# The DGP invariant the sign-reversal figure rests on
+# ---------------------------------------------------------------------------
+
+def _true_tau_on_the_study_grid(dgp_class, n_test=500, m=30, rng_seed=12345):
+    """The true tv-CATE on the shared grid, built the way the simulation harness does.
+
+    Mirrors `_make_test_set` in examples/plot_simulation.py: a DGP supplies its own
+    test covariates if it has `generate_test_X` (IST-3 does, and it must be called
+    before `true_tau` because it selects the super-population rows), otherwise the
+    fallback is uniform on [-1, 1]^5.
+    """
+    from air_cate.utils import build_time_grid
+
+    t_end = getattr(dgp_class, "t_end", 5.0)
+    time_grid, _ = build_time_grid(t_end, m)
+    if hasattr(dgp_class, "generate_test_X"):
+        X = dgp_class.generate_test_X(n_test, rng_seed)
+    else:
+        X = np.random.default_rng(rng_seed).uniform(-1, 1, (n_test, 5)).astype(np.float32)
+    return np.asarray(dgp_class.true_tau(np.asarray(time_grid), X))
+
+
+def _assert_truth_never_reverses_sign(dgp_class):
+    tau_true = _true_tau_on_the_study_grid(dgp_class)
+
+    for h in H_GRID:
+        counts = n_sign_reversals(tau_true, h)
+        assert counts.max() == 0, (
+            f"{dgp_class.__name__}: {np.count_nonzero(counts)} of {len(counts)} true "
+            f"curves reverse sign at h={h}; the figure's zero target line assumes none do"
+        )
+
+    # Not a vacuous assertion about a flat truth: the curves do have turning points,
+    # which is exactly the distinction the two counts draw.
+    assert n_sign_changes(tau_true).max() >= 1
+
+
+def test_the_true_tau_never_reverses_sign_on_the_synthetic_dgps():
+    """The claim the sign-reversal figure rests on, and the reason its target is zero.
+
+    All three DGPs define tau = S_1 - S_0 as a difference of Weibull survivals sharing
+    a shape parameter and differing only in scale. Two such curves are strictly ordered
+    for every t > 0, so no subject's effect can cross zero -- each rises from 0 to a
+    peak and decays back toward 0. Any nonzero count on these DGPs is therefore
+    spurious by construction, which is what makes the metric worth reporting. If this
+    test ever fails, the figure needs a real target line rather than a zero one.
+    """
+    from conftest import WeibullDGP, WeibullMixtureDGP
+
+    _assert_truth_never_reverses_sign(WeibullDGP)
+    _assert_truth_never_reverses_sign(WeibullMixtureDGP)
+
+
+@pytest.mark.slow
+def test_the_true_tau_never_reverses_sign_on_ist3():
+    """Same invariant for IST-3, split out because loading its super-population reads
+    a 100k-subject artifact off disk."""
+    from air_cate.dgp import IST3TextDGP
+
+    _assert_truth_never_reverses_sign(IST3TextDGP)
 
 
 # ---------------------------------------------------------------------------

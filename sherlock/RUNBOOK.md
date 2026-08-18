@@ -1230,6 +1230,151 @@ still resolves.
 - **Excess does not penalize shrinkage.** `τ̂ ≡ 0` scores a perfect 0, which is why its mean
   panel cannot use a log axis and why it is only interpretable beside iMSE.
 
+### Stage 4 — the sign-reversal re-run (`flips50`)
+
+**Why it exists.** `metrics50`'s `excess` / `excess_thresh` count **direction** reversals — sign
+changes of `τ̂(t_{m+1}|x) − τ̂(t_m|x)`, i.e. peaks and troughs. The figure was captioned as
+counting *treatment-effect reversals*, which a reader takes to mean the effect flipping from
+harmful to beneficial. Those are different quantities: a curve that stays positive throughout
+can score 4 direction reversals and 0 sign reversals; one running cleanly from −0.3 to +0.3
+scores 0 and 1. `metrics.n_sign_reversals` counts the second, with a hysteresis band `h` around
+zero so noise skimming zero does not register.
+
+**Why it needs a re-run rather than a re-plot.** Result files carry only the scalars in
+`METRIC_KEYS` plus `mse_per_timepoint`. No `τ̂` survives, so no new counting rule can be
+recovered from `metrics50_merged.json`. This run fixes that for good: it also dumps every cell's
+`τ̂` to `<outfile>.curves.npz` on `$SCRATCH`, so the *next* definition question is a re-plot.
+
+**The target line is 0 in all three DGPs, by construction, and the paper must say so.** Each DGP
+defines `τ = S_1 − S_0` as a difference of Weibull survivals sharing a shape parameter and
+differing only in scale; those are strictly ordered for all `t > 0`, so no subject's true effect
+crosses zero. The 44.8/55.2 (Weibull) and 8.6/91.4 (IST-3) positive/negative splits are
+*cross-sectional* — the population holds both harmed and helped subjects — not temporal
+crossings. The Mixture's apparent 9.3% is float round-off, minority-side peaks of 1.1e-16 to
+2.2e-16, which is why `n_sign_reversals` floors the band at `SIGN_EPS = 1e-9`. Do not carry the
+guarantee over to a DGP outside this family.
+
+**`RUN_TAG=flips50` is mandatory, on every call.** Reusing `metrics50` would be silent data
+corruption, not a collision: in-task resume skips any `(n, seed)` cell already in `OUTFILE`, so
+every task would load the old answers, find every cell present, exit 0, and report the *old*
+fits as the new run. Note that `submit_csf.sh` still defaults to `RUN_TAG=metrics50` — the
+defaults are deliberately the historical headline runs, so an omitted tag lands on an archived
+run rather than an unnamed one. Pass it explicitly.
+
+**Pilot first — the 18 `BLOCK_IDX 0` tasks** (seeds 0-4 for every DGP × method pair). At 10
+blocks per pair these are `0, 10, 20, ...` within each DGP's 60 ids. Own tag, so a pilot cell is
+never resume-skipped by the real submission:
+
+```bash
+CENSORING_FIX=1 RUN_TAG=flips50_pilot N_SEEDS=50 \
+    sbatch --array=0,10,20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170 \
+    --mem-per-cpu=32G sherlock/submit_array.sh
+```
+
+Three things to confirm on the pilot before committing the rest:
+
+```bash
+# 1. The 56 new keys are present and finite. flip_* is the sign count, rev_* the
+#    direction count; abs_p2 is h = 0.02 on the tau scale.
+python - <<'EOF'
+import glob, json
+f = sorted(glob.glob("/scratch/users/grolleau/air_cate_flips50_pilot/flips50_pilot_*.json"))[0]
+d = json.load(open(f))
+cell = next(iter(next(iter(next(iter(d["results"].values())).values())).values()))[0]
+flips = {k: v for k, v in cell.items() if k.startswith(("flip_", "rev_"))}
+print(f, len(flips), "reversal keys")            # want 56
+print({k: v for k, v in flips.items() if "abs_p0" in k or "abs_p2" in k})
+EOF
+
+# 2. The curve dumps landed beside the JSONs, one per task.
+ls $SCRATCH/air_cate_flips50_pilot/*.curves.npz | wc -l    # want 18
+
+# 3. HARNESS NON-REGRESSION -- use an RSF-T cell, which reproduces metrics50 to ~1e-7.
+#    Do NOT use AIR, Tensor-prod, or either oracle: they are not seed-reproducible
+#    (~7% on a single measured cell), so a mismatch there would prove nothing. CSF is
+#    the only bit-exact arm, but it is not in this pilot (own script, ~2.5h/seed), so
+#    RSF-T is what the 18-task pilot can actually check.
+python - <<'EOF'
+import glob, json
+old = json.load(open("/scratch/users/grolleau/air_cate_metrics50/metrics50_merged.json"))
+f = glob.glob("/scratch/users/grolleau/air_cate_flips50_pilot/*_Weibull_RSF-T_b0.json")[0]
+new = json.load(open(f))
+for n in ("500", "1000", "2000"):
+    a = old["results"]["Weibull"]["RSF-T"][n][0]["imse"]
+    b = new["results"]["Weibull"]["RSF-T"][n][0]["imse"]
+    print(f"n={n:>5}  metrics50={a:.10f}  flips50={b:.10f}  |d|={abs(a-b):.2e}")
+EOF
+```
+
+Then the full run — identical to stage 3 in shape, only the tag changes:
+
+```bash
+for r in 0-39 60-99 120-159; do
+    CENSORING_FIX=1 RUN_TAG=flips50 N_SEEDS=50 sbatch --array=$r \
+        --mem-per-cpu=16G sherlock/submit_array.sh
+done
+for r in 40-59 100-119 160-179; do
+    CENSORING_FIX=1 RUN_TAG=flips50 N_SEEDS=50 sbatch --array=$r \
+        sherlock/submit_array.sh
+done
+
+# CSF, two SEQUENTIAL passes, same reasoning and same numbers as stage 3 -- including
+# pass 2 naming the WHOLE ladder so resume caches the five cheap rungs.
+CENSORING_FIX=1 RUN_TAG=flips50 N_SEEDS=50 \
+    N_VALUES=500,1000,2000,5000,10000 \
+    sbatch --array=0-149 --time=05:00:00 sherlock/submit_csf.sh
+
+CENSORING_FIX=1 RUN_TAG=flips50 N_SEEDS=50 \
+    N_VALUES=500,1000,2000,5000,10000,20000 \
+    sbatch --dependency=afterany:<pass1_jobid> --array=0-149 \
+    --mem-per-cpu=64G sherlock/submit_csf.sh
+```
+
+Collect. Note the `.curves.npz` files stay on `$SCRATCH` — `PATTERN` matches `*.json`, and
+`collect_results.sh` says why they are not brought home:
+
+```bash
+ls $SCRATCH/air_cate_flips50/flips50_*.json | wc -l        # target: 330, pre-merge
+
+RESULTS_DIR=$SCRATCH/air_cate_flips50 PATTERN='flips50_*.json' \
+MERGED_NAME=flips50_merged.json FIGURES_DIR=examples/figures/flips50 \
+  bash sherlock/collect_results.sh
+```
+
+**Regenerate EVERYTHING from this one merged file, and nothing from `metrics50`.** The
+cross-fitted and oracle arms are not seed-reproducible, so their `flips50` fits differ from
+`metrics50`'s. Mixing figures across the two would put numbers in the paper that describe
+different fits. `collect_results.sh` already renders the four per-metric figures plus
+`simulation_sign_reversals.*`; the table needs a separate call, and it takes its paths
+positionally (`make_table.py <results.json> <out.tex>`) so the merged file can be pointed at
+directly rather than first being copied over `examples/figures/simulation_results.json`:
+
+```bash
+python examples/make_table.py \
+    $SCRATCH/air_cate_flips50/flips50_merged.json \
+    latex/simulation_table.tex
+```
+
+That is the file `latex/main.tex` `\input`s (as `simulations/simulation_table`), so the name
+must stay `simulation_table.tex`. Then re-check every iMSE quoted inline in
+[simulation_study.tex](../latex/simulation_study.tex) against the regenerated table — expect
+movement in the last digits.
+
+Section 6's rsync then applies unchanged **except for the remote path**, which becomes
+`/scratch/users/grolleau/air_cate_flips50/flips50_merged.json`. It lands on the tracked
+`examples/figures/simulation_results.json`, so commit or stash that first.
+
+**What to check in the sign-reversal figure.**
+
+- **The target line must land on exactly 0 in all nine panels.** It is read from the file's
+  `flip_true_abs_*` keys, not assumed, so a nonzero line means the truth is not what the
+  argument above says — investigate before drawing any conclusion from the row.
+- **The `h = 0` column is the noise ceiling, not the headline.** An estimator whose curve
+  jitters by one ULP across zero scores there. The 2 and 5 percentage-point columns are what a
+  clinician would act on.
+- **A shrunk estimator wins this metric for free.** `τ̂ ≡ 0` never crosses, so it scores a
+  perfect 0 — the same caveat `excess` carries. Read it beside iMSE or not at all.
+
 ---
 
 ## 6. Bring the results home

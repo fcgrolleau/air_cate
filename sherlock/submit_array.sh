@@ -59,6 +59,27 @@
 # N_BLOCKS, hence the whole index mapping: omitting it on one call makes those tasks
 # decode their ids under the 200-block layout and write another arm's filenames.
 #
+# THE SIGN-REVERSAL RE-RUN (RUNBOOK stage 4). Same 180-task shape and the same two ranges
+# as metrics50 above -- only the tag changes, to flips50:
+#
+#   for r in 0-39 60-99 120-159; do
+#       CENSORING_FIX=1 RUN_TAG=flips50 N_SEEDS=50 sbatch --array=$r \
+#           --mem-per-cpu=16G sherlock/submit_array.sh
+#   done
+#   for r in 40-59 100-119 160-179; do
+#       CENSORING_FIX=1 RUN_TAG=flips50 N_SEEDS=50 sbatch --array=$r \
+#           sherlock/submit_array.sh
+#   done
+#
+# It exists because the result files store only the METRIC_KEYS scalars -- no tau_hat --
+# so counting SIGN reversals (the effect crossing zero) rather than DIRECTION reversals
+# (peaks and troughs, what excess/excess_thresh record) cannot be recomputed from
+# metrics50_merged.json. This run also dumps every cell's tau_hat to
+# <OUTFILE>.curves.npz, which is what makes the next such question a re-plot instead.
+#
+# The new tag is load-bearing, not cosmetic: see the RUN_TAG comment below for why
+# reusing metrics50 would report the old fits as the new run's.
+#
 # Pilot (seeds 0-4 for all 18 DGP x method pairs = the 18 tasks with BLOCK_IDX 0).
 # GIVE IT ITS OWN TAG. Without RUN_TAG it writes full999_* files into the full run's
 # directory, and if it also omits CENSORING_FIX those cells hold fix-OFF results that

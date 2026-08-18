@@ -69,4 +69,19 @@ python examples/plot_simulation.py \
     --output "$MERGED" \
     "${FIG_ARGS[@]}"
 
+# The sign-reversal figure is a SECOND invocation, not another flag on the one above:
+# --sign-reversals renders only that figure and returns, because it is the one figure
+# that needs no test set and so must not pay for building them. Runs unconditionally --
+# on a merged file predating the flip_* keys every series is empty and it draws a blank
+# grid rather than failing, which is cheaper than making the caller know which it has.
+python examples/plot_simulation.py \
+    --plot-only --sign-reversals \
+    --output "$MERGED" \
+    "${FIG_ARGS[@]}"
+
+# The per-cell tau_hat dumps (<prefix>_<dgp>_<method>_b<idx>.curves.npz) are deliberately
+# NOT collected. They are the safety net that makes a future counting rule a re-plot
+# rather than another 1,300 CPU-hours, they are ~780 MB across a full run, and no figure
+# reads them -- so they stay on $SCRATCH. PATTERN matches *.json, so they are untouched
+# here; if you ever widen it, exclude them or the merge will choke on a binary file.
 echo "Plots saved to: ${FIGURES_DIR:-examples/figures/}"

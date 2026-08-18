@@ -36,9 +36,10 @@ Then collect:
   ... --merge partial_*.json --output merged.json
   ... --plot-only --output merged.json
 
-Reversal count at both recorded thresholds, one row per DGP and one column per
-threshold, in a single figure, against the true tv-CATE's own count:
-  ... --plot-only --output merged.json --figures-dir <dir> --excess-thresholds
+Sign-reversal count -- how often the estimated effect crosses zero over time -- one row
+per DGP and one column per hysteresis band, against the true tv-CATE's own count. Needs
+no test set, so it re-plots anywhere:
+  ... --plot-only --output merged.json --figures-dir <dir> --sign-reversals
 """
 
 import argparse
@@ -60,7 +61,7 @@ from scipy.stats import t as t_dist
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MultipleLocator
+from matplotlib.ticker import MaxNLocator, MultipleLocator
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -76,11 +77,8 @@ from air_cate.baselines import SurvivalForestTLearner, SurvivalForestSLearner
 from air_cate.baselines_csf import CausalSurvivalForest, grf_available
 from air_cate.cate_model.tensor_product import CATETensorProduct
 from air_cate.metrics import (
-    DEFAULT_THRESHOLD_FRAC,
     METRIC_KEYS,
     curve_metrics,
-    n_sign_changes,
-    range_threshold,
 )
 from air_cate.nuisance.oracle import build_oracle_nuisances
 from air_cate.utils import build_time_grid
@@ -300,31 +298,34 @@ METRIC_SPECS = {
     ),
 }
 
-# The reversal thresholds the results files actually carry, in increasing order.
+# The columns of the sign-reversal figure: one tolerance each, increasing left to right.
 #
-# Both entries are the same quantity -- mean over test subjects of the reversal count
-# N(tau_hat) -- computed under a different rule for what counts as a direction reversal
-# rather than against a different target, which is why they belong side by side on a
-# shared y axis instead of in two unrelated figures.
+# All three are the same quantity -- mean over test subjects of the number of times
+# tau_hat(.|x_i) reverses SIGN, i.e. crosses zero -- measured with a wider hysteresis
+# band each time, which is why they share a y axis instead of forming three figures.
+# The band is absolute, on the tau scale: tau is a difference of survival
+# probabilities, so h = 0.02 reads directly as "two percentage points".
 #
-# There are two and only two, because `curve_metrics` calls `n_sign_changes` exactly
-# twice: once with no threshold, once at DEFAULT_THRESHOLD_FRAC. A third threshold is
-# not a re-plot -- the result files keep these scalars, not the fitted curves, so it
-# would mean re-running the simulation.
+# This is NOT the direction-reversal count `excess`/`excess_thresh` record. A curve
+# that stays positive throughout has zero sign reversals however wiggly it is. See the
+# air_cate.metrics docstring; the direction counts are still stored (the `rev_*` keys)
+# and can be plotted by pointing `key_hat`/`key_true` at them.
 #
-# `key` names the EXCESS scalar the files store, N(tau_hat) - N(tau_true); the raw count
-# is recovered by adding back the truth's own count under the same rule (see
-# `_true_reversal_count` and `plot_reversal_counts`). `thresholded` says which rule that
-# is, so the truth is counted exactly the way the stored excess counted it.
-#
-# `title` is what the column header says. Keeping the 5% out of the string and reading
-# it from DEFAULT_THRESHOLD_FRAC means the header cannot drift from the constant the
-# numbers underneath it were computed with.
-EXCESS_THRESHOLD_VARIANTS = [
-    dict(key="excess", thresholded=False,
-         title="No flatness threshold (any sign change)"),
-    dict(key="excess_thresh", thresholded=True,
-         title=f"Flat below {DEFAULT_THRESHOLD_FRAC:.0%} of the curve's own range"),
+# `key_hat` and `key_true` name the scalars the result files carry, so the target line
+# is read from the same file as the curves rather than recomputed from the DGP. Adding
+# a fourth column is now a re-plot rather than a re-run, provided its tolerance is in
+# `metrics.H_GRID` -- which is the whole reason that grid is dense.
+# Titles put the words first and the symbol in parentheses, in all three. The panel titles
+# are bold and mathtext under the `cm` fontset does not take a bold weight, so a title
+# LEADING with $h = 0.02$ renders half-bold; leading with the phrase keeps the three
+# headers looking like a set.
+SIGN_REVERSAL_COLUMNS = [
+    dict(key_hat="flip_hat_abs_p0", key_true="flip_true_abs_p0",
+         title="No tolerance ($h = 0$)"),
+    dict(key_hat="flip_hat_abs_p2", key_true="flip_true_abs_p2",
+         title="Tolerance 2 percentage points ($h = 0.02$)"),
+    dict(key_hat="flip_hat_abs_p5", key_true="flip_true_abs_p5",
+         title="Tolerance 5 percentage points ($h = 0.05$)"),
 ]
 
 
@@ -431,13 +432,17 @@ def make_estimator(cfg, oracle, tensor, rsf, is_text_dgp=False):
     return AIREstimator(**common)
 
 
-def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf, propensity_oracle=False):
+def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf,
+               propensity_oracle=False, curves_out=None):
     """Fit one method on one (n, seed) draw and return detailed results dict.
 
     Args:
         propensity_oracle: If True and oracle=False, fit with cross-fitted event/censoring
             survival but oracle propensity (e_hat = 0.5 for all). Useful for isolating
             whether propensity estimation is the bottleneck.
+        curves_out: Optional dict. If given, `tau_hat` and `tau_true` are written into
+            it as float32 arrays so the caller can dump them alongside the scalars.
+            Kept out of the return value because that goes straight into JSON.
     """
     # Seed python, numpy, AND the Keras global generator. Seeding numpy alone
     # leaves network initialization keyed to Keras's own counter, which advances
@@ -532,6 +537,16 @@ def run_single(dgp_class, cfg, n, seed, X_test, oracle, tensor, rsf, propensity_
     metrics = curve_metrics(tau_hat, tau_true, delta)
     runtime = time.time() - t_start
 
+    # Hand the raw curves back to the caller so they can be persisted beside the
+    # scalars. This exists because the scalars alone have twice now been not enough:
+    # every question about a different reversal rule or a different tolerance has cost
+    # a full re-run, since a result file records what a metric *was* and not what the
+    # curve *is*. float32 halves the dump at a precision far finer than any metric
+    # here resolves.
+    if curves_out is not None:
+        curves_out["tau_hat"] = np.asarray(tau_hat, dtype=np.float32)
+        curves_out["tau_true"] = np.asarray(tau_true, dtype=np.float32)
+
     out = {
         "seed": seed,
         **metrics,
@@ -576,8 +591,15 @@ def _make_test_set(dgp_class, n_test, rng_seed=TEST_SEED):
     return rng.uniform(-1, 1, (n_test, 5)).astype(np.float32)
 
 
-def run_all(cfg, resume=False, results_path=None, dgps=None, methods=None):
-    """Run all experiments and return nested dict: results[dgp][method][n] = [imse, ...]."""
+def run_all(cfg, resume=False, results_path=None, dgps=None, methods=None,
+            dump_curves=True):
+    """Run all experiments and return nested dict: results[dgp][method][n] = [imse, ...].
+
+    Args:
+        dump_curves: Also write every cell's tau_hat (and one tau_true per DGP) to a
+            sibling `.curves.npz`. On by default: the dump is what makes a future
+            change to a metric's definition a re-plot instead of a re-run.
+    """
     if results_path is None:
         results_path = RESULTS_PATH
     if dgps is None:
@@ -605,6 +627,15 @@ def run_all(cfg, resume=False, results_path=None, dgps=None, methods=None):
             print(f"  Resuming: loaded {n_prior} prior results from {results_path}")
         except Exception:
             prior = {}
+
+    # Raw curves are accumulated in memory and rewritten whole at each save point,
+    # mirroring how `results` is handled. A cluster task holds at most 6 rungs x 5
+    # seeds x (n_test x M+1) float32 ~= 4 MB, so rewriting costs nothing next to a fit.
+    # Prior curves are reloaded on resume for the same reason prior results are: the
+    # two-pass CSF recipe runs the top rung as a second pass and must not drop pass 1.
+    curve_store = load_curves(results_path) if (resume and dump_curves) else {}
+    if curve_store:
+        print(f"  Resuming: loaded {len(curve_store)} prior curve arrays")
 
     total = len(dgps) * len(methods) * len(n_values) * len(seeds)
     results = {}
@@ -646,12 +677,14 @@ def run_all(cfg, resume=False, results_path=None, dgps=None, methods=None):
                     counter += 1
                     tag = f"[{counter}/{total}] {dgp_name}/{method_name} n={n} seed={seed}"
                     print(f"  {tag} ...", end=" ", flush=True)
+                    cell_curves = {} if dump_curves else None
                     try:
                         result = run_single(
                             dgp_class, cfg, n, seed, X_test,
                             oracle=method_opts["oracle"],
                             tensor=method_opts["tensor"],
                             rsf=method_opts["rsf"],
+                            curves_out=cell_curves,
                         )
                     except Exception as exc:
                         # Every metric key gets a nan, not just imse: the plotting
@@ -668,11 +701,26 @@ def run_all(cfg, resume=False, results_path=None, dgps=None, methods=None):
                     elapsed = time.time() - t0
                     print(f"iMSE={result['imse']:.6f}  ({elapsed:.0f}s)")
                     results[dgp_name][method_name][n].append(result)
+                    if cell_curves:
+                        curve_store[curve_key(dgp_name, method_name, n, seed)] = (
+                            cell_curves["tau_hat"]
+                        )
+                        # tau_true depends only on (DGP, X_test, grid), all of which
+                        # are fixed across n and seed, so one copy per DGP is enough
+                        # and storing it per cell would double the dump for nothing.
+                        curve_store.setdefault(
+                            f"tau_true__{dgp_name}", cell_curves["tau_true"]
+                        )
+                        curve_store.setdefault(
+                            f"X_test__{dgp_name}", np.asarray(X_test, dtype=np.float32)
+                        )
                     gc.collect()
                     jax.clear_caches()
 
                 # Save incrementally after each (dgp, method, n) block
                 save_results(results, n_values, cfg, results_path=results_path)
+                if dump_curves:
+                    save_curves(curve_store, results_path)
 
     if skipped:
         print(f"  Skipped {skipped}/{total} fits from prior run")
@@ -707,6 +755,54 @@ def save_results(results, n_values, cfg, results_path=None):
     with open(results_path, "w") as f:
         json.dump(payload, f, indent=2)
     print(f"Results saved to {results_path}")
+
+
+def curves_path(results_path):
+    """Sibling `.curves.npz` for the raw-curve dump of a given result file."""
+    return os.path.splitext(results_path)[0] + ".curves.npz"
+
+
+def curve_key(dgp_name, method_name, n, seed):
+    """Key for one cell's tau_hat inside the curve dump.
+
+    Fully qualified rather than just (n, seed) because a local run covers several
+    DGPs and methods in one file, while a cluster task covers exactly one pair.
+    """
+    return f"tau_hat__{dgp_name}__{method_name}__n{n}__seed{seed}"
+
+
+def save_curves(curve_store, results_path):
+    """Write the curve dump for `results_path`, atomically.
+
+    Atomic where `save_results` is not, and deliberately: a truncated JSON fails
+    loudly on the next load and the block is recomputed, but a truncated npz is
+    simply unreadable, which would silently cost a resuming task every curve it had
+    already produced. Writing to a temp name in the same directory and renaming makes
+    the replacement a single filesystem operation, so a task killed mid-write leaves
+    the previous complete dump in place.
+    """
+    if not curve_store:
+        return
+    path = curves_path(results_path)
+    out_dir = os.path.dirname(path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    tmp = path + ".tmp.npz"
+    np.savez_compressed(tmp, **curve_store)
+    os.replace(tmp, path)
+
+
+def load_curves(results_path):
+    """Load a previously written curve dump, or an empty dict if there is none."""
+    path = curves_path(results_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with np.load(path) as z:
+            return {k: z[k] for k in z.files}
+    except Exception as exc:
+        print(f"  WARNING: could not read {path} ({exc}); starting a fresh dump")
+        return {}
 
 
 def load_results(results_path=None):
@@ -769,33 +865,6 @@ def _pop_avg_metric(dgp_class, X_test, M, metric="imse"):
         tau_true.mean(axis=0, keepdims=True), tau_true.shape
     )                                                          # (n_test, M+1)
     return curve_metrics(tau_bar, tau_true, delta)[metric]
-
-
-def _true_reversal_count(dgp_class, X_test, M, thresholded):
-    """Mean reversal count of the TRUE tv-CATE on the fixed test set.
-
-    This is the reference line for `plot_reversal_counts`, and the constant that turns
-    the stored excess back into a raw count. It needs no fitted model -- only the DGP's
-    own `true_tau` on the same grid and test set the metrics were computed against --
-    which is why a figure of raw counts costs nothing beyond building the test set.
-
-    It is a per-DGP CONSTANT, identical for every method and every sample size: the test
-    set is drawn once per DGP outside the seed loop (see `_make_test_set`) and the grid
-    is fixed at `build_time_grid(t_end, M)`. Reconstructing it here rather than reading
-    `n_true_mean` off the results is what makes the thresholded column possible at all --
-    the files store the thresholded count only inside the excess difference, never on its
-    own. Verified against `n_true_mean` for all three DGPs, which it reproduces exactly.
-
-    `thresholded` must match the variant whose excess it will be added to: the truth has
-    to be counted under the same flatness rule as the estimate it was differenced from,
-    or the sum is not a reversal count of anything.
-    """
-    t_end = getattr(dgp_class, "t_end", 5.0)
-    time_grid, _ = build_time_grid(t_end, M)
-    tau_true = dgp_class.true_tau(np.asarray(time_grid), X_test)   # (n_test, M+1)
-    thr = (range_threshold(tau_true, DEFAULT_THRESHOLD_FRAC)
-           if thresholded else None)
-    return float(np.mean(n_sign_changes(tau_true, thr)))
 
 
 def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None,
@@ -1046,38 +1115,73 @@ def _ordered_legend_handles(ax):
     return [handles[i] for i in order], [labels[i] for i in order]
 
 
-def plot_reversal_counts(results, n_values, cfg, X_tests, figures_dir=None,
-                         stem="simulation_convergence_excess_thresholds"):
-    """Average reversal count under every recorded threshold, in one figure.
+def _stored_target(dgp_results, n_values, key):
+    """The truth's own count for one DGP, read off the result file.
 
-    Plots the RAW count N(tau_hat), not the excess N(tau_hat) - N(tau_true), with the
-    true tv-CATE's own count drawn as the target. That line therefore sits at whatever
-    the truth's count happens to be -- 1.0 for Weibull unthresholded, 0.25 for Weibull
-    thresholded -- and not at zero, so a method is read against the truth's roughness
-    rather than against a difference pinned to the axis.
+    Every cell of a DGP stores the same value under `key`: the truth is evaluated on a
+    test set drawn once per DGP outside the seed loop and on a grid fixed at
+    `build_time_grid(t_end, M)`, so it does not depend on the method, the sample size or
+    the seed. Averaging identical numbers is just a robust way to pick one up wherever
+    the file happens to have cells, and it warns rather than lying if they ever differ
+    -- which would mean two runs with different test sets or grids had been merged.
 
-    The result files store only the excess, so each series is the stored excess plus the
-    truth's count under that column's rule (`_true_reversal_count`). Adding a constant is
-    exact, not an approximation: the truth's count is fixed for a DGP, so the sum is the
-    mean raw count and the CI half-width is unchanged by the shift. For the unthresholded
-    column this reproduces the stored `n_hat_mean` exactly; for the thresholded column
-    there is no stored raw count, which is why it is reconstructed rather than read.
+    Returns nan if no cell carries the key, which is what a file written before the
+    sign-reversal metrics existed looks like; the caller then draws no target line.
+    """
+    vals = [
+        v[key]
+        for method_cells in dgp_results.values()
+        for n in n_values if n in method_cells
+        for v in method_cells[n]
+        if np.isfinite(v.get(key, float("nan")))
+    ]
+    if not vals:
+        return float("nan")
+    spread = float(np.max(vals) - np.min(vals))
+    if spread > 1e-9:
+        print(
+            f"WARNING: the truth's {key} varies by {spread:.3g} across cells "
+            f"({np.min(vals):.6g} to {np.max(vals):.6g}). It should be a per-DGP "
+            f"constant -- results from different test sets or time grids may have "
+            f"been merged. Drawing the mean."
+        )
+    return float(np.mean(vals))
 
-    One row per DGP, one COLUMN per entry of EXCESS_THRESHOLD_VARIANTS, so the two
-    thresholds sit next to each other left to right and the left-to-right change within
-    a row is the flatness rule and nothing else. Both the curves AND the target line move
-    between columns, since thresholding lowers the truth's count too.
 
-    Only the mean panel, deliberately: `simulation_convergence_excess` already carries
-    the variance row at the default threshold, and what this figure exists to answer is
-    whether a method's count survives being asked to ignore small wiggles.
+def plot_sign_reversals(results, n_values, figures_dir=None,
+                        stem="simulation_sign_reversals"):
+    """Average number of treatment-effect SIGN reversals, one column per tolerance.
 
-    The y axis is shared ACROSS each row. Autoscaling the two columns independently
-    would rescale away exactly the effect being shown -- a method whose count falls from
-    13 to 6 under thresholding would draw two identical-looking panels.
+    For each test subject, count how many times the estimated effect crosses zero over
+    time -- harmful becoming beneficial or the reverse -- and average over subjects. The
+    tolerance `h` is a hysteresis band, not a clip: the curve has to reach `+h` to be
+    called positive and `-h` to be called negative, so noise skimming zero does not
+    register while a genuine crossing still does. `h` is absolute on the tau scale, and
+    tau is a difference of survival probabilities, so h = 0.02 reads as two percentage
+    points.
 
-    Unlike the excess version this DOES need X_tests, because the target line is the
-    truth's own count and has to be evaluated from the DGP.
+    This is NOT the direction-reversal count that `excess` / `excess_thresh` record.
+    Those count turning points, so a curve that stays positive throughout can score
+    highly however unambiguous its clinical reading is. See the `air_cate.metrics`
+    docstring for why both quantities exist.
+
+    Both the estimate's count and the TRUTH's count are read from the result file
+    (`key_hat` / `key_true`), so nothing is recomputed from the DGP and no test set is
+    needed -- which is also what lets this figure be re-plotted on a machine without the
+    gitignored IST-3 embedding artifact. The target line is drawn at the truth's own
+    count rather than assumed: in all three DGPs here it lands on exactly 0, because tau
+    is a difference of Weibull survivals sharing a shape and differing only in scale and
+    those are strictly ordered for all t > 0. Reading it from the file rather than
+    hard-coding 0 keeps the figure honest if a future DGP does cross.
+
+    One row per DGP, one COLUMN per entry of SIGN_REVERSAL_COLUMNS, so the tolerances sit
+    side by side and the left-to-right change within a row is the band width and nothing
+    else. Only the mean panel, deliberately: what this figure exists to answer is whether
+    a method's spurious crossings survive being asked to ignore small excursions.
+
+    The y axis is shared ACROSS each row. Autoscaling the columns independently would
+    rescale away exactly the effect being shown -- a method whose count falls from 13 to
+    0.4 under a wider band would draw three identical-looking panels.
     """
     out_dir = figures_dir or FIGURES_DIR
     plt.rcParams.update({
@@ -1100,37 +1204,32 @@ def plot_reversal_counts(results, n_values, cfg, X_tests, figures_dir=None,
         )
 
     n_rows = len(dgps_present)
-    n_cols = len(EXCESS_THRESHOLD_VARIANTS)
+    n_cols = len(SIGN_REVERSAL_COLUMNS)
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(6.5 * n_cols, 4.3 * n_rows),
                              sharex="col", sharey="row", squeeze=False)
-
-    dgp_classes = dict(DGPS)
 
     for row, dgp_name in enumerate(dgps_present):
         dgp_results = results[dgp_name]
 
-        for col, variant in enumerate(EXCESS_THRESHOLD_VARIANTS):
+        for col, column in enumerate(SIGN_REVERSAL_COLUMNS):
             ax = axes[row][col]
 
-            # The target, and the constant that turns the stored excess back into a
-            # count. Computed per column: thresholding lowers the truth's count too, so
-            # a single line reused across the row would be wrong in one of them.
-            n_true = _true_reversal_count(
-                dgp_classes[dgp_name], X_tests[dgp_name], cfg["M"],
-                variant["thresholded"],
-            )
-            ax.axhline(n_true, color="#888888", ls="--", linewidth=1.2, zorder=1,
-                       label="True tv-CATE")
+            # The target. Read per column, because a wider band lowers the truth's count
+            # too whenever the truth crosses at all -- one line reused across the row
+            # would be wrong in every column but the first on such a DGP.
+            n_true = _stored_target(dgp_results, n_values, column["key_true"])
+            if np.isfinite(n_true):
+                ax.axhline(n_true, color="#888888", ls="--", linewidth=1.2, zorder=1,
+                           label="True tv-CATE")
 
             for method_name, _ in METHODS:
                 if method_name not in dgp_results:
                     continue
                 ns, means, hw = _mean_ci_series(
-                    dgp_results[method_name], n_values, variant["key"]
+                    dgp_results[method_name], n_values, column["key_hat"]
                 )
                 if not ns:
                     continue
-                means = means + n_true
                 st = METHOD_STYLES[method_name]
                 ax.plot(
                     ns, means,
@@ -1152,27 +1251,30 @@ def plot_reversal_counts(results, n_values, cfg, X_tests, figures_dir=None,
             # Column headers on the top row only: every panel below repeats the same
             # threshold, and the DGP is named by the row's y label.
             if row == 0:
-                ax.set_title(variant["title"], fontsize=13, fontweight="bold", pad=10)
+                ax.set_title(column["title"], fontsize=13, fontweight="bold", pad=10)
             if row == n_rows - 1:
                 ax.set_xlabel("Sample size", fontsize=15)
 
-        # A count, so unlike the excess it cannot go negative and needs no negative
-        # floor -- but 0 is still forced onto the axis so the near-flat methods are read
-        # against it rather than against whatever autoscale chose, and the tick step is
-        # set explicitly because moving the limit alone does not move the locator's
-        # anchor. min(), so autoscale's own margin below a curve sitting at 0 is kept.
-        # Applied to the left panel only -- sharey="row" carries it across the row.
+        # A count, so it cannot go negative -- but 0 is still forced onto the axis, since
+        # it is the target here and a method sitting near it must be read against the
+        # line rather than against whatever autoscale chose. min(), so autoscale's own
+        # margin below a curve already at 0 is kept. Applied to the left panel only --
+        # sharey="row" carries it across the row.
+        #
+        # The locator is MaxNLocator rather than the fixed step the excess figures use,
+        # because these rows span very different magnitudes: a row whose counts run to 13
+        # and a row whose counts never leave [0, 0.4] cannot share one step, and the band
+        # columns collapse the scale further. `integer` is NOT set -- the sub-unit rows
+        # would then get a single tick at 0.
         lo, hi = axes[row][0].get_ylim()
         axes[row][0].set_ylim(min(lo, 0.0), hi)
-        axes[row][0].yaxis.set_major_locator(
-            MultipleLocator(METRIC_SPECS["excess"]["mean_ytick_step"])
-        )
+        axes[row][0].yaxis.set_major_locator(MaxNLocator(nbins=6))
 
         # The row label carries the DGP; the quantity itself is named once by supylabel,
-        # since all six panels plot it.
+        # since every panel plots it.
         axes[row][0].set_ylabel(f"{dgp_name} DGP", fontsize=14, fontweight="bold")
 
-    fig.supylabel("Average reversal count", fontsize=15)
+    fig.supylabel("Average number of treatment-effect sign reversals", fontsize=15)
 
     handles, labels = _ordered_legend_handles(axes[0][0])
     fig.legend(handles, labels, loc="lower center", ncol=4,
@@ -1230,6 +1332,13 @@ def main():
                         help="Re-plot from saved results (no simulation)")
     parser.add_argument("--no-resume", action="store_true",
                         help="Start fresh, ignoring any saved partial results")
+    parser.add_argument("--no-dump-curves", action="store_true",
+                        help="Skip the per-cell tau_hat dump to <output>.curves.npz. The "
+                             "dump is ON by default and is what makes a future reversal "
+                             "definition a re-plot rather than another full re-run; it "
+                             "costs ~3.7 MB per task (30 cells) and is written beside "
+                             "the JSON, never merged into it. Turn it off for a throwaway "
+                             "run, not for a cluster one.")
     parser.add_argument("--seed-start", type=int, default=0,
                         help="First seed index (default 0)")
     parser.add_argument("--extra-seeds", type=int, default=None,
@@ -1314,13 +1423,15 @@ def main():
                         help="Comma-separated metrics to plot (default: all of "
                              f"{','.join(METRIC_SPECS)}). Every metric is computed and "
                              "stored on every run regardless; this only selects figures.")
-    parser.add_argument("--excess-thresholds", action="store_true",
-                        help="With --plot-only: render ONLY the threshold-comparison "
-                             "figure (average reversal count, one row per DGP, one "
-                             "column per recorded threshold, against the true "
-                             "tv-CATE's own count). Like the per-metric figures it "
-                             "needs the test sets, since the target line is evaluated "
-                             "from the DGP.")
+    parser.add_argument("--sign-reversals", action="store_true",
+                        help="With --plot-only: render ONLY the sign-reversal figure "
+                             "(average number of times the estimated effect crosses "
+                             "zero over time, one row per DGP, one column per hysteresis "
+                             "band, against the true tv-CATE's own count). Unlike the "
+                             "per-metric figures it needs NO test set -- both the "
+                             "estimate's and the truth's counts are read from the "
+                             "results file -- so it re-plots without the gitignored "
+                             "IST-3 embedding artifact.")
     parser.add_argument("--csf-rscript", type=str, default=None,
                         help="Path to the Rscript binary for the CSF baseline. Needed "
                              "wherever R is provided by a module rather than being on "
@@ -1354,6 +1465,16 @@ def main():
     if args.plot_only:
         print("Loading saved results...")
         results, n_values, cfg = load_results(args.output or RESULTS_PATH)
+        print_summary(results, n_values)
+        print("\nGenerating plots...")
+        # Handled BEFORE the test sets are built, because it is the one figure that does
+        # not need them -- it reads the truth's own count off the results file. Building
+        # them first would make it fail on a machine without the IST-3 artifact for no
+        # reason.
+        if args.sign_reversals:
+            plot_sign_reversals(results, n_values, figures_dir=args.figures_dir)
+            print(f"Figure saved to {args.figures_dir or FIGURES_DIR}/")
+            return
         # Recreate per-DGP test sets, for the DGPs the file actually holds. Building
         # all of DGPS unconditionally made re-plotting a two-DGP smoke run impossible
         # on any machine without the IST-3 embedding artifact, which is gitignored.
@@ -1362,13 +1483,6 @@ def main():
             if dgp_name not in results:
                 continue
             X_tests[dgp_name] = _make_test_set(dgp_class, cfg["n_test"])
-        print_summary(results, n_values)
-        print("\nGenerating plots...")
-        if args.excess_thresholds:
-            plot_reversal_counts(results, n_values, cfg, X_tests,
-                                 figures_dir=args.figures_dir)
-            print(f"Figure saved to {args.figures_dir or FIGURES_DIR}/")
-            return
         plot_all_metrics(results, n_values, cfg, X_tests,
                          figures_dir=args.figures_dir, metrics=plot_metrics)
         print(f"All figures saved to {args.figures_dir or FIGURES_DIR}/")
@@ -1517,6 +1631,7 @@ def main():
     results, n_values, X_tests = run_all(
         cfg, resume=not args.no_resume, results_path=results_path,
         dgps=dgps, methods=methods,
+        dump_curves=not args.no_dump_curves,
     )
     save_results(results, n_values, cfg, results_path=results_path)
     print_summary(results, n_values)
