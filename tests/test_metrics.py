@@ -340,12 +340,17 @@ def _assert_truth_never_reverses_sign(dgp_class):
 def test_the_true_tau_never_reverses_sign_on_the_synthetic_dgps():
     """The claim the sign-reversal figure rests on, and the reason its target is zero.
 
-    All three DGPs define tau = S_1 - S_0 as a difference of Weibull survivals sharing
-    a shape parameter and differing only in scale. Two such curves are strictly ordered
-    for every t > 0, so no subject's effect can cross zero -- each rises from 0 to a
-    peak and decays back toward 0. Any nonzero count on these DGPs is therefore
-    spurious by construction, which is what makes the metric worth reporting. If this
-    test ever fails, the figure needs a real target line rather than a zero one.
+    No subject's true effect crosses zero on the study grid, so any nonzero count on
+    these DGPs is spurious -- which is what makes the metric worth reporting. The
+    reason differs by DGP. WeibullDGP puts both arms on a shared shape with differing
+    scales, and two such survival curves are strictly ordered for every t > 0, so its
+    zero holds at any horizon. WeibullMixtureDGP is not in that family (arm-specific
+    mixture weights over components of shape 1, 2, 3) and its true tau does cross, at
+    t ~ 16.3 for x_0 = 0, x_1 = -1 -- past its t_end of 5, which is why the assertion
+    below, evaluated on the study grid, still holds. So `_true_tau_on_the_study_grid`
+    has to keep using each DGP's own t_end for this test to mean what it says.
+
+    If this test ever fails, the figure needs a real target line rather than a zero one.
     """
     from conftest import WeibullDGP, WeibullMixtureDGP
 

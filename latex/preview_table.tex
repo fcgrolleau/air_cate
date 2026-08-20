@@ -1,0 +1,34 @@
+% Standalone preview document for a single table fragment.
+%
+% Usage (from this directory):
+%     ./preview.sh                                  % previews simulation_table_flips50.tex
+%     ./preview.sh simulation_table_metrics50.tex   % previews any other table fragment
+%
+% The table file to include is set by \tablefile; the default below is used when
+% the script does not override it on the command line.
+\providecommand{\tablefile}{simulation_table_flips50}
+
+\documentclass[11pt]{article}
+
+% Wide page with thin margins: the simulation tables are much wider than a
+% portrait text block, and \resizebox scales the table to \textwidth. Widen
+% paperwidth to make the table bigger; raise paperheight if a taller table
+% spills onto a second page. (Do not add geometry's "landscape" option here --
+% it swaps paperwidth and paperheight.)
+\usepackage[paperwidth=12in,paperheight=11in,margin=1cm]{geometry}
+
+\usepackage{graphicx}   % \resizebox
+\usepackage{makecell}   % \makecell (two-line iMSE / runtime cells)
+\usepackage{amsmath}
+\usepackage{booktabs}   % harmless; available if a fragment uses \toprule etc.
+\usepackage{multirow}
+
+\pagestyle{empty}
+
+\begin{document}
+
+% The fragment is a [htbp] float; on an otherwise empty page it lands on page 1.
+% (No center/minipage wrapper here: floats are not allowed inside those.)
+\input{\tablefile}
+
+\end{document}

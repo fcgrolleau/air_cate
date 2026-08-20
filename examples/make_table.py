@@ -21,7 +21,7 @@ COL_HEADERS = [
     "TP",
     "T-learner",
     "S-learner",
-    "grf",
+    "grf package",
 ]
 # Spans must sum to len(METHODS); col_spec below derives its width from that too.
 GROUP_HEADERS = [
@@ -57,69 +57,74 @@ def compute_stats(entries):
     return mean, se, mean_rt, se_rt
 
 
+# One fixed precision per quantity, applied to every cell in the table. Fixed
+# beats per-cell precision here: a column where 0.1000 sits under 0.0503 reads as
+# one scale the eye can scan down, whereas 0.1 under 0.0503 invites the reader to
+# compare digit positions instead of values. Trailing zeros are the point, not
+# noise. Runtimes span 0.3s to ~20000s, so they carry one decimal -- enough to
+# separate the sub-second baselines without printing false precision on the
+# five-digit CSF timings.
+IMSE_DECIMALS = 4
+RUNTIME_DECIMALS = 1
+
+
 def _fmt_val(v, decimals):
     return f"{v:.{decimals}f}"
 
 
-# Approximate an SE only when it is genuinely beyond the table's resolution.
-# Everything above this gets printed as a number, at whatever precision that takes,
-# so the reader never sees a bound in one cell and 0.0001 in the next.
-SE_APPROX_BELOW = 1e-5
-SE_MAX_DECIMALS = 5
+def _fmt_floor(v, decimals, bold=False):
+    """Fixed-precision value, or a "<" bound when it would round to zero.
 
+    A printed 0.0 makes two false claims -- an instantaneous fit, or a zero
+    standard error -- so anything below the column's resolution is reported as a
+    bound at that resolution instead ("<0.1", "<0.0001"). The zero test is on the
+    formatted string rather than a threshold, so it stays correct if the decimal
+    counts above ever change.
 
-def _se_decimals(se, decimals):
-    """Decimals for the SE: the mean's precision, widened only if that shows zero.
-
-    An SE is conventionally reported at the same precision as the estimate it
-    belongs to, and that is what keeps a row readable. It breaks only when the SE
-    is finer than the estimate's last digit: 0.0004 beside a mean of 0.145 would
-    print as 0.000, which reads as a zero standard error. In that case, and only
-    then, add decimals -- and stop at the first precision that shows something, so
-    an SE of 9e-5 prints as 0.0001 rather than 0.00009 and stays flush with the
-    rest of the column. Cells that already print a real number are left at the
-    mean's precision instead of sprouting digits.
-
-    The zero test is on the formatted string, not a threshold, so it stays correct
-    if the decimal counts in fmt_imse ever change.
+    bold matters because \\textbf does not reach inside math mode: wrapping $<0.1$
+    in \\textbf leaves it roman while the digits around it turn bold. \\boldsymbol
+    (amsmath) is the math-mode equivalent. The {<} braces make < an ordinary
+    symbol rather than a relation, dropping the thin space TeX would otherwise
+    insert after the opening parenthesis.
     """
-    for d in range(decimals, SE_MAX_DECIMALS + 1):
-        if float(_fmt_val(se, d)) != 0:
-            return d
-    return SE_MAX_DECIMALS
-
-
-def fmt_se(se, decimals, bold=False):
-    """SE text, or a bound when it is below the table's resolution entirely.
-
-    bold matters because \\textbf does not reach inside math mode: wrapping
-    $10^{-5}$ in \\textbf leaves it roman while the digits around it turn bold.
-    \\boldsymbol (amsmath) is the math-mode equivalent. The {<} braces make < an
-    ordinary symbol rather than a relation, dropping the thin space TeX would
-    otherwise insert after the opening parenthesis.
-    """
-    if math.isnan(se):
-        return "---"
-    if se < SE_APPROX_BELOW:
-        bound = rf"{{<}}10^{{-{SE_MAX_DECIMALS}}}"
-        return rf"$\boldsymbol{{{bound}}}$" if bold else f"${bound}$"
-    return _fmt_val(se, _se_decimals(se, decimals))
+    text = _fmt_val(v, decimals)
+    if float(text) != 0:
+        return text
+    bound = rf"{{<}}{_fmt_val(10.0**-decimals, decimals)}"
+    return rf"$\boldsymbol{{{bound}}}$" if bold else f"${bound}$"
 
 
 def fmt_imse(mean, se, bold=False):
     if math.isnan(mean):
         return "---"
-    if mean >= 1:
-        decimals = 2
-    elif mean >= 0.1:
-        decimals = 3
-    else:
-        decimals = 4
-    return f"{_fmt_val(mean, decimals)} ({fmt_se(se, decimals, bold=bold)})"
+    mean_str = _fmt_floor(mean, IMSE_DECIMALS, bold=bold)
+    se_str = "---" if math.isnan(se) else _fmt_floor(se, IMSE_DECIMALS, bold=bold)
+    return f"{mean_str} ({se_str})"
 
 
-def fmt_runtime(rt, se_rt):
-    return f"{rt:.0f}s ({se_rt:.0f}s)"
+def fmt_runtime(rt, se_rt, bold=False):
+    """Mean runtime and its SE, both in seconds.
+
+    The trailing "s" is repeated on the SE so neither number can be mistaken for
+    the iMSE line directly above it in the same cell.
+    """
+    mean_str = _fmt_floor(rt, RUNTIME_DECIMALS, bold=bold)
+    se_str = _fmt_floor(se_rt, RUNTIME_DECIMALS, bold=bold)
+    return f"{mean_str}s ({se_str}s)"
+
+
+def best_methods(values, decimals):
+    """Methods tied for the lowest value *as printed* at `decimals` places.
+
+    Bolding a strict argmin looks arbitrary whenever a competitor rounds to the
+    same printed number -- routine among the sub-second RSF runtimes, where two
+    methods can both land on "<0.1s". Comparing formatted strings marks every
+    method the reader has no way to distinguish in the table.
+    """
+    if not values:
+        return set()
+    target = _fmt_val(min(values.values()), decimals)
+    return {m for m, v in values.items() if _fmt_val(v, decimals) == target}
 
 
 def _n_replications(results):
@@ -143,10 +148,12 @@ def make_table(results, n_values):
     lines = []
     lines.append(r"\begin{table}[htbp]")
     lines.append(r"\centering")
-    lines.append(rf"\caption{{Mean iMSE (SE) and average runtime in seconds (SE) across {n_reps} replications "
-                 r"for each combination of DGP, sample size, and method. "
-                 r"The lowest iMSE in each row is shown in bold. "
-                 r"Runtimes measured on a single core of an AMD EPYC 7502 CPU (2.5\,GHz base).}")
+    lines.append(rf"\caption{{Accuracy and cost across {n_reps} replications for each combination of DGP, "
+                 r"sample size, and method. Each cell reports the mean iMSE (SE) on the first line and the "
+                 r"mean runtime in seconds (SE) on the second. Within each row, the lowest iMSE and the "
+                 r"shortest runtime are shown in bold. Values below the displayed precision are reported as "
+                 r"a bound rather than rounded to zero. Runtimes measured on a single core of an "
+                 r"AMD EPYC 7502 CPU (2.5\,GHz base).}")
     lines.append(r"\label{tab:simulation}")
     lines.append(r"\resizebox{\textwidth}{!}{%")
 
@@ -183,9 +190,15 @@ def make_table(results, n_values):
                 entries = results.get(dgp, {}).get(method, {}).get(n_str, [])
                 stats[method] = compute_stats(entries)
 
-            # Find best (lowest mean iMSE)
+            # Best iMSE and best runtime are marked independently. Both are
+            # restricted to methods that actually ran at this n: a cell with no
+            # replications has a 0.0 runtime from compute_stats, which would
+            # otherwise win the runtime comparison outright.
             valid = {m: s[0] for m, s in stats.items() if not math.isnan(s[0])}
-            best_method = min(valid, key=valid.get) if valid else None
+            best_imse = best_methods(valid, IMSE_DECIMALS)
+            best_runtime = best_methods(
+                {m: stats[m][2] for m in valid}, RUNTIME_DECIMALS
+            )
 
             # Format n with thousands separator
             n_fmt = f"{n:,}".replace(",", r"{\,}")
@@ -195,20 +208,23 @@ def make_table(results, n_values):
             cells = [dgp_label, f"${n_fmt}$"]
             for method in METHODS:
                 mean, se, rt, se_rt = stats[method]
-                # A cell with no replications has no runtime either. compute_stats
-                # returns 0.0 for it, which would print as "0s (0s)" and read as an
-                # instantaneous fit rather than a method that was not run at this n.
+                # No replications means no runtime either, so the whole cell is a
+                # dash rather than a runtime line under an em dash.
                 if math.isnan(mean):
                     cells.append("---")
                     continue
-                is_best = method == best_method
-                imse_str = fmt_imse(mean, se, bold=is_best)
-                rt_str = fmt_runtime(rt, se_rt)
-                cell = f"{imse_str}"
-                if is_best:
-                    cell = rf"\textbf{{{cell}}}"
-                cell = rf"\makecell{{{cell} \\ \scriptsize {rt_str}}}"
-                cells.append(cell)
+
+                imse_bold = method in best_imse
+                imse_str = fmt_imse(mean, se, bold=imse_bold)
+                if imse_bold:
+                    imse_str = rf"\textbf{{{imse_str}}}"
+
+                rt_bold = method in best_runtime
+                rt_str = fmt_runtime(rt, se_rt, bold=rt_bold)
+                if rt_bold:
+                    rt_str = rf"\textbf{{{rt_str}}}"
+
+                cells.append(rf"\makecell{{{imse_str} \\ \scriptsize {rt_str}}}")
 
             lines.append(" & ".join(cells) + r" \\")
 

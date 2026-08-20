@@ -61,7 +61,12 @@ from scipy.stats import t as t_dist
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator, MultipleLocator
+from matplotlib.ticker import (
+    LogFormatterSciNotation,
+    LogLocator,
+    MaxNLocator,
+    MultipleLocator,
+)
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -276,8 +281,8 @@ METRIC_SPECS = {
     ),
     "h1": dict(
         key="h1", stem="simulation_convergence_h1",
-        mean_label=r"Mean $\|\hat\tau - \tau\|_{H^1}$",
-        var_label=r"Variance of mean $\|\hat\tau - \tau\|_{H^1}$",
+        mean_label=r"Mean $H^1$ error",
+        var_label=r"Variance of mean $H^1$ error",
         log_y=True, ref="pop_avg",
     ),
     "excess": dict(
@@ -867,6 +872,46 @@ def _pop_avg_metric(dgp_class, X_test, M, metric="imse"):
     return curve_metrics(tau_bar, tau_true, delta)[metric]
 
 
+# A log axis spanning barely a decade gets ONE labelled tick out of LogLocator: the
+# IST-3 H^1 panel runs from about 0.35 to 4.5 and was labelled "10^0" and nothing else,
+# leaving no scale to read the curve separations against. Matplotlib labels minor ticks
+# instead once the span falls under LogFormatter's `minor_thresholds`, but the default
+# (1, 0.4) decades is tighter than the spans that actually occur here, so the panel fell
+# in the gap.
+#
+# Raising the subset threshold to 2 decades closes it: a span of 2 decades or more
+# necessarily contains two decade boundaries, so the majors alone already label such an
+# axis and the minor formatter stays silent there -- the deep variance panels, spanning
+# ~5 decades, are untouched.
+#
+# The minor LOCATOR is pinned to 2 and 3 because those are the mantissas the formatter
+# will actually label in that middle regime: for base 10 it labels the rounded
+# geomspace(1, 10, 6), i.e. {1, 2, 3, 4, 6}, and notably NOT 5. Locating minors at the
+# conventional 2/3/5 therefore left the 5s as ticks that never receive a number, which
+# reads as an arbitrary unlabelled gridline. Pinning the subs also bounds the
+# formatter's "label everything" regime (spans under 0.8 decades), which would otherwise
+# be free to put eight labels inside one decade.
+LOG_MINOR_SUBS = (2.0, 3.0)
+LOG_MINOR_THRESHOLDS = (2.0, 0.8)
+
+
+def _label_narrow_log_axis(ax):
+    """Add labelled minor y ticks so a narrow log axis shows more than one number.
+
+    A no-op in appearance on wide axes: the formatter reads the axis span at draw
+    time and labels only decade boundaries when the span is 2 decades or more.
+    """
+    ax.yaxis.set_minor_locator(
+        LogLocator(base=10.0, subs=LOG_MINOR_SUBS, numticks=12)
+    )
+    ax.yaxis.set_minor_formatter(
+        LogFormatterSciNotation(base=10.0, minor_thresholds=LOG_MINOR_THRESHOLDS)
+    )
+    # A step below the major labels (12), so the decade boundaries still read as the
+    # primary scale.
+    ax.tick_params(axis="y", which="minor", labelsize=10)
+
+
 def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None,
                      metric="imse"):
     """Multi-panel convergence plot: metric mean (top) and variance (bottom) per DGP.
@@ -1023,6 +1068,13 @@ def plot_convergence(results, n_values, cfg, X_tests, figures_dir=None,
         if step is not None:
             ax_mean[col].yaxis.set_major_locator(MultipleLocator(step))
 
+        # After the scales and any limit override above, so the tick machinery is
+        # attached to the axis in its final state. The mean row is skipped when it is
+        # linear (Excess), where MultipleLocator already gives it several ticks.
+        if spec["log_y"]:
+            _label_narrow_log_axis(ax_mean[col])
+        _label_narrow_log_axis(ax_var[col])
+
         ax_mean[col].set_title(f"{dgp_name} DGP", fontsize=14,
                                 fontweight="bold", pad=8)
         ax_var[col].set_xlabel("Sample size", fontsize=15)
@@ -1169,10 +1221,11 @@ def plot_sign_reversals(results, n_values, figures_dir=None,
     (`key_hat` / `key_true`), so nothing is recomputed from the DGP and no test set is
     needed -- which is also what lets this figure be re-plotted on a machine without the
     gitignored IST-3 embedding artifact. The target line is drawn at the truth's own
-    count rather than assumed: in all three DGPs here it lands on exactly 0, because tau
-    is a difference of Weibull survivals sharing a shape and differing only in scale and
-    those are strictly ordered for all t > 0. Reading it from the file rather than
-    hard-coding 0 keeps the figure honest if a future DGP does cross.
+    count rather than assumed: in all three DGPs here it lands on exactly 0, since no
+    subject's true tau crosses zero inside the observation window. That is structural
+    on Weibull and IST-3, and merely a property of the window on Mixture -- see the
+    `air_cate.metrics` docstring. Reading it from the file rather than hard-coding 0
+    keeps the figure honest if a future DGP, or a longer horizon, does cross.
 
     One row per DGP, one COLUMN per entry of SIGN_REVERSAL_COLUMNS, so the tolerances sit
     side by side and the left-to-right change within a row is the band width and nothing
@@ -1274,7 +1327,17 @@ def plot_sign_reversals(results, n_values, figures_dir=None,
         # since every panel plots it.
         axes[row][0].set_ylabel(f"{dgp_name} DGP", fontsize=14, fontweight="bold")
 
-    fig.supylabel("Average number of treatment-effect sign reversals", fontsize=15)
+    # "Spurious" is licensed by the truth's own count being exactly 0 on all three of this
+    # study's DGPs -- asserted in tests/test_metrics.py -- so every reversal a method draws
+    # here is an artifact of that method, and the raw count and the excess over the truth
+    # coincide. Deliberately NOT called an "excess": that word already names the
+    # DIRECTION-reversal difference in this study's other figures, a different rule. The
+    # target line is still read from the file, so a DGP that does cross would need this
+    # wording changed along with it.
+    fig.supylabel(
+        "Average number of spurious treatment-effect sign reversals per subject",
+        fontsize=15,
+    )
 
     handles, labels = _ordered_legend_handles(axes[0][0])
     fig.legend(handles, labels, loc="lower center", ncol=4,

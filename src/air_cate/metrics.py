@@ -32,15 +32,26 @@ counted here, at a grid of tolerances h, because the distinction is easy to lose
     reverses sign.
 
 In this study's three DGPs the true tau has, per subject, exactly zero sign reversals
-and about one direction reversal. That is structural, not incidental: all three define
-tau = S_1 - S_0 as a difference of Weibull survivals that share a shape parameter and
-differ only in scale, and two such survival curves are strictly ordered for every
-t > 0. So each subject's tau rises from 0 to a peak and decays back toward 0 without
-touching zero in between. The population still contains harmed and helped subjects
-(Weibull splits 44.8/55.2 across subjects, IST-3 8.6/91.4) -- that is a
-cross-sectional spread, not a temporal crossing. Any nonzero sign-reversal count on
-these DGPs is therefore spurious by construction, which is what makes it worth
-reporting; do not carry that guarantee over to a DGP outside this family.
+within the observation window, and between a half and one direction reversal (measured:
+1.00 per subject on Weibull, 0.51 on Mixture, 0.55 on IST-3). Each subject's tau rises
+from 0 to a peak and decays back toward 0 without touching zero in between, so any
+nonzero sign-reversal count on these DGPs is spurious -- which is what makes it worth
+reporting.
+
+Why the zero holds differs by DGP, and the difference matters if the window ever moves.
+On Weibull and IST-3 it is structural for every t > 0: both build tau = S_1 - S_0 from
+arms that share the per-subject Weibull shape and differ only in scale, and two such
+survival curves are strictly ordered everywhere. Mixture is NOT in that family -- its
+arms differ in mixture weights as well as in scale, over components of different shapes
+(1, 2, 3) -- and its true tau does reverse sign, at t ~ 16.3 for x_0 = 0, x_1 = -1, well
+past t_end = 5. Inside [0, 5] no subject carries both signs at any magnitude, and the
+excursion beyond the crossing peaks near 1e-4, so any h >= 0.01 would filter it in any
+case; the zero is nonetheless the window's doing there, not the family's.
+
+The population still contains harmed and helped subjects (55.2% harmed on Weibull,
+44.8% on Mixture, 8.6% on IST-3) -- a cross-sectional spread, not a temporal crossing.
+Do not carry the zero over to a DGP outside the shared-shape family, or to a longer
+horizon.
 
 Three properties of these metrics to keep in view when reporting them:
 
