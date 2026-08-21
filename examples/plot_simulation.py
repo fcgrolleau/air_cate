@@ -320,17 +320,20 @@ METRIC_SPECS = {
 # is read from the same file as the curves rather than recomputed from the DGP. Adding
 # a fourth column is now a re-plot rather than a re-run, provided its tolerance is in
 # `metrics.H_GRID` -- which is the whole reason that grid is dense.
-# Titles put the words first and the symbol in parentheses, in all three. The panel titles
-# are bold and mathtext under the `cm` fontset does not take a bold weight, so a title
-# LEADING with $h = 0.02$ renders half-bold; leading with the phrase keeps the three
-# headers looking like a set.
+# Titles are plain prose: no symbol for the band and no numeric value of it. The value
+# would be redundant anyway -- tau is a difference of survival probabilities, so
+# "2 percentage points" already names the band exactly -- and a reader of the figure has
+# no definition of a symbol in front of them, only the caption. There is a rendering
+# reason to keep them symbol-free as well: the panel titles are bold, and mathtext under
+# the `cm` fontset does not take a bold weight, so any $...$ put back here renders
+# half-bold against the words around it.
 SIGN_REVERSAL_COLUMNS = [
     dict(key_hat="flip_hat_abs_p0", key_true="flip_true_abs_p0",
-         title="No tolerance ($h = 0$)"),
+         title="No tolerance"),
     dict(key_hat="flip_hat_abs_p2", key_true="flip_true_abs_p2",
-         title="Tolerance 2 percentage points ($h = 0.02$)"),
+         title="Tolerance 2 percentage points"),
     dict(key_hat="flip_hat_abs_p5", key_true="flip_true_abs_p5",
-         title="Tolerance 5 percentage points ($h = 0.05$)"),
+         title="Tolerance 5 percentage points"),
 ]
 
 
@@ -1334,9 +1337,18 @@ def plot_sign_reversals(results, n_values, figures_dir=None,
     # DIRECTION-reversal difference in this study's other figures, a different rule. The
     # target line is still read from the file, so a DGP that does cross would need this
     # wording changed along with it.
+    #
+    # "Recommendation reversals" is the clinical reading of the quantity, which is still
+    # exactly the sign-reversal count of `metrics.n_sign_reversals`: the sign of tau is
+    # which arm the effect favours, so a sign reversal IS the recommendation flipping.
+    #
+    # Larger than the other text because it names the quantity for all nine panels. The
+    # label is rotated, so what has to fit is its length against the figure HEIGHT
+    # (4.3in per row); at this size the string occupies well under half of it, and
+    # bbox_inches="tight" below extends the canvas rather than clipping it.
     fig.supylabel(
-        "Average number of spurious treatment-effect sign reversals per subject",
-        fontsize=15,
+        "Mean spurious recommendation reversals per subject",
+        fontsize=19,
     )
 
     handles, labels = _ordered_legend_handles(axes[0][0])
