@@ -112,6 +112,16 @@ class AIREstimator:
             Costs about `n_restarts` times the CATE stage. The nuisance stage is
             unaffected, so the multiplier is smaller for cross-fitted fits than for
             ones given oracle nuisances.
+        aux_loss_fn: Optional auxiliary penalty added to the CATE objective, forwarded
+            verbatim to `train_cate` for both the selection fit and the full-data
+            refit. See `train_cate` for the call signature. None leaves the objective
+            and the recorded history identical to an unhooked run.
+        aux_in_monitor: Whether that penalty also enters the monitored series that
+            early stopping and best-epoch selection read. Set it True whenever
+            `aux_loss_fn` is in use: monitoring the pure R-loss while optimizing
+            R + penalty makes `restore_best` hand back the least-penalized epoch,
+            silently undoing the penalty. It also moves `refit_epochs_`, since the
+            step-matched budget is derived from `history_["best_epoch"]`.
 
     Attributes (after fit):
         cate_model_: The fitted CATE model. The winning restart, or -- with
@@ -155,6 +165,8 @@ class AIREstimator:
         n_restarts: int = 1,
         cate_model_class=None,
         cate_model_kwargs: dict | None = None,
+        aux_loss_fn=None,
+        aux_in_monitor: bool = False,
     ):
         self.K = K
         self.M = M
@@ -188,6 +200,8 @@ class AIREstimator:
         self.n_restarts = n_restarts
         self.cate_model_class = cate_model_class
         self.cate_model_kwargs = cate_model_kwargs or {}
+        self.aux_loss_fn = aux_loss_fn
+        self.aux_in_monitor = bool(aux_in_monitor)
 
         self.cate_model_ = None
         self.time_grid_ = None
@@ -365,6 +379,8 @@ class AIREstimator:
                 patience=self.patience,
                 rng_seed=restart_seed,
                 verbose=verbose,
+                aux_loss_fn=self.aux_loss_fn,
+                aux_in_monitor=self.aux_in_monitor,
             )
 
             # Rank restarts by whatever early stopping itself selected the epoch on:
@@ -447,6 +463,12 @@ class AIREstimator:
                 patience=None,
                 rng_seed=self.rng_seed,
                 verbose=verbose,
+                # Forwarding to the refit is mandatory rather than tidy: under
+                # cate_refit_full this model IS the estimator that gets returned, so
+                # omitting the penalty here would hand back an unpenalized model
+                # sitting behind a penalized selection history.
+                aux_loss_fn=self.aux_loss_fn,
+                aux_in_monitor=self.aux_in_monitor,
             )
             self.cate_model_ = model
 

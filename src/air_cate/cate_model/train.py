@@ -38,6 +38,8 @@ def train_cate(
     restore_best: bool = True,
     rng_seed: int | None = None,
     verbose: int = 0,
+    aux_loss_fn=None,
+    aux_in_monitor: bool = False,
 ) -> dict:
     """Minimize the empirical R-loss over a CATE model via minibatch AdamW.
 
@@ -64,6 +66,28 @@ def train_cate(
         restore_best: Restore the weights from the best epoch when done.
         rng_seed: Seed for minibatch shuffling. None uses fresh entropy.
         verbose: Verbosity level (0=silent).
+        aux_loss_fn: Optional auxiliary penalty added to the optimized objective,
+            called as
+
+                aux_loss_fn(model, trainable_vars, non_trainable_vars,
+                            X_batch, time_grid, tau_pred) -> scalar
+
+            and expected to return its terms already multiplied by their own
+            coefficients. `model` is passed in rather than captured so that one hook
+            object stays valid across restarts and across the full-data refit, each
+            of which builds a fresh model; inside the jitted step the model's
+            `v.value` is stale, so use it only for structure and take every numeric
+            input from `trainable_vars`. None (the default) leaves the objective, the
+            returned history and the emitted HLO identical to the unhooked loop.
+        aux_in_monitor: Add the penalty to the monitored series that drives early
+            stopping and best-epoch selection. Leave False to monitor the pure
+            R-loss; set True whenever a penalty is actually in use. This is not a
+            symmetry question: a penalty deliberately moves the fit off the R-loss
+            optimum, so a pure-R monitor *rises* as the penalty bites and
+            `restore_best` then hands back the least-penalized epoch -- silently
+            undoing the penalty and making every penalised run look inert. The
+            monitored values are not comparable across penalty strengths, which is
+            why `train_loss` and `val_loss` below stay pure R-loss.
 
     Returns:
         history: dict with keys
@@ -72,9 +96,17 @@ def train_cate(
                 per epoch). Still a running average over the epoch's parameter
                 trajectory rather than the loss at a single parameter value.
             val_loss: list of per-epoch validation R-loss, or None.
+            train_aux: list of per-epoch auxiliary penalty, size-weighted exactly
+                like train_loss. All zeros when aux_loss_fn is None.
+            val_aux: list of per-epoch validation penalty, or None.
+            monitored_loss: the series actually minimized over to choose
+                best_epoch. Element-wise equal to train_loss or val_loss when
+                aux_in_monitor is False.
+            aux_in_monitor: the resolved flag, so an archived history records which
+                series best_epoch came from.
             best_epoch: 0-indexed epoch minimizing the monitored loss.
-            best_train_loss: training loss at best_epoch.
-            best_val_loss: validation loss at best_epoch, or None.
+            best_train_loss: training loss at best_epoch (pure R-loss).
+            best_val_loss: validation loss at best_epoch (pure R-loss), or None.
             stopped_epoch: 0-indexed final epoch actually run.
             monitor: the resolved monitor string.
     """
@@ -99,21 +131,55 @@ def train_cate(
     model({"X": X_jax[:1], "time_grid": time_grid_jax})
     optimizer.build(model.trainable_variables)
 
-    @jax.jit
-    def train_step(
-        trainable_vars, non_trainable_vars, opt_vars,
-        X_batch, Y_tilde_batch, S_marg_batch, W_batch, e_batch,
-    ):
-        def loss_fn(trainable_vars):
-            tau_pred, _ = model.stateless_call(
-                trainable_vars, non_trainable_vars,
-                {"X": X_batch, "time_grid": time_grid_jax},
-            )
-            return r_loss(tau_pred, Y_tilde_batch, S_marg_batch, W_batch, e_batch, delta)
+    # Two separate jitted steps rather than one with a branch inside the traced
+    # function: the aux_loss_fn=None branch then keeps the exact closure and body it
+    # had before this hook existed, so the unhooked objective and the emitted HLO are
+    # unchanged. `has_aux=True` alters the traced output structure, which is why the
+    # None path does not simply reuse the penalised body with a zero penalty.
+    if aux_loss_fn is None:
 
-        loss, grads = jax.value_and_grad(loss_fn)(trainable_vars)
-        trainable_vars, opt_vars = optimizer.stateless_apply(opt_vars, grads, trainable_vars)
-        return loss, trainable_vars, opt_vars
+        @jax.jit
+        def train_step(
+            trainable_vars, non_trainable_vars, opt_vars,
+            X_batch, Y_tilde_batch, S_marg_batch, W_batch, e_batch,
+        ):
+            def loss_fn(trainable_vars):
+                tau_pred, _ = model.stateless_call(
+                    trainable_vars, non_trainable_vars,
+                    {"X": X_batch, "time_grid": time_grid_jax},
+                )
+                return r_loss(tau_pred, Y_tilde_batch, S_marg_batch, W_batch, e_batch, delta)
+
+            loss, grads = jax.value_and_grad(loss_fn)(trainable_vars)
+            trainable_vars, opt_vars = optimizer.stateless_apply(opt_vars, grads, trainable_vars)
+            # A constant second output keeps the caller's unpacking uniform without
+            # entering the traced gradient computation.
+            return loss, jnp.zeros((), dtype=loss.dtype), trainable_vars, opt_vars
+
+    else:
+
+        @jax.jit
+        def train_step(
+            trainable_vars, non_trainable_vars, opt_vars,
+            X_batch, Y_tilde_batch, S_marg_batch, W_batch, e_batch,
+        ):
+            def loss_fn(trainable_vars):
+                tau_pred, _ = model.stateless_call(
+                    trainable_vars, non_trainable_vars,
+                    {"X": X_batch, "time_grid": time_grid_jax},
+                )
+                r = r_loss(tau_pred, Y_tilde_batch, S_marg_batch, W_batch, e_batch, delta)
+                aux = aux_loss_fn(
+                    model, trainable_vars, non_trainable_vars,
+                    X_batch, time_grid_jax, tau_pred,
+                )
+                # Gradient descends r + aux; the two are reported separately so the
+                # history can keep train_loss pure.
+                return r + aux, (r, aux)
+
+            (_, (r, aux)), grads = jax.value_and_grad(loss_fn, has_aux=True)(trainable_vars)
+            trainable_vars, opt_vars = optimizer.stateless_apply(opt_vars, grads, trainable_vars)
+            return r, aux, trainable_vars, opt_vars
 
     @jax.jit
     def eval_step(
@@ -124,7 +190,17 @@ def train_cate(
             trainable_vars, non_trainable_vars,
             {"X": X_eval, "time_grid": time_grid_jax},
         )
-        return r_loss(tau_pred, Y_tilde_eval, S_marg_eval, W_eval, e_eval, delta)
+        r = r_loss(tau_pred, Y_tilde_eval, S_marg_eval, W_eval, e_eval, delta)
+        # `aux_loss_fn` is a closure constant, so this branch resolves at trace time
+        # and emits nothing. No gradient is taken here, so unlike train_step the two
+        # cases can share one body.
+        if aux_loss_fn is None:
+            return r, jnp.zeros((), dtype=r.dtype)
+        aux = aux_loss_fn(
+            model, trainable_vars, non_trainable_vars,
+            X_eval, time_grid_jax, tau_pred,
+        )
+        return r, aux
 
     if validation_data is not None:
         val_args = (
@@ -139,6 +215,9 @@ def train_cate(
 
     train_history: list[float] = []
     val_history: list[float] = [] if validation_data is not None else None
+    train_aux_history: list[float] = []
+    val_aux_history: list[float] = [] if validation_data is not None else None
+    monitored_history: list[float] = []
 
     best_loss = float("inf")
     best_epoch = 0
@@ -150,6 +229,7 @@ def train_cate(
         stopped_epoch = epoch
         perm = rng.permutation(n)
         epoch_loss_sum = 0.0
+        epoch_aux_sum = 0.0
 
         for start in range(0, n, batch_size):
             idx = perm[start : start + batch_size]
@@ -159,7 +239,7 @@ def train_cate(
             ntv = _extract_vars(model.non_trainable_variables)
             ov = _extract_vars(optimizer.variables)
 
-            loss, new_tv, new_ov = train_step(
+            loss, aux, new_tv, new_ov = train_step(
                 tv, ntv, ov,
                 X_jax[idx],
                 Y_tilde_jax[idx],
@@ -182,26 +262,38 @@ def train_cate(
             # Size-weighting makes each subject count once per epoch, so the epoch
             # loss is shuffle-invariant.
             epoch_loss_sum += float(loss) * len(idx)
+            epoch_aux_sum += float(aux) * len(idx)
 
         mean_loss = epoch_loss_sum / n
+        mean_aux = epoch_aux_sum / n
         train_history.append(mean_loss)
+        train_aux_history.append(mean_aux)
 
         if validation_data is not None:
-            val_loss = float(
-                eval_step(
-                    _extract_vars(model.trainable_variables),
-                    _extract_vars(model.non_trainable_variables),
-                    *val_args,
-                )
+            val_r, val_aux = eval_step(
+                _extract_vars(model.trainable_variables),
+                _extract_vars(model.non_trainable_variables),
+                *val_args,
             )
-            val_history.append(val_loss)
+            val_history.append(float(val_r))
+            val_aux_history.append(float(val_aux))
 
-        monitored = val_history[-1] if monitor == "val" else mean_loss
+        # The monitored series is what best_epoch and `patience` read. It picks up the
+        # penalty only under aux_in_monitor, so an unhooked run is bit-identical.
+        if monitor == "val":
+            monitored = val_history[-1] + (val_aux_history[-1] if aux_in_monitor else 0.0)
+        else:
+            monitored = mean_loss + (mean_aux if aux_in_monitor else 0.0)
+        monitored_history.append(monitored)
 
         if verbose > 0 and (epoch + 1) % 10 == 0:
             msg = f"Epoch {epoch + 1}/{epochs}, loss: {mean_loss:.6f}"
             if validation_data is not None:
                 msg += f", val_loss: {val_history[-1]:.6f}"
+            if aux_loss_fn is not None:
+                msg += f", aux: {mean_aux:.6f}"
+                if validation_data is not None:
+                    msg += f", val_aux: {val_aux_history[-1]:.6f}"
             print(msg)
 
         # Snapshot non-trainable variables too: harmless today (no BN in the
@@ -257,6 +349,10 @@ def train_cate(
     return {
         "train_loss": train_history,
         "val_loss": val_history,
+        "train_aux": train_aux_history,
+        "val_aux": val_aux_history,
+        "monitored_loss": monitored_history,
+        "aux_in_monitor": bool(aux_in_monitor),
         "best_epoch": best_epoch,
         "best_train_loss": train_history[best_epoch],
         "best_val_loss": val_history[best_epoch] if val_history is not None else None,
