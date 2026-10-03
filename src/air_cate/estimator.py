@@ -148,6 +148,7 @@ class AIREstimator:
         M: int = 100,
         n_folds: int = 5,
         eps: float = 0.01,
+        eps_prop: float | None = None,
         encoder_hidden_sizes: tuple[int, ...] = (64, 32),
         propensity_config: dict | None = None,
         weibull_config: dict | None = None,
@@ -172,6 +173,11 @@ class AIREstimator:
         self.M = M
         self.n_folds = n_folds
         self.eps = eps
+        # Separate propensity floor, defaulting to `eps`. The two floors want opposite
+        # values: large for the censoring tail, small to keep mean(W - e) near zero so
+        # the R-loss's uncentred projection does not pick up a mean-product bias term.
+        # See compute_pseudo_outcomes for the measurements.
+        self.eps_prop = eps_prop
         self.encoder_hidden_sizes = encoder_hidden_sizes
         self.propensity_config = propensity_config
         self.weibull_config = weibull_config
@@ -274,7 +280,8 @@ class AIREstimator:
 
         # Step 3: Compute pseudo-outcomes
         Y_tilde, S_marg, e_clipped = compute_pseudo_outcomes(
-            data, nuisances, self.time_grid_, self.delta_, eps=self.eps
+            data, nuisances, self.time_grid_, self.delta_, eps=self.eps,
+            eps_prop=self.eps_prop,
         )
 
         # Step 3b: optional honest validation split for the CATE stage.

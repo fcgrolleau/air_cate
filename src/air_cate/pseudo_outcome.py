@@ -12,6 +12,7 @@ def compute_pseudo_outcomes(
     time_grid: jnp.ndarray,
     delta: float,
     eps: float = 0.01,
+    eps_prop: float | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Compute discretized AIPCW pseudo-outcomes on the time grid.
 
@@ -20,7 +21,24 @@ def compute_pseudo_outcomes(
         nuisances: Cross-fitted nuisance estimates.
         time_grid: (M+1,) uniform grid on [0, t_end].
         delta: Grid step size.
-        eps: Clipping bound for numerical stability.
+        eps: Clipping bound for the SURVIVAL floors -- event and censoring, on the
+            grid and at Z -- and the default for the propensity clip.
+        eps_prop: Separate clipping bound for the propensity, defaulting to `eps` so
+            existing callers are unaffected.
+
+            Split out because the two floors want OPPOSITE values and one knob cannot
+            serve both. Measured on a Stanford CAD cohort (n = 2909 training rows,
+            P(W=1) = 0.717): raising eps repairs the censoring tail -- the IPCW
+            identity mean(1{Z>t}/S_cens) / S_KM(t) runs 2.04 at eps = 0.05 but
+            1.03-1.22 at eps = 0.20 -- while simultaneously wrecking the propensity,
+            because clipping an imbalanced cohort into [eps, 1-eps] drags mean(e) away
+            from mean(W) and makes mean(W - e) grow 0.014 -> 0.075 -> 0.217.
+
+            That matters because the R-loss's covariate-independent minimiser is the
+            UNCENTRED projection sum_i (W-e) r / sum_i (W-e)^2, which decomposes as
+            ( cov(W-e, r) + mean(W-e)*mean(r) ) / ( var(W-e) + mean(W-e)^2 ). The
+            second numerator term has no causal content, and at eps = 0.20 it was
+            0.0868 of a 0.0785 total -- more than the whole estimate.
 
     Returns:
         Y_tilde: (n, M+1) pseudo-outcome matrix.
@@ -33,8 +51,10 @@ def compute_pseudo_outcomes(
     n = W.shape[0]
     M = len(time_grid) - 1
 
-    # Clip nuisances
-    e_clipped = clip_propensity(nuisances.e_hat, eps)
+    # Clip nuisances. The propensity floor is deliberately separable from the survival
+    # floors below -- see `eps_prop`. None reproduces the single-knob behaviour.
+    eps_prop = eps if eps_prop is None else eps_prop
+    e_clipped = clip_propensity(nuisances.e_hat, eps_prop)
 
     # Select arm-specific survivals based on treatment assignment
     # W is (n,), broadcast to select arm-specific arrays
