@@ -41,12 +41,41 @@ class WeibullAFT:
             pseudo-outcome directly. Worth turning on for the censoring model
             whenever the censoring shape is not believed to vary with x; leave it
             off for an event process with covariate-dependent shape.
+        normalize_time: Divide T by a scale (default max(T)) before fitting, and
+            divide every `survival` query by the same scale, so the fitted parameters
+            live on a unit time axis. ON by default, because the un-normalized
+            behaviour is a silent trap rather than a neutral alternative.
+
+            k and lambda are two heads of the SAME MLP. On a time axis in days with
+            t_end = 1825, lambda must reach ~1e3 while k needs to be ~1.4 -- three
+            orders of magnitude apart from one linear layer. The lambda gradient
+            dominates and the shape head collapses onto its 0.3 floor. Measured on a
+            Stanford CAD cohort (n = 2909, 10.4% events), fitting on raw days returned
+            k = 0.300 exactly -- the floor -- with lambda = 1081, giving mean S(t) of
+            0.557 / 0.487 / 0.368 / 0.312 at 6 months / 1 / 3 / 5 years against
+            Kaplan-Meier 0.922 / 0.907 / 0.859 / 0.812, i.e. 38-60% of the truth.
+            The same data on t/1825 returned k = 5.22, lambda = 2.25 and mean S(t) of
+            0.906 / 0.876 / 0.793 / 0.714 -- within 2-12% of KM.
+
+            The downstream cost is not a modest bias. Too small an S_cens inflates the
+            IPCW weight 1/S_cens, which pushed the AIPCW pseudo-outcome's mean above 1
+            -- impossible for a survival probability -- and broke the R-learner's
+            orthogonalization: the residual Y_tilde - S_marg had mean 1.20 at 5 years
+            where it must be ~0. The tv-R-loss's implied homogeneous effect then came
+            out anywhere from -0.67 to +0.62 depending only on the clipping floor
+            `eps`, against a Kaplan-Meier difference of +0.014.
+
+            This is the same failure mode `CATEMixture.normalize_time` exists for.
     """
 
-    def __init__(self, hidden_sizes: list[int] = (64, 32), shared_shape: bool = False):
+    def __init__(self, hidden_sizes: list[int] = (64, 32), shared_shape: bool = False,
+                 normalize_time: bool = True):
         self.hidden_sizes = hidden_sizes
         self.shared_shape = shared_shape
+        self.normalize_time = normalize_time
         self.model_ = None
+        # Set by `fit`; 1.0 means "no rescaling", so `survival` is safe either way.
+        self.t_scale_ = 1.0
 
     def _build_model(self, input_dim: int) -> keras.Model:
         inputs = keras.Input(shape=(input_dim,))
@@ -86,6 +115,7 @@ class WeibullAFT:
         batch_size: int = 256,
         lr: float = 1e-3,
         verbose: int = 0,
+        t_scale: float | None = None,
     ) -> "WeibullAFT":
         """Fit Weibull AFT by maximizing the censored likelihood.
 
@@ -93,7 +123,25 @@ class WeibullAFT:
             X: Covariates (n, p).
             T: Observed times (n,). Must be > 0.
             event: Event indicator (n,). 1 = event observed, 0 = censored.
+            t_scale: Time scale to divide T by when `normalize_time`; defaults to
+                max(T). Pass it explicitly to pin ONE scale across cross-fitting
+                folds -- otherwise each fold normalizes by its own maximum, which is
+                harmless when the follow-up is administratively capped (every fold
+                then sees the same maximum) and a source of fold-to-fold drift when
+                it is not.
         """
+        T = np.asarray(T, dtype=np.float64)
+        if self.normalize_time:
+            scale = float(np.max(T)) if t_scale is None else float(t_scale)
+            if not np.isfinite(scale) or scale <= 0.0:
+                raise ValueError(
+                    f"t_scale must be finite and positive, got {scale!r}"
+                )
+            self.t_scale_ = scale
+        else:
+            self.t_scale_ = 1.0
+        T = T / self.t_scale_
+
         self.model_ = self._build_model(X.shape[1])
 
         # Custom training step via a wrapper model
@@ -130,7 +178,12 @@ class WeibullAFT:
         raw_params = self.model_(np.asarray(X, dtype=np.float32), training=False)
         k, lam = self._get_params(raw_params)
 
-        t = jnp.asarray(t, dtype=jnp.float32)
+        # Queries arrive on the ORIGINAL time scale, so rescale them exactly as `fit`
+        # did. Callers therefore never see the normalization, and t_scale_ = 1.0
+        # reproduces the un-normalized behaviour.
+        t = jnp.asarray(t, dtype=jnp.float32) / jnp.asarray(
+            self.t_scale_, dtype=jnp.float32
+        )
         k = jnp.asarray(k)
         lam = jnp.asarray(lam)
 
